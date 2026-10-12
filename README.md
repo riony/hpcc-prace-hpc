@@ -1,5 +1,7 @@
 # HPCC PRACE HPC
 
+[![Public validation](https://github.com/riony/hpcc-prace-hpc/actions/workflows/ci.yml/badge.svg)](https://github.com/riony/hpcc-prace-hpc/actions/workflows/ci.yml)
+
 A reproducible HPC infrastructure and security-validation project: Slurm on
 Kubernetes with Slinky, Ansible roles for physical Linux fleets, and a bounded
 action harness that records, verifies and replays scenario activity.
