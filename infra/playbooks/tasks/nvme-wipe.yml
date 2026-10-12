@@ -1,0 +1,489 @@
+---
+# Tasks of playbooks/beegfs-disk-wipe.yml for ONE confirmed GPU node (serial: 1), inside the lease.
+# Stage 1 only reads (tools/nvme-wipe-inspect.py) and refuses anything but the two known states.
+# Stage 2 runs only for the known 'rl' layout, or to finish an earlier run (below), only after the
+# gates of this run (nw_gates_ok) and only on the devices named by this run's plan (nw_plan).
+# Order: cordon; identity re-check; the old ESP's UEFI entries; LVM; partitions; identity
+# re-check; whole disks; the kernel has dropped the partitions; discard; verify.
+# Evidence goes to evidence/<date>/nvme-wipe/<host>/<stamp>/ on the controller: before.txt,
+# plan.json/.err, and after a wipe after.txt and verify.json/.err (after-failure.txt if it failed).
+# The same files stay on the node in /var/lib/prace-nvme-wipe/<stamp>/. Add a README and
+# SHA256SUMS when committing them (evidence is append-only).
+#
+# An interrupted wipe is never mistaken for a blank node. Before its first change a run writes
+# wipe-started.json in its directory on the node, and wipe-finished only once verified. If the
+# disks are blank but an earlier run never finished, this run RESUMES it: the same gates, the
+# cordon, any of that run's UEFI deletions still pending, the discard, and verification against
+# that run's own plan (its before-state), then wipe-finished in both directories. An earlier
+# unfinished run with the disks still in the 'rl' layout is superseded by a full wipe.
+
+- name: This run passed the confirmation and lease gates (a run started past them does nothing)
+  ansible.builtin.assert:
+    that: nw_gates_ok | bool
+    fail_msg: "{{ inventory_hostname }}: nothing done: the confirmation and lease gates of beegfs-disk-wipe.yml did not pass in this run"
+    quiet: true
+
+# ------------------------------------------------------------ stage 1: read-only
+- name: This run's stamp (controller clock)
+  ansible.builtin.set_fact:
+    nw_stamp: "{{ now(fmt='%Y%m%dT%H%M%S') }}"
+    nw_date: "{{ now(fmt='%Y-%m-%d') }}"
+
+- name: This run's paths and inspector command
+  ansible.builtin.set_fact:
+    nw_dir: "{{ nvme_wipe_node_dir }}/{{ nw_stamp }}"
+    nw_evidence: "{{ nvme_wipe_evidence_root }}/{{ nw_date }}/nvme-wipe/{{ inventory_hostname }}/{{ nw_stamp }}"
+    nw_inspect: >-
+      {{ [nvme_wipe_python, nvme_wipe_node_dir ~ '/' ~ nw_stamp ~ '/nvme-wipe-inspect.py',
+          '--disk', nvme_serials[0] ~ '=' ~ nvme_euis[0], '--disk', nvme_serials[1] ~ '=' ~ nvme_euis[1],
+          '--os-wwn', os_disk.wwn, '--model', nvme_wipe_model, '--size', nvme_wipe_size | string,
+          '--legacy-vg', nvme_wipe_legacy_vg, '--legacy-lvs', nvme_wipe_legacy_lvs | join(',')]
+         | map('quote') | join(' ') }}
+
+# The run's own records on the node are not managed state: reported unchanged, so a no-op run
+# (blank node) shows changed=0.
+- name: This run's directory on the node (root only)
+  ansible.builtin.file:
+    path: "{{ nw_dir }}"
+    state: directory
+    mode: "0700"
+  changed_when: false
+  check_mode: false
+
+- name: The read-only inspector, next to this run's records
+  ansible.builtin.copy:
+    src: "{{ nvme_wipe_inspector }}"
+    dest: "{{ nw_dir }}/nvme-wipe-inspect.py"
+    mode: "0700"
+  changed_when: false
+  check_mode: false
+
+- name: Record the before-state (lsblk with PARTUUID, pvs/vgs/lvs with UUIDs, wipefs -n, efibootmgr -v, lvmdevices)
+  ansible.builtin.shell: >-
+    {{ nvme_wipe_python | quote }} {{ (nw_dir ~ '/nvme-wipe-inspect.py') | quote }} --record
+    > {{ (nw_dir ~ '/before.txt') | quote }}
+  changed_when: false
+  when: not ansible_check_mode
+
+- name: Earlier runs on this node that started changing it and never finished (read-only)
+  ansible.builtin.command:
+    argv: ["{{ nvme_wipe_python }}", "{{ nw_dir }}/nvme-wipe-inspect.py", --unfinished, "{{ nvme_wipe_node_dir }}"]
+  register: nw_unfinished_run
+  changed_when: false
+  check_mode: false
+
+- name: Earlier unfinished runs
+  ansible.builtin.set_fact:
+    nw_unfinished: "{{ nw_unfinished_run.stdout | from_json }}"
+
+- name: Inspect - resolve both NVMes by serial AND EUI, classify the pre-state, plan (read-only)
+  ansible.builtin.shell: |
+    {{ nw_inspect }} > {{ (nw_dir ~ '/plan.json') | quote }} 2> {{ (nw_dir ~ '/plan.err') | quote }}
+    rc=$?
+    cat {{ (nw_dir ~ '/plan.json') | quote }}; cat {{ (nw_dir ~ '/plan.err') | quote }} >&2
+    exit $rc
+  register: nw_plan_run
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Fetch the before-state and the plan to the controller's evidence
+  ansible.builtin.fetch:
+    src: "{{ nw_dir }}/{{ item }}"
+    dest: "{{ nw_evidence }}/{{ item }}"
+    flat: true
+  loop: [before.txt, plan.json, plan.err]
+  changed_when: false
+  when: not ansible_check_mode
+
+- name: The pre-state is blank or the known 'rl' layout (anything else changes nothing)
+  ansible.builtin.assert:
+    that: nw_plan_run.rc == 0
+    fail_msg: >-
+      {{ inventory_hostname }}: {{ nw_plan_run.stderr | default('') | trim }}.
+      Nothing was changed. Before-state: {{ nw_evidence }}/before.txt
+      {{ ('An earlier run on this node did not finish: ' ~ nw_unfinished.all | join(', ')
+          ~ ' (see its after-failure.txt); finish its remaining steps by hand.') if nw_unfinished.all else '' }}
+    quiet: true
+
+- name: This run's plan
+  ansible.builtin.set_fact:
+    nw_plan: "{{ nw_plan_run.stdout | from_json }}"
+
+- name: The plan names only this host's two NVMes (whole namespaces and their partitions)
+  ansible.builtin.assert:
+    that:
+      - nw_plan.state in ['blank', nvme_wipe_legacy_vg]
+      - nw_plan.host_disks | map(attribute='serial') | list == nvme_serials
+      - nw_plan.host_disks | map(attribute='eui') | list == nvme_euis
+      - nw_plan.whole_disks | length == 2 and nw_plan.whole_disks | unique | length == 2
+      - nw_plan.whole_disks | select('match', '^/dev/nvme[0-9]+n[0-9]+$') | list | length == 2
+      - nw_plan.partitions | reject('match', nw_disk_rx ~ 'p[0-9]+$') | list == []
+      - nw_plan.lvm_devices | reject('match', nw_disk_rx ~ '(p[0-9]+)?$') | list == []
+      - nw_plan.devices_file | reject('match', nw_disk_rx ~ '(p[0-9]+)?$') | list == []
+      - nw_plan.state == 'blank' or nw_plan.vg.pvs | reject('in', nw_plan.partitions) | list == []
+      - nw_plan.state == 'blank' or nw_plan.partitions | length == 4
+      - nw_plan.efi.current not in nw_plan.efi_delete
+      - nw_plan.efi.order[:1] | intersect(nw_plan.efi_delete) | length == 0
+    fail_msg: "{{ inventory_hostname }}: inconsistent plan, nothing changed: {{ nw_plan | to_json }}"
+    quiet: true
+  vars:
+    nw_disk_rx: "^({{ nw_plan.whole_disks | map('regex_escape') | join('|') }})"
+
+- name: At most one earlier unfinished run (more need a person)
+  ansible.builtin.assert:
+    that: nw_unfinished.originals | length <= 1
+    fail_msg: "{{ inventory_hostname }}: nothing changed: more than one earlier run never finished: {{ nw_unfinished.all | join(', ') }}"
+    quiet: true
+
+- name: The run this one finishes (blank disks and an earlier run that never finished)
+  ansible.builtin.set_fact:
+    nw_resuming: "{{ nw_plan.state == 'blank' and nw_unfinished.originals | length == 1 }}"
+    nw_resume: "{{ nw_unfinished.originals[0] if (nw_plan.state == 'blank' and nw_unfinished.originals | length == 1) else {} }}"
+
+- name: The earlier run's plan is the same node's 'rl' wipe of the same disks
+  ansible.builtin.assert:
+    that:
+      - nw_resume.plan.state == nvme_wipe_legacy_vg
+      - nw_resume.plan.host_disks == nw_plan.host_disks
+      - nw_resume.plan.whole_disks == nw_plan.whole_disks
+      - nw_resume.plan.efi_delete | reject('in', nw_resume.plan.efi.entries) | list == []
+      - nw_resume.plan.efi.current not in nw_resume.plan.efi_delete
+    fail_msg: "{{ inventory_hostname }}: nothing changed: the unfinished run {{ nw_resume.dir }} cannot be resumed (another plan or other device names); finish it by hand"
+    quiet: true
+  when: nw_resuming | bool
+
+# The plan whose before-state the result is verified against, and the UEFI entries still to delete.
+- name: Reference plan
+  ansible.builtin.set_fact:
+    nw_ref: "{{ nw_resume.plan if nw_resuming | bool else nw_plan }}"
+    nw_ref_file: "{{ (nw_resume.dir ~ '/plan.json') if nw_resuming | bool else (nw_dir ~ '/plan.json') }}"
+    nw_efi_delete: >-
+      {{ (nw_resume.plan.efi_delete | select('in', nw_plan.efi.entries) | list) if nw_resuming | bool else nw_plan.efi_delete }}
+
+- name: Plan
+  ansible.builtin.debug:
+    msg:
+      - "{{ inventory_hostname }}: pre-state {{ nw_plan.state }}"
+      - "NVMes: {{ nw_plan.host_disks | map(attribute='serial') | zip(nw_plan.whole_disks) | map('join', ' = ') | join(', ') }}"
+      - "Partitions to wipe: {{ nw_plan.partitions | join(', ') or 'none' }}"
+      - "VG to remove: {{ (nw_plan.vg.name ~ ' ' ~ nw_plan.vg.uuid ~ ' on ' ~ nw_plan.vg.pvs | join(', ')) if nw_plan.vg is defined else 'none' }}"
+      - "UEFI entries to delete (old NVMe ESP {{ nw_plan.esp.partuuid | default('-') }}): {{ nw_plan.efi_delete | map('extract', nw_plan.efi.entries) | list or 'none' }}"
+      - "BootCurrent {{ nw_plan.efi.current }}, head of BootOrder {{ nw_plan.efi.order[:1] | join }} (both kept)"
+      - "{{ ('RESUMES the unfinished run ' ~ nw_resume.dir ~ ': UEFI entries still to delete ' ~ (nw_efi_delete | join(', ') or 'none')
+             ~ ', discard both disks, verify against the plan of that run') if nw_resuming | bool
+            else ('Supersedes the unfinished run(s) ' ~ nw_unfinished.all | join(', ')) if nw_unfinished.all else 'No unfinished earlier run' }}"
+
+- name: Preview (--check) ends here, before any change
+  ansible.builtin.meta: end_host
+  when: ansible_check_mode
+
+- name: Already blank, and no earlier run left unfinished - verified, nothing to do
+  ansible.builtin.set_fact:
+    nw_result: "{{ inventory_hostname }}: both NVMes already blank (verified no-op); evidence {{ nw_evidence }}"
+  when: nw_plan.state == 'blank' and not nw_resuming | bool
+
+- name: Result (blank)
+  ansible.builtin.debug:
+    msg: "{{ nw_result }}"
+  when: nw_plan.state == 'blank' and not nw_resuming | bool
+
+- name: End here for a blank node
+  ansible.builtin.meta: end_host
+  when: nw_plan.state == 'blank' and not nw_resuming | bool
+
+# ------------------------------------------------------------ stage 2: the 'rl' layout, or a resumption
+- name: Before the wipe (no change yet)
+  when:
+    - nw_gates_ok | bool
+    - nw_plan.state | default('') == nvme_wipe_legacy_vg or nw_resuming | default(false) | bool
+  block:
+    - name: Kubernetes cordon state of this node (login node)
+      ansible.builtin.command:
+        argv: "{{ nvme_wipe_kubectl + ['get', 'node', inventory_hostname, '-o', 'jsonpath={.spec.unschedulable}'] }}"
+      delegate_to: "{{ groups['login'][0] }}"
+      register: nw_k8s_before
+      changed_when: false
+
+    # A cordon left by an unfinished run of this playbook is that run's, and is lifted once verified.
+    - name: Remember whether someone else had cordoned it
+      ansible.builtin.set_fact:
+        nw_was_cordoned: "{{ nw_k8s_before.stdout | trim == 'true' }}"
+        nw_inherited: >-
+          {{ nw_k8s_before.stdout | trim == 'true' and nw_unfinished.originals | length == 1
+             and nw_unfinished.originals[0].started.cordon | default('') == 'cordoned-here' }}
+        nw_cordon: "{{ 'was-cordoned' if nw_k8s_before.stdout | trim == 'true' else 'not-cordoned' }}"
+        nw_changing: false
+
+    - name: The worker is usable before the wipe (so the check after it means something)
+      ansible.builtin.command:
+        argv: ["{{ nvme_wipe_worker_check }}", "{{ inventory_hostname }}"]
+      delegate_to: "{{ groups['login'][0] }}"
+      register: nw_wc_before
+      until: nw_wc_before.rc == 0
+      retries: 3
+      delay: "{{ nvme_wipe_worker_delay }}"
+      changed_when: false
+      when: not nw_was_cordoned
+
+- name: Quarantine and wipe (on any failure the node stays cordoned, with a message)
+  when:
+    - nw_gates_ok | bool
+    - nw_plan.state | default('') == nvme_wipe_legacy_vg or nw_resuming | default(false) | bool
+  block:
+    - name: The cordon is attempted from here on
+      ansible.builtin.set_fact:
+        nw_cordon: cordon-attempted
+      when: not nw_was_cordoned
+
+    - name: Cordon the node (kubectl, never scontrol; Slinky drains its Slurm node, running jobs may finish)
+      ansible.builtin.command:
+        argv: "{{ nvme_wipe_kubectl + ['cordon', inventory_hostname] }}"
+      delegate_to: "{{ groups['login'][0] }}"
+      when: not nw_was_cordoned
+
+    - name: The node is cordoned
+      ansible.builtin.command:
+        argv: "{{ nvme_wipe_kubectl + ['get', 'node', inventory_hostname, '-o', 'jsonpath={.spec.unschedulable}'] }}"
+      delegate_to: "{{ groups['login'][0] }}"
+      register: nw_k8s_cordoned
+      changed_when: false
+      failed_when: nw_k8s_cordoned.rc != 0 or nw_k8s_cordoned.stdout | trim != 'true'
+
+    - name: Cordoned by this run (or by the unfinished run it finishes)
+      ansible.builtin.set_fact:
+        nw_cordon: "{{ 'cordoned-here' if (not nw_was_cordoned or nw_inherited) else nw_cordon }}"
+
+    - name: Record that this run starts changing the node (a re-run then never reports a blank no-op)
+      ansible.builtin.copy:
+        dest: "{{ nw_dir }}/wipe-started.json"
+        content: "{{ {'stamp': nw_stamp, 'cordon': nw_cordon, 'state': nw_plan.state, 'resumes': nw_resume.dir if nw_resuming | bool else none} | to_json }}\n"
+        mode: "0600"
+      changed_when: false
+
+    - name: The whole disks are still the confirmed NVMes, before the first change
+      ansible.builtin.include_tasks: nvme-wipe-identity.yml
+
+    - name: UEFI entries now (read-only)
+      ansible.builtin.command: efibootmgr -v
+      register: nw_efi_now
+      changed_when: false
+
+    - name: Each entry to delete is unchanged since the inspection, and BootCurrent too
+      ansible.builtin.assert:
+        that:
+          - nw_ref.efi.entries[item] in nw_efi_now.stdout_lines
+          - "('BootCurrent: ' ~ nw_ref.efi.current) in nw_efi_now.stdout_lines"
+        quiet: true
+      loop: "{{ nw_efi_delete }}"
+
+    - name: The node changes from here on
+      ansible.builtin.set_fact:
+        nw_changing: true
+
+    # First, so that no failure later can leave them behind once the old ESP is gone.
+    - name: Delete only the UEFI entries on the old NVMe ESP's PARTUUID (never BootCurrent or the BootOrder head)
+      ansible.builtin.command:
+        argv: [efibootmgr, -b, "{{ item }}", -B]
+      loop: "{{ nw_efi_delete }}"
+
+    # --devices: these LVM commands see the two old PVs and nothing else (not the OS VG).
+    - name: Deactivate the old VG (selected by its UUID; LVM sees only its two PVs)
+      when: not nw_resuming | bool
+      ansible.builtin.command:
+        argv: [vgchange, -an, --devices, "{{ nw_plan.vg.pvs | join(',') }}", --select, "vg_uuid={{ nw_plan.vg.uuid }}"]
+
+    - name: Remove the old VG and its LVs (by UUID, only on its two PVs)
+      when: not nw_resuming | bool
+      ansible.builtin.command:
+        argv: [vgremove, -y, --devices, "{{ nw_plan.vg.pvs | join(',') }}", --select, "vg_uuid={{ nw_plan.vg.uuid }}"]
+
+    - name: Remove the two PV labels
+      when: not nw_resuming | bool
+      ansible.builtin.command:
+        argv: "{{ ['pvremove', '-y', '--devices', nw_plan.vg.pvs | join(',')] + nw_plan.vg.pvs }}"
+
+    - name: Drop the NVMe entries from the LVM devices file (while the partitions still exist)
+      ansible.builtin.command:
+        argv: [lvmdevices, --deldev, "{{ item }}"]
+      loop: "{{ nw_plan.devices_file }}"
+      when: not nw_resuming | bool
+      register: nw_deldev
+      changed_when: nw_deldev.rc == 0
+      failed_when: nw_deldev.rc != 0 and 'No devices file entry' not in (nw_deldev.stderr ~ nw_deldev.stdout)
+
+    - name: Erase the signatures of every partition (the first NVMe's p3, p2, p1, then the second's p1)
+      ansible.builtin.command:
+        argv: [wipefs, -a, "{{ item }}"]
+      loop: "{{ nw_plan.partitions }}"
+      when: not nw_resuming | bool
+
+    # Each partition wipe makes udev probe the partitions; the whole-disk wipe re-reads the table.
+    - name: Settle udev before the whole disks
+      ansible.builtin.command: udevadm settle
+      changed_when: false
+
+    - name: The whole disks are still the confirmed NVMes, before the whole-disk steps
+      ansible.builtin.include_tasks: nvme-wipe-identity.yml
+
+    - name: Erase the partition table and signatures of both whole disks (primary and backup GPT)
+      ansible.builtin.command:
+        argv: [wipefs, -a, "{{ item }}"]
+      loop: "{{ nw_plan.whole_disks }}"
+      when: not nw_resuming | bool
+
+    - name: Settle udev
+      ansible.builtin.command: udevadm settle
+      changed_when: false
+
+    # wipefs only reports a busy re-read of the partition table, so the kernel may still list the
+    # old partitions. Re-read it, a bounded number of times, until it lists none.
+    - name: Partitions the kernel still lists on the whole disks
+      ansible.builtin.command:
+        argv: "{{ ['lsblk', '-J', '-o', 'PATH,TYPE'] + nw_plan.whole_disks }}"
+      register: nw_kids
+      changed_when: false
+
+    - name: Re-read the partition table of a disk that still lists partitions
+      ansible.builtin.command:
+        argv: [blockdev, --rereadpt, "{{ item }}"]
+      loop: >-
+        {{ (nw_kids.stdout | from_json).blockdevices | selectattr('children', 'defined')
+           | selectattr('children') | map(attribute='path') | list }}
+      register: nw_reread
+      until: nw_reread.rc == 0
+      retries: "{{ nvme_wipe_reread_retries }}"
+      delay: "{{ nvme_wipe_reread_delay }}"
+
+    - name: Settle udev after the re-read
+      ansible.builtin.command: udevadm settle
+      changed_when: false
+      when: nw_reread.results | default([]) | length > 0
+
+    - name: The kernel lists no partition on either whole disk
+      ansible.builtin.command:
+        argv: "{{ ['lsblk', '-J', '-o', 'PATH,TYPE'] + nw_plan.whole_disks }}"
+      register: nw_kids_after
+      changed_when: false
+      failed_when: >-
+        nw_kids_after.rc != 0 or (nw_kids_after.stdout | from_json).blockdevices
+        | selectattr('children', 'defined') | selectattr('children') | list | length > 0
+
+    # No -f: the disks carry no signature now, so blkdiscard keeps its exclusive-open check.
+    - name: Discard every block of both whole disks
+      ansible.builtin.command:
+        argv: [blkdiscard, "{{ item }}"]
+      loop: "{{ nw_plan.whole_disks }}"
+
+    - name: Settle udev again
+      ansible.builtin.command: udevadm settle
+      changed_when: false
+
+    - name: Verify (read-only) - both NVMes blank, rl gone, OS disk/VGs and boot order otherwise unchanged
+      ansible.builtin.shell: |
+        {{ nw_inspect }} --verify-after {{ nw_ref_file | quote }} > {{ (nw_dir ~ '/verify.json') | quote }} 2> {{ (nw_dir ~ '/verify.err') | quote }}
+        rc=$?
+        cat {{ (nw_dir ~ '/verify.json') | quote }}; cat {{ (nw_dir ~ '/verify.err') | quote }} >&2
+        exit $rc
+      register: nw_verify
+      changed_when: false
+      failed_when: false
+
+    - name: Record the after-state
+      ansible.builtin.shell: >-
+        {{ nvme_wipe_python | quote }} {{ (nw_dir ~ '/nvme-wipe-inspect.py') | quote }} --record
+        > {{ (nw_dir ~ '/after.txt') | quote }}
+      changed_when: false
+
+    - name: Fetch the after-state and the verification
+      ansible.builtin.fetch:
+        src: "{{ nw_dir }}/{{ item }}"
+        dest: "{{ nw_evidence }}/{{ item }}"
+        flat: true
+      loop: [after.txt, verify.json, verify.err]
+      changed_when: false
+
+    - name: Verified
+      ansible.builtin.assert:
+        that: nw_verify.rc == 0
+        fail_msg: "{{ nw_verify.stderr | default('') | trim }}"
+        quiet: true
+
+    - name: Record that the wipe finished, here and in every earlier unfinished run it resolves
+      ansible.builtin.copy:
+        dest: "{{ item }}/wipe-finished"
+        content: "verified by run {{ nw_stamp }}\n"
+        mode: "0600"
+      loop: "{{ [nw_dir] + nw_unfinished.all }}"
+      changed_when: false
+
+    - name: Uncordon (only when this run cordoned the node)
+      ansible.builtin.command:
+        argv: "{{ nvme_wipe_kubectl + ['uncordon', inventory_hostname] }}"
+      delegate_to: "{{ groups['login'][0] }}"
+      when: nw_cordon == 'cordoned-here'
+
+    - name: Uncordoned by this run
+      ansible.builtin.set_fact:
+        nw_cordon: uncordoned
+      when: nw_cordon == 'cordoned-here'
+
+    - name: The worker is usable again (Kubernetes Ready, one ready slurmd pod, Slurm idle/mixed/allocated)
+      ansible.builtin.command:
+        argv: ["{{ nvme_wipe_worker_check }}", "{{ inventory_hostname }}"]
+      delegate_to: "{{ groups['login'][0] }}"
+      register: nw_wc_after
+      until: nw_wc_after.rc == 0
+      retries: "{{ nvme_wipe_worker_retries }}"
+      delay: "{{ nvme_wipe_worker_delay }}"
+      changed_when: false
+      when: nw_cordon == 'uncordoned'
+
+    - name: Result
+      ansible.builtin.set_fact:
+        nw_result: >-
+          {{ inventory_hostname }}: {{ ('finished the unfinished run ' ~ nw_resume.dir) if nw_resuming | bool
+             else ('old ' ~ nw_plan.vg.name ~ ' layout wiped') }}; both NVMes verified blank;
+          UEFI entries deleted: {{ nw_efi_delete | join(', ') or 'none' }};
+          {{ 'node uncordoned and worker check passed' if nw_cordon == 'uncordoned'
+             else 'node left cordoned as found (it was cordoned before this run)' }}; evidence {{ nw_evidence }}
+
+    - name: Result (wiped)
+      ansible.builtin.debug:
+        msg: "{{ nw_result }}"
+
+  rescue:
+    - name: Record the state after the failure (best effort)
+      ansible.builtin.shell: >-
+        {{ nvme_wipe_python | quote }} {{ (nw_dir ~ '/nvme-wipe-inspect.py') | quote }} --record
+        > {{ (nw_dir ~ '/after-failure.txt') | quote }}
+      changed_when: false
+      failed_when: false
+
+    - name: Fetch it (best effort)
+      ansible.builtin.fetch:
+        src: "{{ nw_dir }}/after-failure.txt"
+        dest: "{{ nw_evidence }}/after-failure.txt"
+        flat: true
+      changed_when: false
+      failed_when: false
+
+    - name: Stop with the node's state
+      ansible.builtin.fail:
+        msg: >-
+          {{ inventory_hostname }}: FAILED at '{{ ansible_failed_task.name | default('?') }}':
+          {{ ([ansible_failed_result.msg | default(''), ansible_failed_result.stderr | default('')]
+              + (ansible_failed_result.results | default([]) | selectattr('failed', 'defined') | selectattr('failed')
+                 | map(attribute='stderr', default='') | list)
+              + (ansible_failed_result.results | default([]) | selectattr('failed', 'defined') | selectattr('failed')
+                 | map(attribute='msg', default='') | list)) | map('trim') | select | unique | join(' / ') }}.
+          {{ 'The disks were being changed.' if nw_changing | default(false) else 'No disk had been changed yet.' }}
+          {{ ('This run is recorded as unfinished on the node (' ~ nw_dir ~ '/wipe-started.json): fix the cause and re-run the same
+              command; once the disks are blank it resumes (pending UEFI deletions, discard, verification, uncordon). If the kernel
+              still lists old partitions, run blockdev --rereadpt (or partprobe) on the whole disk first.')
+             if nw_cordon | default('') in ['cordoned-here', 'was-cordoned'] else '' }}
+          {{ {'cordoned-here': 'The node STAYS CORDONED on purpose (this run cordoned it). Uncordon it only when both NVMes are verified blank: k3s kubectl uncordon ' ~ inventory_hostname ~ ', then prace-slinky-worker-check ' ~ inventory_hostname ~ '.',
+              'was-cordoned': 'The node was cordoned before this run and stays cordoned.',
+              'cordon-attempted': 'The cordon itself failed: check the node with k3s kubectl get node ' ~ inventory_hostname ~ '.',
+              'uncordoned': 'Both NVMes were verified blank and the node was uncordoned, but the worker check failed: fix the worker (cordon it again if it must not take jobs).'}[nw_cordon | default('cordon-attempted')] }}
+          Evidence: {{ nw_evidence }}

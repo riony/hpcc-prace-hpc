@@ -1,0 +1,101 @@
+{
+  "cleanup": "complete",
+  "driver": "nemo",
+  "events": [
+    {
+      "event_sha256": "b2a7dc86fd610e9e6830b89b67dc605e98d7ad14f5bb2c4a86a618a8e0b7f603",
+      "event_type": "action",
+      "id": "find-readable-canary",
+      "phase": "attack",
+      "sequence": 1,
+      "status": "ok"
+    },
+    {
+      "event_sha256": "a679ae59d80211b41f2494bf563ef7378d8f813cc5006c2cd1edbda7fe4f2734",
+      "event_type": "action",
+      "id": "read-synthetic-canary",
+      "phase": "attack",
+      "sequence": 2,
+      "status": "ok"
+    },
+    {
+      "event_sha256": "2e962005f4a329a7d664282b385f9d00611088f6f4124e6f703d5904a2941e8a",
+      "event_type": "observation",
+      "id": "vulnerable-canary-read",
+      "phase": "attack",
+      "sequence": 3,
+      "status": "pass"
+    },
+    {
+      "event_sha256": "aec6090c6768e68a9292c4f1874feaf329ece4105f28b8ebcefcd79a834d8c3c",
+      "event_type": "action",
+      "id": "find-readable-canary",
+      "phase": "replay",
+      "sequence": 4,
+      "status": "denied"
+    },
+    {
+      "event_sha256": "79bdf143cd035794c7f291ce8a15a7eff02ef9ea87ad6c1e93545512c19db888",
+      "event_type": "observation",
+      "id": "patched-read-blocked",
+      "phase": "replay",
+      "sequence": 5,
+      "status": "pass"
+    },
+    {
+      "event_sha256": "7aea670abb847c0e8b90285a6c703570e28e76f40ccc134d9dd3840b4c1bed8b",
+      "event_type": "observation",
+      "id": "alpha-authorized-write",
+      "phase": "regression",
+      "sequence": 6,
+      "status": "pass"
+    },
+    {
+      "event_sha256": "9372a1007d0b843b92801e3c5cd32ee44ede141074471c8ceb82fc7e7061aaf9",
+      "event_type": "observation",
+      "id": "beta-authorized-write",
+      "phase": "regression",
+      "sequence": 7,
+      "status": "pass"
+    },
+    {
+      "event_sha256": "97dfe27e47f610e6737d4a0e585d8b2ba18a6080aa248a5f3c2b85b7814a83e6",
+      "event_type": "observation",
+      "id": "normal-project-job",
+      "phase": "regression",
+      "sequence": 8,
+      "status": "pass"
+    },
+    {
+      "event_sha256": "4fcaa608d705966524fbfad1db7ed989792c77d2355a97475caba7c136fb202d",
+      "event_type": "observation",
+      "id": "metadata-reset",
+      "phase": "reset",
+      "sequence": 9,
+      "status": "pass"
+    }
+  ],
+  "fixture_discarded": true,
+  "framework_version": "1.9.0",
+  "model": null,
+  "model_used": false,
+  "private_bundle_index_sha256": "253ddd01b958357f252e2dd5816ae1f6f7a10b363f9fb26ec0ab786586bfc103",
+  "proof_scope": {
+    "filesystem": "linux-kernel-authorization",
+    "quota": "tree-usage-stand-in",
+    "scheduler": "simulated-accounting",
+    "selinux": "not-qualified"
+  },
+  "reset_scope": "seeded-vulnerable-fixture",
+  "run_id": "canary-read-nemo-20261008",
+  "scenario_kind": "read",
+  "schema": "prace.security-simulation-public.v1",
+  "scope": "disposable-local-linux-acl-simulation",
+  "source_dirty": false,
+  "source_revision": "619583f4261fa12eb1297976c560397b0b38631a",
+  "verdicts": {
+    "baseline": "security_failure",
+    "functional": "pass",
+    "patched": "security_blocked"
+  }
+}

@@ -1,0 +1,8 @@
+---
+# Repeated at the top of every task file that changes a node: a run started past the gates (or past
+# the lease and window checks) stops here instead of changing anything.
+- name: This run passed its gates and holds the lease (a run started past them changes nothing)
+  ansible.builtin.assert:
+    that: ibf_run_gated | bool or (ansible_check_mode and ibf_gates_passed | default(false) | bool and ibf_lease_held | bool)
+    fail_msg: "Gates not passed in this run; nothing is changed"
+    quiet: true

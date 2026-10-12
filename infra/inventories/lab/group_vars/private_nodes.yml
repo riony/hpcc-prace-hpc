@@ -1,0 +1,29 @@
+# Nodes that live only on the private admin segment 10.88.0.0/24: no default
+# gateway, no DNS, no repository path. Reached through the .205 bastion.
+# See docs/history/PRIVATE-LAB-NETWORK.md and docs/history/LENOVO-POSTINSTALL-PREP.md.
+
+# private_net reads top-level private_* vars; host_vars keep them under network:.
+private_iface: "{{ network.private_iface }}"
+private_ip: "{{ network.private_ip }}"
+private_prefix: "{{ network.private_prefix }}"
+
+# No repository is reachable: the package task only verifies presence. Missing
+# RPMs are staged offline from .205 (dependency-resolved against this node's own
+# rpmdb, signature-checked, installed with all repos disabled).
+host_base_offline: true
+
+# Time from the .205 bastion (its chrony serves 10.88.0.0/24 on eno4).
+chrony_servers:
+  - 10.88.0.1
+# The private switch (IBM RackSwitch G8052) drops frames for several seconds after a
+# port links up (most likely STP listening/learning; host ports not set as edge).
+# chronyd's boot-time iburst falls entirely in that window (Lenovo reboot
+# 2026-09-24: 6 requests lost, then backoff to poll 7 = 128 s). Poll the LAN
+# server fast so a lost burst is retried within 16-64 s. Proper fix: switch-side
+# edge/portfast on host-facing ports (needs switch credentials).
+chrony_server_opts: "minpoll 4 maxpoll 6"
+
+# Lab deploy runner key (roles/lab_deploy_key): private nodes are reached through the
+# .205 jump, so connections arrive from .205's private address. Converge runs as root.
+lab_deploy_user: root
+lab_deploy_from: "10.88.0.1"

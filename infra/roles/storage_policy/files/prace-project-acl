@@ -1,0 +1,47 @@
+#!/bin/bash
+# prace-project-acl [--check] DIR: make a project ROOT's ACL exactly the managed one
+# (roles/storage_policy runs it on each /projects/<group>; the test runs this same file).
+#   access  u::rwx,g::rwx,m::rwx,o::---      default  the same, so new files stay group-writable
+# No named user/group entries: an outsider's grant (or its inherited default) on the root is
+# removed, not kept. Only the root itself: ACLs that users set further down are theirs.
+# Prints the old ACL when it differs, then "CHANGED ..." (--check: "WOULD ..." and changes
+# nothing). Exit 0 = matches or reconciled; 1 = still differs or a command failed; 2 = usage.
+set -euo pipefail
+MANAGED='u::rwx,g::rwx,m::rwx,o::---'
+EXPECTED='user::rwx
+group::rwx
+mask::rwx
+other::---
+default:user::rwx
+default:group::rwx
+default:mask::rwx
+default:other::---'
+
+check=0
+[ "${1:-}" = --check ] && { check=1; shift; }
+[ $# -eq 1 ] || { echo "usage: prace-project-acl [--check] DIR" >&2; exit 2; }
+dir=$1
+[ -d "$dir" ] && [ ! -L "$dir" ] || { echo "$dir: not a directory" >&2; exit 1; }
+
+acl() { getfacl -cpnE -- "$dir"; }     # no header, numeric ids, no "#effective" comments
+
+old=$(acl)
+if [ "$old" = "$EXPECTED" ]; then
+  echo "$dir: ACL matches"
+  exit 0
+fi
+echo "$dir: ACL differs; was:"
+printf '%s\n' "$old" | sed 's/^/  /'
+if [ "$check" = 1 ]; then
+  echo "WOULD reconcile the ACL of $dir"
+  exit 0
+fi
+setfacl --set "$MANAGED" -- "$dir"
+setfacl -d --set "$MANAGED" -- "$dir"
+new=$(acl)
+if [ "$new" != "$EXPECTED" ]; then
+  echo "$dir: ACL still differs after setfacl; now:"
+  printf '%s\n' "$new" | sed 's/^/  /'
+  exit 1
+fi
+echo "CHANGED ACL of $dir reconciled"

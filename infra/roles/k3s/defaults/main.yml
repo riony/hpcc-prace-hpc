@@ -1,0 +1,38 @@
+---
+# K3s under Slinky (PLAN D36/D37). The login node is the only server (control plane, API on
+# its private address); every compute node is an agent. Only the login node reaches the
+# internet: it downloads each artifact once, checks it against the SHA-256 published with the
+# release (pinned here), and serves it on the private network next to the package repository.
+k3s_version: v1.36.4+k3s1
+k3s_selinux_rpm: k3s-selinux-1.6-1.el9.noarch.rpm
+k3s_artifacts:
+  - name: k3s
+    url: https://github.com/k3s-io/k3s/releases/download/v1.36.4%2Bk3s1/k3s
+    sha256: 835873f37245fc615f547a2fe2af9402a347875f13fa64a1f136de644955ea3f
+  - name: k3s-airgap-images-amd64.tar.zst
+    url: https://github.com/k3s-io/k3s/releases/download/v1.36.4%2Bk3s1/k3s-airgap-images-amd64.tar.zst
+    sha256: 9024613e2d468c51ba0e5ba21898604c41339354449fb3338cc6a7931189eb6a
+  - name: install.sh              # the release's own installer script, at the same tag
+    url: https://raw.githubusercontent.com/k3s-io/k3s/v1.36.4+k3s1/install.sh
+    sha256: 46177d4c99440b4c0311b67233823a8e8a2fc09693f6c89af1a7161e152fbfad
+  - name: k3s-selinux-1.6-1.el9.noarch.rpm   # Rancher's stable EL9 repository (hash from its metadata)
+    url: https://rpm.rancher.io/k3s/stable/common/centos/9/noarch/k3s-selinux-1.6-1.el9.noarch.rpm
+    sha256: 23d0095a766b89317d2bdbe8773825987db7221e48743417930a994ca1096793
+
+k3s_server_ip: "{{ hostvars[groups['login'][0]].admin_ip }}"
+k3s_artifact_dir: /srv/fleet-repo/k3s                                   # login node (httpd serves /srv/fleet-repo)
+k3s_artifact_url: "http://{{ k3s_server_ip }}/fleet-repo/k3s"
+k3s_stage_dir: /var/lib/prace/k3s                                        # agents: verified copies
+# Kubernetes defaults; neither overlaps the admin network, campus, BMC or ring addressing.
+k3s_cluster_cidr: 10.42.0.0/16
+k3s_service_cidr: 10.43.0.0/16
+# Workers run only Slurm pods (Slinky docs/usage/workload-isolation.md); cluster add-ons
+# (CoreDNS, local-path storage, metrics) stay on the login node, which has upstream DNS.
+k3s_worker_taint: slinky.slurm.net/slurm=:NoExecute
+k3s_system_reserved: cpu=2,memory=4Gi
+k3s_mirrored_registries: [ghcr.io, docker.io]
+k3s_agent_secret_file: /etc/rancher/k3s/agent-secret   # login node, 0600; agents never see the server token
+# Gateway-less nodes need a default route for kube-proxy (K3s air-gap docs); a dummy
+# interface provides one that leads nowhere, so no campus transit is created.
+k3s_dummy_route_net: 192.0.2.254/31      # TEST-NET-1 (RFC 5737), never routed
+k3s_dummy_route_gw: 192.0.2.255

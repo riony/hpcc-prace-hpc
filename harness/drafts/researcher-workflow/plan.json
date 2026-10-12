@@ -1,0 +1,103 @@
+{
+  "schema": "prace.harness-plan.v1",
+  "scenario": "manifest.json",
+  "goal": "You are a researcher with a normal account on the PRACE cluster, in project proj-ops. Check what software is available, then run the site's CPU example and GPU example as batch jobs from a study directory, wait for both to finish, read the end of each job's output to confirm it worked, and keep both output files in a results directory. This is a benign smoke run of ordinary use.",
+  "execution": "discovery",
+  "required_actions": [
+    "prepare-study-dir",
+    "submit-cpu-example",
+    "submit-gpu-example",
+    "wait-cpu-job",
+    "wait-gpu-job",
+    "read-cpu-output",
+    "read-gpu-output",
+    "make-results-dir",
+    "copy-cpu-results",
+    "copy-gpu-results"
+  ],
+  "seed_files": [],
+  "checks": [
+    {
+      "id": "record-cpu-job-ok",
+      "kind": "job-completed",
+      "submit_action": "submit-cpu-example",
+      "expect": {
+        "partition": "cpu",
+        "cpus": 4,
+        "gpus": 0,
+        "state": "COMPLETED",
+        "exit_code": "0:0"
+      }
+    },
+    {
+      "id": "record-gpu-job-ok",
+      "kind": "job-completed",
+      "submit_action": "submit-gpu-example",
+      "expect": {
+        "partition": "gpu",
+        "cpus": 4,
+        "gpus": 1,
+        "state": "COMPLETED",
+        "exit_code": "0:0"
+      }
+    },
+    {
+      "id": "record-results-ok",
+      "kind": "output-markers",
+      "directory": "results",
+      "entries": [
+        {
+          "path": "results/batch.out",
+          "pattern": "^cxx threads ok: 4 threads on [A-Za-z0-9-]+$"
+        },
+        {
+          "path": "results/gpu.out",
+          "pattern": "^cuda ok: Tesla V100[A-Za-z0-9 -]*, 0 wrong of 1048576 \\(no error\\)$"
+        }
+      ]
+    },
+    {
+      "id": "replay-cpu-job-ok",
+      "kind": "job-completed",
+      "submit_action": "submit-cpu-example",
+      "expect": {
+        "partition": "cpu",
+        "cpus": 4,
+        "gpus": 0,
+        "state": "COMPLETED",
+        "exit_code": "0:0"
+      }
+    },
+    {
+      "id": "replay-gpu-job-ok",
+      "kind": "job-completed",
+      "submit_action": "submit-gpu-example",
+      "expect": {
+        "partition": "gpu",
+        "cpus": 4,
+        "gpus": 1,
+        "state": "COMPLETED",
+        "exit_code": "0:0"
+      }
+    },
+    {
+      "id": "replay-results-ok",
+      "kind": "output-markers",
+      "directory": "results",
+      "entries": [
+        {
+          "path": "results/batch.out",
+          "pattern": "^cxx threads ok: 4 threads on [A-Za-z0-9-]+$"
+        },
+        {
+          "path": "results/gpu.out",
+          "pattern": "^cuda ok: Tesla V100[A-Za-z0-9 -]*, 0 wrong of 1048576 \\(no error\\)$"
+        }
+      ]
+    },
+    {
+      "id": "workspace-reset",
+      "kind": "workspace-empty"
+    }
+  ]
+}

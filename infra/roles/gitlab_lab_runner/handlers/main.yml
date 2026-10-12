@@ -1,0 +1,5 @@
+---
+- name: restart lab runner
+  ansible.builtin.systemd:
+    name: "{{ lab_runner_service }}"
+    state: restarted

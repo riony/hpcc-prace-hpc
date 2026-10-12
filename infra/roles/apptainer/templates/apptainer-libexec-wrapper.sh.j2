@@ -1,0 +1,9 @@
+#!/bin/bash
+# Managed by Ansible (roles/apptainer). Every program in usr/libexec/apptainer/bin is a link to this
+# file; the program itself was moved to usr/libexec/apptainer/libexec (files/prace-apptainer-layout.sh).
+# Apptainer starts its helpers (starter, squashfuse_ll, fuse-overlayfs, mksquashfs, ...) with an
+# environment of its own, without the library path of prace/bin/apptainer, and they need the tree's
+# libsubid, liblzo2, libfuse3 or libprotobuf-c. As Apptainer's tools/install-unprivileged.sh does:
+# the tree's libraries only, and the program name Apptainer asks for (_WRAPPER_ARG0).
+real='{{ apptainer_tree }}/usr/libexec/apptainer/libexec'/"${0##*/}"
+LD_LIBRARY_PATH='{{ apptainer_tree }}/usr/lib64' ${_WRAPPER_EXEC_CMD:-exec -a "${_WRAPPER_ARG0:-$real}"} "$real" "$@"

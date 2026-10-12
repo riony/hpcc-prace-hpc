@@ -1,0 +1,245 @@
+---
+# Slurm through Slinky on K3s (PLAN D36/D37, docs/reference/SLINKY-REBUILD-2026-09-27.md). Login node only:
+# K3s applies the manifests this role writes (HelmChart objects with the vendored charts).
+# Charts are vendored in files/ (sha256 = the OCI blob digest on ghcr.io/slinkyproject/charts);
+# every image is pinned by digest, because the chart defaults are Slurm 26.05 and alpine:latest.
+slinky_charts:
+  - {name: slurm-operator-crds, namespace: slinky, sha256: fdc011a81d4f86de5ce0940b8181dbfacd4c8cb9c22724704bb5898ae18551bd}
+  - {name: slurm-operator, namespace: slinky, sha256: 8521035313b9bf936e473e1aa1d452206aa3e5f4073b3b47af48b54d87b9be00}
+  - {name: slurm, namespace: slurm, sha256: 5b4fd6e02232818e8a9ba02c9a6feb790fbc455cf758a106c0174762462048a5}
+slinky_chart_version: 1.2.2
+slinky_images:
+  operator: {repository: ghcr.io/slinkyproject/slurm-operator, tag: "1.2.2", digest: "sha256:0ce1930f20dedfbccc0da8c5d249af4a63d2f83f9fc02b2f345da5c0f7b3b3de"}
+  webhook: {repository: ghcr.io/slinkyproject/slurm-operator-webhook, tag: "1.2.2", digest: "sha256:da98125cd06f20e94a64f716976e4391d7c0ace32e81f71bcd01735f4f117b12"}
+  slurmctld: {repository: ghcr.io/slinkyproject/slurmctld, tag: 25.11.8-rockylinux9, digest: "sha256:23437ccb017d49ec16890e16290e33335a683df9b53764b8d5749bd2762244fc"}
+  slurmd: {repository: ghcr.io/slinkyproject/slurmd, tag: 25.11.8-rockylinux9, digest: "sha256:a3a81989a48de9a2d0cbb8cc559ce3b6d7f710158c12a04ed54884599abc88c5"}
+  slurmrestd: {repository: ghcr.io/slinkyproject/slurmrestd, tag: 25.11.8-rockylinux9, digest: "sha256:c7a533c0e4ab27e17e20fa828cf70e41a573262cb550dc3b8b6f15fd014599d8"}
+  slurmdbd: {repository: ghcr.io/slinkyproject/slurmdbd, tag: 25.11.8-rockylinux9, digest: "sha256:2a6ce3508c38137af091e15d8034dd8c8c3cde5ab3516cfe96675d3dbd1ac7dc"}
+  login: {repository: ghcr.io/slinkyproject/login, tag: 25.11.8-rockylinux9, digest: "sha256:01a27e7920e443927e2f0a068cd8c5b8a68f0b9ef2f021693b995b4c21aa2af2"}
+  alpine: {repository: docker.io/library/alpine, tag: "3.22", digest: "sha256:5291449c3df73caf6ed85e649dec1b9e818b39a5d8c871e97afc13e9cd5e8fa8"}
+# Pulled on the login node and served to compute nodes as archives (tasks/images.yml).
+slinky_worker_images: [slurmd, alpine]
+slinky_image_dir: /srv/fleet-repo/k3s/images
+slinky_image_url: "http://{{ hostvars[groups['login'][0]].admin_ip }}/fleet-repo/k3s/images"
+slinky_manifest_dir: /var/lib/rancher/k3s/server/manifests
+slinky_kubectl: /usr/local/bin/k3s kubectl   # the scheduler preflight's (tests point it at the slurm bench)
+slinky_preflight_controller_down: false   # recovery runs only: go on with a silent controller under the lease, revoking nobody (tasks/preflight.yml)
+slinky_preflight_retries: 20   # the preflight waits up to retries x delay (5 min) for K3s and the controller, then stops
+slinky_preflight_delay: 15
+slinky_db_password_file: /root/slinky-db.pw
+slinky_db_client_host: "10.42.%"      # the pod network (k3s_cluster_cidr 10.42.0.0/16)
+slinky_cluster_name: prace
+# One NodeSet per compute kind; a DaemonSet puts one slurmd pod on every matching node.
+slinky_nodesets: [cpu, gpu]
+slinky_login_node_port: 32222      # login pod ssh, private network only (campus zone allows ssh to the host only)
+# --- Scheduler policy (D39 generic academic projects; user decisions 29 Sep 2026) ---------------
+# Projects are the cluster_groups with a GID in slinky_project_gids; each is a Slurm account and
+# its members' only accounts. A user in no project has no association and cannot run jobs (owner
+# decision 30 Sep: mirror the production PBS clusters, where a job needs a project).
+# Every job names its account with -A, like PBS -P on the production cluster: the Lua submit
+# filter (templates/job_submit.lua.j2) rejects a job without one; root is exempt. The filter also
+# keeps a GPU node's CPUs and memory with its GPUs (slinky_gpu_share, below).
+# files/prace-slurm-accounts.py makes the accounting database match (QoS, accounts, associations,
+# default accounts, each association's allowed and default QoS). It changes nothing in Slurm while
+# a user or association it would remove still has queued jobs; tasks/preflight.yml runs the same
+# check at the start of fleet.yml, so such a run stops before any identity change (D40).
+slinky_project_gids: [31001, 31999]
+# Account settings. GrpTRES is shared by the whole account; "" = no limit. The project's quota on
+# the free queues is QoS normal's MaxTRESPerAccount (below), so pay-per-use jobs are not held by it.
+slinky_account_settings:
+  project: {Fairshare: 100, GrpTRES: ""}
+# QoS. normal: every association's QoS, with the project's quota (MaxTRESPerAccount) and no
+# per-user limit (owner decision 2 Oct: production has none outside its free queues). debug: the
+# debug partition's QoS, a per-job size and a GPU pool shared by everyone's debug jobs (a
+# partition QoS limit replaces the job QoS's same limit for that partition's jobs, Slurm
+# resource_limits). DenyOnLimit rejects at submission a job that could never fit a Max limit.
+slinky_qos:
+  # the free queues, per project (MaxTRESPerAccount): stands in for the production clusters' quota
+  # per project on their free queues (charge rate 0, limited CPUs/GPUs; checklist B10, G1)
+  # no per-user limits: production has none outside its free queues (owner decision 2 Oct; checklist B7-B9)
+  normal: {Priority: 0, MaxTRESPerAccount: "cpu=96,gres/gpu=16", Flags: DenyOnLimit}
+  debug: {Priority: 0, MaxTRESPerJob: "cpu=8,gres/gpu=1,mem=90G", GrpTRES: "gres/gpu=4", Flags: DenyOnLimit}
+# The QoS every association (except root) may use, and its default: exactly these, so a QoS
+# granted by hand (an unlimited one, say) cannot bypass the normal limits. The debug partition's
+# QoS applies through the partition and needs no grant.
+slinky_assoc_qos: {allowed: [normal], default: normal}
+# Partition limits per NodeSet. The memory settings are derived from slinky_nodeset_resources:
+# on cpu, DefMemPerCPU and MaxMemPerCPU are the node's share per CPU (job memory / job CPUs), so a
+# job asking for more memory is given the CPUs that memory belongs to (Slurm raises its CPU
+# count); on gpu, DefCpuPerGPU and DefMemPerGPU are one GPU's share (slinky_gpu_share).
+slinky_partition_policy:
+  cpu: {DefaultTime: "01:00:00", MaxTime: "1-00:00:00"}
+  gpu: {DefaultTime: "01:00:00", MaxTime: "1-00:00:00"}
+# A GPU node's job CPUs and memory per GPU (32 CPUs, 720 GiB, 8 V100: 4 CPUs and 90 GiB). A job
+# on a GPU node takes at least one GPU, and the submit filter rewrites it to exactly this share per
+# GPU in gpu, debug and payg (owner decisions 30 Sep and 2 Oct, production's rule; bench probe
+# 30 Sep: one-GPU or GPU-less jobs held whole V100 nodes). --exclusive stays allowed in gpu: Slurm
+# then allocates and counts all of the node's GPUs.
+slinky_gpu_share:
+  cpus: "{{ (slinky_nodeset_resources.gpu.cpu | int) // (slinky_gpus_per_node | int) }}"
+  mem_mib: "{{ (slinky_nodeset_resources.gpu.memory[:-2] | int) * 1024 // (slinky_gpus_per_node | int) }}"
+# CPU nodes: their NodeSet feature (a debug job without GPUs is constrained to it; a native worker
+# registers with the same) and their memory per job CPU (110 GiB / 48: the cpu partition's
+# DefMemPerCPU and MaxMemPerCPU, and the limit for a debug job without GPUs).
+slinky_cpu_feature: cpu
+# What a job is charged per hour on the partitions with GPU nodes (gpu, debug, payg): its CPUs, or
+# 4 per GPU when that is more (PriorityFlags=MAX_TRES: the largest TRES on a node, not their sum).
+# Production charges a GPU as 4 units and never charges memory (PBS-POLICY-MIRROR-CHECKLIST A6/G3,
+# read 1 Oct: GAAS GPU-hours x 4, WF core-hours with 4 CPUs per GPU). Within the share (4 CPUs per
+# GPU) this is Slurm's default CPU billing; a job naming fewer CPUs than its GPUs' share no longer
+# pays less (bench probe v2: 8 GPUs and 1 CPU were billed 1). Fairshare and payg credits alike.
+slinky_tres_billing_weights: "CPU=1.0,GRES/gpu=4.0"
+slinky_cpu_mib_per_cpu: "{{ (slinky_nodeset_resources.cpu.memory[:-2] | int) * 1024 // (slinky_nodeset_resources.cpu.cpu | int) }}"
+# Short jobs on every worker (same slurmd pods, no extra NodeSet). DefMemPerCPU is the smallest
+# NodeSet share.
+slinky_debug_partition: {DefaultTime: "00:10:00", MaxTime: "00:30:00", QOS: debug, PriorityJobFactor: "100"}
+# What slurmctld prints once the policy is live (tasks/login.yml waits for it; the exact forms
+# were read from the slurm bench, infra/tests/slurm-bench).
+slinky_policy_expected_live:
+  - "AccountingStorageEnforce={{ slinky_scheduler_conf.AccountingStorageEnforce }}"
+  - "EnforcePartLimits={{ slinky_scheduler_conf.EnforcePartLimits }}"
+  - "JobSubmitPlugins={{ slinky_scheduler_conf.JobSubmitPlugins }}"
+  - "partition debug qos={{ slinky_debug_partition.QOS }}"
+# --- Pay per use (simulated; owner 30 Sep, D41 item 6) ---------------------------------------------
+# Production has one pay-per-use queue that charges credits at a rate, beside free queues limited
+# per project. Simulated here until its configuration is supplied (PBS-POLICY-MIRROR-CHECKLIST, G):
+# - partition payg over every worker, the free queues' node shares (a GPU job gets 4 CPUs and
+#   90 GiB per GPU; jobs without GPUs run on CPU nodes), the free queues' priority
+#   (Slurm's default partition factor 1);
+# - charge rate: slinky_tres_billing_weights, times the QoS UsageFactor: 1 credit per CPU-hour, and
+#   a GPU at least 4 credits an hour whatever CPUs the job names (production: 4 units per GPU-hour);
+# - credits: each project's own QoS payg-<project> with Flags=NoDecay (usage does not decay) and
+#   GrpTRESMins=billing=<credits x 60>. A job whose whole time limit does not fit the credit left
+#   (after the running jobs' remaining time; AccountingStorageEnforce=safe) is accepted and
+#   waits (QOSGrpBillingMinutes), even one costing more than the whole credit, until the credit
+#   fits; a running job is never killed for credit (safe, and the reconciler never lowers a credit
+#   while jobs run on it; owner decision 2 Oct). The submit filter gives a payg job its project's
+#   QoS, and refuses the payg QoS outside payg. Not held by the free queues' per-project quota.
+# Balance: scontrol show assoc_mgr flags=qos qos=payg-<project> (GrpTRESMins=billing=LIMIT(USED),
+# in credit-minutes). Top up: raise the project's credits here, or sacctmgr modify qos payg-<p> set RawUsage=0.
+slinky_payg:
+  partition: payg
+  qos_prefix: payg-
+  DefaultTime: "01:00:00"
+  MaxTime: "1-00:00:00"
+  PriorityJobFactor: "1"                 # Slurm's default, as cpu and gpu (debug 100)
+  # no per-user limits, and no DenyOnLimit: a job the credit cannot cover yet is accepted and waits
+  # (QOSGrpBillingMinutes) until it fits; `safe` never starts a job its credit cannot finish (owner, 2 Oct)
+  qos: {Priority: 0, UsageFactor: "1.0", Flags: NoDecay}
+  credits: {default: 1000}               # credit-hours per project; a project's own value by name
+# QoS names the accounting database already has; a partition names only these (null = all).
+# slurmctld refuses to start on an unknown partition QoS; tasks/login.yml sets this.
+slinky_known_qos: null
+# Controller-wide policy settings (slurm.conf).
+slinky_scheduler_conf:
+  # safe: a job runs against a credit limit (GrpTRESMins, pay per use) only if its whole time limit
+  # fits what is left after the running jobs' remaining time; without it Slurm starts a job while
+  # any credit remains and kills it when the credit runs out (Slurm's documented behaviour)
+  AccountingStorageEnforce: associations,limits,qos,safe
+  EnforcePartLimits: ALL                 # refuse at submission a job that does not fit EVERY partition it requests
+  JobSubmitPlugins: lua
+  # the weights of Slurm's documented multifactor example (priority_multifactor): fairshare 10000,
+  # age, job size and partition 1000 each, QoS 0 (every QoS here has priority 0)
+  PriorityWeightFairshare: "10000"
+  PriorityWeightQOS: "0"
+  PriorityWeightPartition: "1000"
+  PriorityWeightAge: "1000"
+  PriorityWeightJobSize: "1000"
+  PriorityMaxAge: "1-00:00:00"
+  PriorityDecayHalfLife: "1-00:00:00"    # the event lasts days, not months
+  PriorityCalcPeriod: "1"                # minutes: usage (fairshare, pay-per-use credits) is charged every minute
+  PriorityFlags: MAX_TRES                # billing is a node's largest weighted TRES (slinky_tres_billing_weights)
+# --- Shared storage in the pods (T87) ----------------------------------------------------------
+# Every enabled home/projects/apps share uses static NFS PV/PVC mount options, on login and
+# worker pods alike. Required exports and mounts are checked before the consumer chart changes.
+# A missing home is a refusal, never an inline NFS or local-directory fallback.
+slinky_pod_shares: >-
+  {{ (storage_lvs | default([]))
+     | rejectattr('name', 'in', storage_defer | default([])) | list
+     if storage_enable | default(true) | bool else [] }}
+slinky_share_modes: "{{ slinky_pod_shares | map(attribute='path') | zip(slinky_pod_shares | map(attribute='export')) | map('join', ':') | list }}"
+slinky_share_probe_specs: >-
+  {{ slinky_pod_shares | map(attribute='path') | zip(slinky_pod_shares | map(attribute='export'),
+     slinky_pod_shares | map(attribute='name') | map('regex_replace', '^', 'prace-')) | map('join', ':') | list }}
+# the hosts' storage_client_opts without _netdev (boot ordering, meaningless for kubelet); a
+# read-only share also gets ro
+slinky_pod_mount_options: [nosuid, nodev, hard, nfsvers=4.2]
+# Inside the pod, containerd 2.3.4 hands each volume to runc as [rbind, rprivate, rw|ro] and the
+# container's bind mount loses those nosuid,nodev (3 Oct, runbook step 5). The NRI plugin
+# prace-nri-mount-guard (infra/nri-mount-guard; a reproducible build, refused with another hash)
+# adds them again on every node, for the share mounts of these namespaces' pods; the login and
+# slurmd containers first run files/prace-share-check.sh, which refuses to start without them.
+slinky_nri_guard_sha256: 663e5ba689241fe6c52a1c0e34f6f8b078710d77045cea145c3ced71ecdbca71
+slinky_nri_guard_namespaces: [slurm]
+# the login and slurmd images' entrypoint, which the share check runs after its check (3 Oct)
+slinky_container_entrypoint: /usr/local/bin/entrypoint.sh
+# What tasks/slurm-accounts.yml gives files/prace-slurm-accounts.py (no keys or comments).
+slinky_accounts_spec:
+  cluster: "{{ slinky_cluster_name }}"
+  users: "{{ cluster_users | map('dict2items') | map('selectattr', 'key', 'in', ['name', 'uid', 'groups', 'state']) | map('items2dict') | list }}"
+  groups: "{{ cluster_groups }}"
+  project_gids: "{{ slinky_project_gids }}"
+  account_settings: "{{ slinky_account_settings }}"
+  qos: "{{ slinky_qos }}"
+  payg: {qos_prefix: "{{ slinky_payg.qos_prefix }}", qos: "{{ slinky_payg.qos }}", credits: "{{ slinky_payg.credits }}"}
+  assoc_qos: "{{ slinky_assoc_qos }}"
+slinky_default_shell: "{{ cluster_default_shell | default('/bin/bash') }}"   # as roles/cluster_accounts
+# slurmd pod budget per NodeSet kind: below Kubernetes-allocatable (capacity minus
+# system-reserved and eviction threshold) with room for slurmd itself. The slurmd image turns
+# these limits into CoreSpecCount/MemSpecLimit, so Slurm offers exactly this to jobs.
+#   gpu (XL270d): 36 cores/772148 MiB, allocatable 34 CPU / ~768053 MiB -> 32 CPU, 720 GiB
+#   cpu (Lenovo SR650): 56 threads/127681 MiB, allocatable 54 CPU -> 48 CPU, 110 GiB
+slinky_gpus_per_node: 8                  # V100s per GPU node (roles/nvidia_gpu verifies the count)
+slinky_cuda_path: /usr/local/cuda-12.9   # host CUDA toolkit mounted read-only into GPU worker pods
+# The job environment's profile snippet in /etc/profile.d of the login and slurmd pods (T88): the
+# ConfigMap prace-apps-profile from roles/apps_env files/prace-apps-profile.sh; after Lmod's modules.sh
+slinky_apps_profile: z01-prace-apps.sh
+# Per-node explicit GPU lines ({node: ["File=... Cores=...", ...]}) replacing AutoDetect for that
+# node. Empty: all three V100 nodes autodetect. g005 needed one while its BIOS had Sub-NUMA
+# Clustering enabled (4 NUMA nodes of 9 cores; Slurm rejected the autodetected per-NUMA affinity,
+# INVALID_REG, 28 Sep); removed after its BIOS moved to the HPC workload profile with SNC off (D39).
+slinky_gres_overrides: {}
+# --- Native workers (T89; the list is slurm_native_workers in group_vars all/slurm.yml) -----------
+# OpenHPC slurmd of the Slinky images' Slurm version (bench, 30 Sep: it registers with the images'
+# slurmctld over auth/slurm and configless, and the live cgroup.conf confines its jobs under
+# systemd). The host's slurm user must have the images' SlurmUser uid, or slurmd refuses the
+# controller's messages. The job budget is the NodeSet's (slinky_nodeset_resources), kept with
+# CoreSpecCount/MemSpecLimit as the slurmd image does for pods.
+slinky_native_packages: [slurm-ohpc-25.11.8, slurm-slurmd-ohpc-25.11.8]
+# The job environment of a native worker (slurm_native_runtime_packages in group_vars all/slurm.yml):
+# the paths the shared modulefiles and examples use, and Lmod's module command in a login shell.
+slinky_native_runtime_paths: [/etc/profile.d/modules.sh, /usr/lib64/openmpi/bin/mpicc, /usr/lib64/openmpi/bin/mpirun,
+                              /usr/bin/python3.9, /usr/bin/gfortran]
+slinky_native_module_probe: "bash -lc 'module --version' 2>&1"   # a login shell, as jobs get it
+slinky_slurm_uid: 401
+slinky_slurm_gid: "{{ slinky_slurm_uid }}"
+slinky_controller_name: slurm-controller.slurm   # SlurmctldHost's address in the generated slurm.conf
+slinky_controller_port: 6817
+slinky_native_file: /etc/prace-slinky/native-workers   # "name address" per line, for the worker check
+slinky_native_taint: "prace.fleet/native-slurm=true:NoSchedule"   # no Kubernetes workload on a native worker
+# Paths on a native worker (the offline tests, tools/test-slinky-native.py, point them at a temporary tree)
+slinky_native_slurmd: /usr/sbin/slurmd
+# K3s's Helm controller keeps the values it renders (the HelmChart's, then the HelmChartConfig's) in
+# this Secret in kube-system; the T89 bridge waits on it (tasks/charts-applied.yml)
+slinky_chart_values_secret: chart-values-slurm
+# T89 bridge: the native workers of the chart Helm pairs with now (its slurm values in K3s's manifest
+# directory, read by tasks/maintenance-topology.yml once the API holds them); a kind whose NodeSet is
+# off counts as native (parked between two bridge steps included). Before the first bootstrap: none.
+slinky_native_deployed: >-
+  {{ (((slinky_charts_ondisk.content | b64decode | from_yaml_all | selectattr('metadata.name', 'equalto', 'slurm')
+        | first).spec.valuesContent | from_yaml).nodesets | dict2items | rejectattr('value.enabled')
+        | map(attribute='key') | select('in', groups) | map('extract', groups) | flatten | sort)
+     if slinky_charts_ondisk is defined and slinky_charts_ondisk is not skipped else [] }}
+slinky_native_dropin: /etc/systemd/system/slurmd.service.d/prace-native.conf
+# the native slurmd's ExecStartPre (files/prace-native-share-check.sh, 4 Oct): no NRI guard or pod share
+# check exists on the host, so slurmd starts only on the login node's NFS 4.2 exports, hard, nosuid,nodev
+slinky_native_share_check: /usr/local/sbin/prace-native-share-check
+slinky_native_key_file: /etc/slurm/slurm.key
+slinky_native_hosts_file: /etc/hosts
+# This host's transition marker: "native" once it is set up for a native slurmd, "leaving" while
+# tasks/native-off.yml takes that down; removed only when the returning pod worker passes its check
+# (tasks/worker-check.yml). A rerun after any failure therefore repeats the whole rollback.
+slinky_native_marker: /var/lib/prace-slinky/native-state
+slinky_nodeset_resources:
+  gpu: {cpu: "32", memory: 720Gi}
+  cpu: {cpu: "48", memory: 110Gi}

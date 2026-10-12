@@ -1,0 +1,9 @@
+---
+# v1 with the key removed from agent-keyed and agent-leaving deleted.
+cluster_groups:
+  - {name: agents, gid: 40000}
+  - {name: proj-beta, gid: 31002}
+cluster_users:
+  - {name: agent-keyed, uid: 40001, groups: [agents, proj-beta], comment: "keyed", ssh_keys: []}
+  - {name: agent-placeholder, uid: 40002, groups: [agents]}
+  - {name: agent-leaving, uid: 40003, groups: [agents], state: absent}

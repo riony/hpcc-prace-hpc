@@ -1,0 +1,7 @@
+---
+# host_base on the login node: time from the internet pool (campus side), served to the
+# private network; the campus-facing public zone allows ssh only.
+chrony_allow: ["{{ admin_network }}"]
+chrony_allow_zone: trusted
+host_base_fw_zone: public
+host_base_fw_services: [ssh]

@@ -1,0 +1,118 @@
+---
+# T87 (3 Oct): containerd 2.3.4 hands a volume to runc as [rbind, rprivate, rw|ro], and the
+# container's bind mount loses the nosuid,nodev of kubelet's NFS mount. This containerd NRI plugin
+# puts them back on the share mounts of the slurm pods. Every node runs its own containerd, so it
+# runs on every node, before any pod uses the shares (the share probe checks it end to end). While
+# it is not registered, containers start unadjusted and the pods' own share check refuses them.
+- name: The NRI mount guard binary is the reviewed build
+  ansible.builtin.stat:
+    path: "{{ role_path }}/files/prace-nri-mount-guard"
+    checksum_algorithm: sha256
+  delegate_to: localhost
+  become: false
+  run_once: true
+  register: slinky_nri_local
+
+- name: The NRI mount guard binary has the reviewed hash
+  ansible.builtin.assert:
+    that: slinky_nri_local.stat.exists and slinky_nri_local.stat.checksum == slinky_nri_guard_sha256
+    fail_msg: "files/prace-nri-mount-guard is not the reviewed build {{ slinky_nri_guard_sha256 }}: rebuild it (infra/nri-mount-guard)"
+  run_once: true
+
+- name: Observe installed NRI binary and service definition
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    checksum_algorithm: sha256
+    follow: false
+  loop:
+    - /usr/local/sbin/prace-nri-mount-guard
+    - /etc/systemd/system/prace-nri-mount-guard.service
+  register: slinky_nri_installed
+
+- name: Existing NRI paths must be regular files, never symlinks
+  ansible.builtin.assert:
+    that: not item.stat.exists or (item.stat.isreg | default(false) and not item.stat.islnk | default(false))
+  loop: "{{ slinky_nri_installed.results }}"
+
+- name: Observe whether the NRI service is active
+  ansible.builtin.command: systemctl is-active prace-nri-mount-guard
+  register: slinky_nri_active
+  failed_when: false
+  changed_when: false
+  check_mode: false
+
+- name: Observe whether the NRI service is enabled
+  ansible.builtin.command: systemctl is-enabled prace-nri-mount-guard
+  register: slinky_nri_enabled
+  failed_when: false
+  changed_when: false
+  check_mode: false
+
+- name: Does the NRI service need a mutation?
+  ansible.builtin.set_fact:
+    slinky_nri_mutation: >-
+      {{ slinky_nri_installed.results[0].stat.checksum | default('') != slinky_nri_guard_sha256
+         or slinky_nri_installed.results[1].stat.checksum | default('') != (lookup('ansible.builtin.template', 'prace-nri-mount-guard.service.j2') | hash('sha256'))
+         or slinky_nri_active.rc != 0 or slinky_nri_enabled.rc != 0
+         or slinky_nri_installed.results[0].stat.mode | default('') != '0755'
+         or slinky_nri_installed.results[1].stat.mode | default('') != '0644'
+         or slinky_nri_installed.results[0].stat.uid | default(-1) != 0
+         or slinky_nri_installed.results[1].stat.uid | default(-1) != 0
+         or slinky_nri_installed.results[0].stat.gid | default(-1) != 0
+         or slinky_nri_installed.results[1].stat.gid | default(-1) != 0 }}
+
+# Once for the play, if any node needs a mutation: the check takes the window tool's workstation
+# lock without waiting, so one check per node (five in parallel at a first installation) would stop
+# all but one ("another local window operation is running", 4 Oct). A failed run_once task ends the
+# play for every host before any mutation.
+- name: A runtime service mutation requires the owned closed window even with slinky_nri alone
+  ansible.builtin.command:
+    argv: ["{{ ansible_playbook_python }}", "{{ role_path }}/../../tools/require-closed-window.py"]
+    stdin: "{{ {'lease_id': fleet_lease_id | default(''), 'intent': slurm_window_intent | default(none)} | to_json }}"
+  environment:
+    PRACE_LOGIN: "{{ hostvars[groups['login'][0]].ansible_host | default(hostvars[groups['login'][0]].admin_ip) }}"
+  delegate_to: localhost
+  become: false
+  run_once: true
+  changed_when: false
+  check_mode: false
+  when: ansible_play_hosts | map('extract', hostvars, 'slinky_nri_mutation') | map('bool') | select | list | length > 0
+
+- name: The NRI mount guard installed
+  ansible.builtin.copy:
+    src: prace-nri-mount-guard
+    dest: /usr/local/sbin/prace-nri-mount-guard
+    owner: root
+    group: root
+    mode: "0755"
+  register: slinky_nri_bin
+
+- name: Its service (the namespaces and the share paths it guards)
+  ansible.builtin.template:
+    src: prace-nri-mount-guard.service.j2
+    dest: /etc/systemd/system/prace-nri-mount-guard.service
+    owner: root
+    group: root
+    mode: "0644"
+  register: slinky_nri_unit
+
+- name: Running; restarted when either changed (running containers keep their mounts)
+  ansible.builtin.systemd:
+    name: prace-nri-mount-guard
+    enabled: true
+    daemon_reload: "{{ slinky_nri_unit is changed }}"
+    state: "{{ 'restarted' if slinky_nri_bin is changed or slinky_nri_unit is changed else 'started' }}"
+  when: not ansible_check_mode
+
+- name: Registered with containerd (its ready file names the service's own process)
+  ansible.builtin.shell: |
+    for i in $(seq 30); do
+      pid=$(systemctl show -p MainPID --value prace-nri-mount-guard)
+      if [ "$pid" != 0 ] && grep -qs "^pid=$pid " /run/prace-nri-mount-guard/ready; then cat /run/prace-nri-mount-guard/ready; exit 0; fi
+      sleep 1
+    done
+    echo "prace-nri-mount-guard is not registered with containerd after 30 s"
+    systemctl --no-pager status prace-nri-mount-guard | tail -5
+    exit 1
+  changed_when: false
+  when: not ansible_check_mode

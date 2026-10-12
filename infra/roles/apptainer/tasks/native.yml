@@ -1,0 +1,13 @@
+---
+# Managed by Ansible (roles/apptainer). A native worker's read-only checks (files/prace-apptainer-native-check.sh),
+# before the login node offers the module (tasks/tree.yml waits for them).
+- name: Native worker - user namespaces, /dev/fuse, no subordinate id ranges (read-only, T89)
+  ansible.builtin.command:
+    argv: "{{ ['bash', '-s', '--', apptainer_check_userns, apptainer_check_fuse] + apptainer_check_subid + ['--']
+              + (cluster_users | map(attribute='name') | zip(cluster_users | map(attribute='uid') | map('string'))
+                 | map('join', ':') | list) }}"
+    stdin: "{{ lookup('ansible.builtin.file', 'prace-apptainer-native-check.sh') }}"
+  register: apptainer_native
+  changed_when: false
+  check_mode: false
+  when: inventory_hostname in (slurm_native_workers | default([])) and apptainer_enabled | bool

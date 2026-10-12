@@ -1,0 +1,28 @@
+---
+- name: Provision the local PRACE CPU demonstration
+  hosts: localhost
+  gather_facts: false
+  vars:
+    prace_demo_root: "{{ playbook_dir | dirname }}"
+    prace_demo_state: "{{ lookup('ansible.builtin.env', 'HOME') }}/.local/state/hpcc-prace-hpc-public/demo"
+  tasks:
+    - name: Create the dedicated local kind cluster and Slurm installation
+      ansible.builtin.command:
+        argv:
+          - python3
+          - "{{ prace_demo_root }}/demo/cluster.py"
+          - up
+          - --state
+          - "{{ prace_demo_state }}"
+        creates: "{{ prace_demo_state }}/ready.json"
+      register: prace_demo_creation
+    - name: Verify the owned cluster remains available
+      ansible.builtin.command:
+        argv:
+          - python3
+          - "{{ prace_demo_root }}/demo/cluster.py"
+          - status
+          - --state
+          - "{{ prace_demo_state }}"
+      changed_when: false
+      when: not ansible_check_mode

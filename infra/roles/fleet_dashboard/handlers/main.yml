@@ -1,0 +1,13 @@
+---
+# Names are prefixed: handler names are global in a play, and other roles in mgmt.yml have their own.
+- name: fleet_dashboard reload systemd
+  ansible.builtin.systemd:
+    daemon_reload: true
+  when: fleet_dashboard_enable | bool and not ansible_check_mode
+
+- name: fleet_dashboard refresh data
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    state: started          # one run of each oneshot collector, so the page has data right after a deploy
+  loop: [prace-dash-evidence.service, prace-dash-observe.service, prace-dash-gitlab.service]
+  when: fleet_dashboard_enable | bool and not ansible_check_mode

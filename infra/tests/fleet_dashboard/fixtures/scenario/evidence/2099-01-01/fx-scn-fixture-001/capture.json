@@ -1,0 +1,37 @@
+{
+ "actors": [
+  {
+   "account": "syn-alice",
+   "under_test": true
+  },
+  {
+   "account": "syn-carol",
+   "under_test": false
+  }
+ ],
+ "captured_at": 4070915400,
+ "files": {
+  "events.jsonl": "events from the sources below, one per line",
+  "observation-fx-1.json": "raw observation at START",
+  "observation-fx-2.json": "raw observation during the run",
+  "sacct.txt": "sacct in the controller pod for the run window",
+  "sshd-login-pod.log": "login-pod sshd log for the window"
+ },
+ "kind": "scenario-run",
+ "lease_id": "fedcba9876543210",
+ "lease_label": "fx-scenario",
+ "observations": [
+  "observation-fx-1.json",
+  "observation-fx-2.json"
+ ],
+ "recovery": {
+  "after": "fx-point-after",
+  "before": "fx-point-before",
+  "restore_test": "passed"
+ },
+ "run_id": "fx-scn-fixture-001",
+ "schema": 1,
+ "start": 4070912400,
+ "stop": 4070914200,
+ "title": "fx fixture: GPU job under test (tests only)"
+}

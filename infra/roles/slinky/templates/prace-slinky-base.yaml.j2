@@ -1,0 +1,58 @@
+# Managed by Ansible (roles/slinky). Applied by K3s from its manifests directory.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: slinky
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: slurm
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mariadb-password
+  namespace: slurm
+type: Opaque
+stringData:
+  password: "{{ slinky_pw.content | b64decode | trim }}"
+---
+# Cluster users for the login pods (SSSD files domain), generated from group_vars/all/accounts.yml
+# so UIDs/GIDs match the NFS-backed /home. Job users on compute pods come from nss_slurm.
+# Only present users (state absent = revoked: no passwd entry, no groups, even if a home and
+# keys were retained); each keeps its configured shell (e.g. /sbin/nologin). Password field '*'
+# (no password, as for directory users): with 'x' pam_unix looks for a shadow entry that does not
+# exist in the pod and its account check fails, refusing every key login.
+{% set present = cluster_users | rejectattr('state', 'defined') | list
+   + (cluster_users | selectattr('state', 'defined') | selectattr('state', 'equalto', 'present') | list) %}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prace-identity
+  namespace: slurm
+data:
+  passwd: |
+{% for u in present %}
+    {{ u.name }}:*:{{ u.uid }}:{{ u.uid }}:{{ u.comment | default('') }}:/home/{{ u.name }}:{{ u.shell | default(slinky_default_shell) }}
+{% endfor %}
+  group: |
+{% for u in present %}
+    {{ u.name }}:x:{{ u.uid }}:
+{% endfor %}
+{% for g in cluster_groups %}
+    {{ g.name }}:x:{{ g.gid }}:{{ present | selectattr('groups', 'contains', g.name) | map(attribute='name') | join(',') }}
+{% endfor %}
+---
+# The job environment's profile snippet (T88; roles/apps_env files/prace-apps-profile.sh, the same
+# file a native worker gets on its host): /apps/modulefiles on MODULEPATH in the login and slurmd
+# pods, and nothing where /apps is absent or deferred. Mounted with subPath, so a changed snippet
+# reaches a pod when it restarts.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prace-apps-profile
+  namespace: slurm
+data:
+  {{ slinky_apps_profile }}: |
+    {{ lookup('ansible.builtin.file', role_path ~ '/../apps_env/files/prace-apps-profile.sh') | indent(4) }}

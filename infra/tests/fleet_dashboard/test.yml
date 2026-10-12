@@ -1,0 +1,23 @@
+---
+- name: fleet_dashboard role test (disposable container only)
+  hosts: mgmt
+  gather_facts: false
+  roles:
+    - fleet_dashboard
+
+- name: gitlab.rb renders the /prace-dash/ location only when enabled
+  hosts: mgmt
+  gather_facts: false
+  tags: [render]
+  tasks:
+    - name: Render gitlab.rb with and without the dashboard location
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/../../roles/gitlab/templates/gitlab.rb.j2"
+        dest: "/tmp/gitlab.rb.{{ item }}"
+        mode: "0600"
+      vars:
+        gitlab_prace_dash: "{{ item == 'on' }}"
+        gitlab_prace_dash_root: /var/lib/prace-dash/www
+        gitlab_smtp_enable: false
+        gitlab_backup_keep_days: 7
+      loop: ["on", "off"]

@@ -1,0 +1,12 @@
+---
+- name: Every required pod carries the exact reviewed startup check
+  ansible.builtin.command:
+    argv: [python3, '-']
+    stdin: "{{ lookup('ansible.builtin.file', role_path ~ '/files/prace-share-pods.py') }}"
+  environment:
+    PRACE_SHARE_POD_SPEC: >-
+      {{ {'command': ['/bin/sh', '-c', lookup('ansible.builtin.file', role_path ~ '/files/prace-share-check.sh'), 'prace-share-check'] + slinky_share_modes + ['--', slinky_container_entrypoint],
+          'workers': groups['compute'] | difference(slurm_native_workers | default([])),
+          'login_required': (slurm_window_intent | default({})).get('phase', 'opening') != 'closed'} | to_json }}
+  changed_when: false
+  check_mode: false

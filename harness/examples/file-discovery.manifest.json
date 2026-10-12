@@ -1,0 +1,114 @@
+{
+  "schema": "prace.scenario.v1",
+  "id": "file-discovery-smoke",
+  "version": 1,
+  "title": "Bounded file discovery and replay",
+  "status": "smoke",
+  "description": "Benign discovery of a seeded workspace followed by a declared marker write. No security claim.",
+  "actor": {
+    "identity": "syn-smoke",
+    "project": "proj-ops",
+    "intent": "benign"
+  },
+  "boundaries": {
+    "action_targets": [
+      "local-workspace"
+    ],
+    "observation_targets": [
+      "local-workspace"
+    ],
+    "paths": [
+      "/tmp/prace-file-ops-smoke-v1"
+    ],
+    "action_kinds": [
+      "file.list",
+      "file.stat",
+      "file.write"
+    ]
+  },
+  "budgets": {
+    "max_actions": 8,
+    "max_seconds": 120,
+    "max_output_bytes": 4096
+  },
+  "actions": [
+    {
+      "id": "inspect-root",
+      "kind": "file.list",
+      "target": "local-workspace",
+      "identity": "syn-smoke",
+      "parameters": {
+        "path": "/tmp/prace-file-ops-smoke-v1"
+      },
+      "timeout_seconds": 10,
+      "capture": {
+        "listing": "root_listing"
+      }
+    },
+    {
+      "id": "inspect-input",
+      "kind": "file.stat",
+      "target": "local-workspace",
+      "identity": "syn-smoke",
+      "parameters": {
+        "path": "/tmp/prace-file-ops-smoke-v1/input.txt"
+      },
+      "timeout_seconds": 10,
+      "capture": {
+        "metadata": "input_metadata"
+      }
+    },
+    {
+      "id": "write-marker",
+      "kind": "file.write",
+      "target": "local-workspace",
+      "identity": "syn-smoke",
+      "parameters": {
+        "path": "/tmp/prace-file-ops-smoke-v1/marker.txt",
+        "content": "integration-marker\n"
+      },
+      "timeout_seconds": 10,
+      "capture": {}
+    }
+  ],
+  "assertions": [
+    {
+      "id": "record-layout-ok",
+      "phase": "record",
+      "category": "functional",
+      "description": "After the recorded run, demo-dir exists with only test-file-2.txt."
+    },
+    {
+      "id": "replay-layout-ok",
+      "phase": "replay",
+      "category": "functional",
+      "description": "After deterministic replay from a clean workspace, the same final layout exists."
+    },
+    {
+      "id": "workspace-reset",
+      "phase": "cleanup",
+      "category": "cleanup",
+      "description": "The smoke workspace is emptied after reports are written."
+    }
+  ],
+  "redaction": {
+    "keys": [
+      "password",
+      "token",
+      "secret",
+      "private_key"
+    ],
+    "patterns": [
+      "-----BEGIN [A-Z ]*PRIVATE KEY-----",
+      "(?i)bearer [A-Za-z0-9._-]{16,}",
+      "(?i)kubeconfig:[^ ]+"
+    ]
+  },
+  "gates": [],
+  "cleanup": {
+    "required": true,
+    "check_ids": [
+      "workspace-reset"
+    ]
+  }
+}

@@ -1,0 +1,13 @@
+# Managed by Ansible (roles/ib_fabric). OpenSM for InfiniBand ring link {{ item.link }} only, bound to
+# this node's port of that cable. The link's own subnet prefix keeps the three point-to-point
+# subnets apart (MPI and UCX take one prefix for one fabric). Priority 0: the role starts it only after
+# reading the cable's other end; were it ever on another subnet, that subnet's manager would keep
+# mastership unless it too ran at priority 0.
+# Everything else is OpenSM's default.
+guid 0x{{ item.guid | replace(':', '') }}
+subnet_prefix {{ item.gid_prefix }}
+sm_priority 0
+log_file /var/log/opensm-{{ item.link }}.log
+log_max_size {{ ib_fabric_log_max_mb }}
+dump_files_dir /var/cache/opensm/{{ item.link }}
+partition_config_file /etc/rdma/prace-opensm-{{ item.link }}.partitions

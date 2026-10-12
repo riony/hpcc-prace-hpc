@@ -1,0 +1,9 @@
+---
+# Stand-in for the login node (tools/storage-rehearsal.sh): 4 vCPU / 4096 MiB, 20G OS overlay,
+# blank 24G data disk (serial prace-sr-data) with PV + VG sr_vg and no LV. /home is a plain
+# directory on the root filesystem, as on production before the cutover.
+ansible_host: 127.0.0.1            # the login node's loopback (ProxyJump), never the workstation's
+ansible_port: 2242
+fleet_role: login
+os_disk: {kind: virtio, serial: prace-sr-login-os}   # lsblk SERIAL of the OS overlay (QEMU serial=)
+admin_ip: 10.90.10.1               # the private link to sr-client (production: admin network)

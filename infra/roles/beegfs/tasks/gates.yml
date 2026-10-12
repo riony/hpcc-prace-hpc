@@ -1,0 +1,128 @@
+---
+# Gates of playbooks/beegfs.yml that need no host. Everything here runs on the controller (assert,
+# include_vars, and stat/openssl delegated to localhost), so a refusal contacts no host. Every play
+# includes this file before its first connection: --limit skips the controller play.
+- name: The exact BeeGFS files and signing key (roles/fleet_repo defaults, into bg_fleet_repo only)
+  ansible.builtin.include_vars:
+    file: "{{ role_path }}/../fleet_repo/defaults/main.yml"
+    name: bg_fleet_repo
+
+- name: A qualified release is recorded, and every pinned BeeGFS package is exactly that release
+  vars:
+    want: "{{ bg_required_pins }}"
+    beegfs_versions: "{{ bg_beegfs_pins | map(attribute='nevra') | map('regex_replace', '^.*-[0-9]+:', '') | map('regex_replace', '-[^-]*$', '') | unique | list }}"
+  ansible.builtin.assert:
+    that:
+      - beegfs_qualified_release | default(none) is string and beegfs_qualified_release is match('^8[.][0-9]+[.][0-9]+$')
+      - beegfs_qualification_record | default(none) is string and beegfs_qualification_record is match('^evidence/[0-9]{4}-[0-9]{2}-[0-9]{2}/[A-Za-z0-9._/-]+$')
+      - beegfs_versions == [beegfs_qualified_release]
+      - want | difference(bg_pins.keys() | list) | length == 0
+      - bg_pins.keys() | select('in', beegfs_refused_packages) | list | length == 0
+      - bg_key.fingerprint | default('') is match('^[0-9A-F]{40}$') and bg_key.file | default('') is match('^[A-Za-z0-9._+-]+$')
+      - bg_key.sha256 | default('') is match('^[0-9a-f]{64}$')
+      - bg_repo_url is match('^http://[0-9.]+/[A-Za-z0-9._/-]+$')
+    fail_msg: >-
+      Nothing done: BeeGFS is not qualified. beegfs_qualified_release and beegfs_qualification_record
+      (inventories/fleet/group_vars/all/beegfs.yml) must come from the qualification record, and every
+      package the role installs ({{ want | join(', ') }}) must be pinned at that release in
+      roles/fleet_repo fleet_repo_beegfs_packages (pinned BeeGFS versions: {{ beegfs_versions }};
+      unpinned: {{ want | difference(bg_pins.keys() | list) }}).
+    quiet: true
+
+- name: The BeeGFS data agree with the inventory (unique IDs per class, every NVMe serial recorded)
+  vars:
+    meta_ids: "{{ beegfs_meta_nodes | map(attribute='id') | list }}"
+    storage_ids: "{{ beegfs_storage_nodes | map(attribute='id') | list }}"
+    target_ids: "{{ beegfs_storage_nodes | map(attribute='targets') | flatten | map(attribute='id') | list }}"
+    all_ids: "{{ meta_ids + storage_ids + target_ids + [beegfs_mgmt_id] }}"
+    serial_mismatch: >-
+      {%- set ns = namespace(bad=[]) -%}
+      {%- for n in beegfs_storage_nodes -%}
+      {%-   if n.targets | map(attribute='serial') | sort != hostvars[n.host].nvme_serials | default([]) | sort -%}
+      {%-     set ns.bad = ns.bad + [n.host] -%}
+      {%-   endif -%}
+      {%- endfor -%}
+      {{ ns.bad }}
+  ansible.builtin.assert:
+    that:
+      - groups['login'] | default([]) == [beegfs_mgmt_host]
+      - beegfs_meta_nodes | map(attribute='host') | sort == groups['gpu'] | sort
+      - beegfs_storage_nodes | map(attribute='host') | sort == groups['gpu'] | sort
+      - meta_ids | unique | length == meta_ids | length
+      - storage_ids | unique | length == storage_ids | length
+      - target_ids | unique | length == target_ids | length
+      - all_ids | select('integer') | select('ge', 1) | select('le', 65535) | list | length == all_ids | length
+      - serial_mismatch | length == 0
+    fail_msg: >-
+      Nothing done: inventories/fleet/group_vars/all/beegfs.yml disagrees with the inventory
+      (management host, GPU hosts, unique 1..65535 IDs, or targets vs host_vars nvme_serials: {{ serial_mismatch }})
+    quiet: true
+
+- name: Every BeeGFS run happens inside a cluster lease you hold (its id is required)
+  ansible.builtin.assert:
+    that: fleet_lease_id | default('') | string | length > 0
+    fail_msg: "Nothing done: take the cluster lease and pass its id (-e fleet_lease_id=<id>); see playbooks/beegfs.yml"
+    quiet: true
+
+- name: First use names hosts of this run and exactly their items (only with -e beegfs_format_armed=true)
+  ansible.builtin.assert:
+    that: bg_confirm_errors | length == 0
+    fail_msg: "Nothing done: {{ bg_confirm_errors | join('; ') }}"
+    quiet: true
+
+- name: TLS stays on unless an owner decision is recorded
+  ansible.builtin.assert:
+    that: not beegfs_tls_disable | bool or beegfs_tls_disable_decision | string | length > 0
+    fail_msg: "Nothing done: beegfs_tls_disable=true needs beegfs_tls_disable_decision=<recorded decision>"
+    quiet: true
+
+- name: Controller-private files (connection secret; the management's TLS certificate and key)
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    get_checksum: false
+    get_mime: false
+    follow: false
+  loop: "{{ [beegfs_auth_secret_src] + ([] if beegfs_tls_disable | bool else [beegfs_tls_cert_src, beegfs_tls_key_src]) }}"
+  register: bg_private
+  delegate_to: localhost
+  run_once: true
+  check_mode: false
+
+- name: They exist outside git, are regular files and are private (0600 or 0400)
+  ansible.builtin.assert:
+    that:
+      - item.stat.exists and item.stat.isreg and not item.stat.islnk
+      - item.stat.mode in ['0600', '0400']
+      - not (item.item | realpath).startswith(((playbook_dir ~ '/../..') | realpath) ~ '/')
+      - item.item != beegfs_auth_secret_src or item.stat.size >= beegfs_auth_secret_min_bytes
+    fail_msg: >-
+      Nothing done: {{ item.item }} must be a private (0600/0400) regular file outside the repository
+      (the secret at least {{ beegfs_auth_secret_min_bytes }} bytes); see playbooks/beegfs.yml
+    quiet: true
+  loop: "{{ bg_private.results }}"
+  loop_control: {label: "{{ item.item }}"}
+  run_once: true
+
+- name: The management certificate names its admin address and matches its key
+  ansible.builtin.shell: |
+    set -euo pipefail
+    openssl x509 -noout -ext subjectAltName -in {{ beegfs_tls_cert_src | quote }}
+    cmp -s <(openssl x509 -noout -pubkey -in {{ beegfs_tls_cert_src | quote }}) \
+           <(openssl pkey -pubout -in {{ beegfs_tls_key_src | quote }}) && echo key-matches
+  args: {executable: /bin/bash}
+  register: bg_cert
+  delegate_to: localhost
+  run_once: true
+  changed_when: false
+  check_mode: false
+  failed_when: >-
+    bg_cert.rc != 0 or 'key-matches' not in bg_cert.stdout_lines
+    or bg_cert.stdout is not search('IP Address:' ~ (bg_mgmt_addr | regex_escape) ~ '(?![0-9])')
+  when: not beegfs_tls_disable | bool
+
+# Last: every gate above passed in THIS run. The role's entry files assert it before anything
+# else and fact gathering waits for it, so --start-at-task past the gates contacts no host
+# (Session A re-review of !77, finding 1; the wipe playbook's pattern).
+- name: Every controller-side gate of this run passed
+  ansible.builtin.set_fact:
+    bg_gates_passed: true

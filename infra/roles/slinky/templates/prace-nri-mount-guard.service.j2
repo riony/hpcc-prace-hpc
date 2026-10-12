@@ -1,0 +1,16 @@
+# Managed by Ansible (roles/slinky). T87 (3 Oct): the containerd NRI plugin that gives the share
+# mounts of the {{ slinky_nri_guard_namespaces | join(', ') }} pods nosuid and nodev inside the container.
+# Built from infra/nri-mount-guard; sha256 {{ slinky_nri_guard_sha256 }}.
+[Unit]
+Description=PRACE NRI mount guard: nosuid,nodev on the Slurm pods' share mounts (T87)
+After={{ 'k3s' if fleet_role == 'login' else 'k3s-agent' }}.service
+
+[Service]
+ExecStart=/usr/local/sbin/prace-nri-mount-guard{% for n in slinky_nri_guard_namespaces %} -namespace {{ n }}{% endfor %}{% for sh in slinky_pod_shares %} -path {{ sh.path }}{% endfor %}
+
+# containerd restarted or dropped it: it exits, and registers again
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

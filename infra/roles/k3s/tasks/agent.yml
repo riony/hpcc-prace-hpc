@@ -1,0 +1,73 @@
+---
+- name: Staging directory for verified artifacts
+  ansible.builtin.file:
+    path: "{{ k3s_stage_dir }}"
+    state: directory
+    mode: "0700"
+
+- name: Artifacts from the login node, each checked against the same pinned SHA-256
+  ansible.builtin.get_url:
+    url: "{{ k3s_artifact_url }}/{{ item.name }}"
+    dest: "{{ k3s_stage_dir }}/{{ item.name }}"
+    checksum: "sha256:{{ item.sha256 }}"
+    mode: "0600"
+  loop: "{{ k3s_artifacts }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: A default route that leads nowhere (K3s needs one; this node has no gateway)
+  ansible.builtin.copy:
+    dest: /etc/NetworkManager/system-connections/k3s-default-route.nmconnection
+    owner: root
+    group: root
+    mode: "0600"
+    content: |
+      # Managed by Ansible (roles/k3s). Dummy interface: packets for anything off the private
+      # network are dropped here, so this default route grants no campus transit.
+      [connection]
+      id=k3s-default-route
+      type=dummy
+      interface-name=prace-dummy0
+      autoconnect=true
+
+      [dummy]
+
+      [ipv4]
+      method=manual
+      address1={{ k3s_dummy_route_net }},{{ k3s_dummy_route_gw }}
+      route-metric=4000
+
+      [ipv6]
+      method=disabled
+  register: k3s_dummy
+
+- name: Activate it
+  ansible.builtin.shell: nmcli connection reload && nmcli connection up k3s-default-route
+  when: k3s_dummy.changed or ansible_facts.default_ipv4.address is not defined
+
+- name: Agent join token from the server (agent-only authority; never printed)
+  ansible.builtin.slurp:
+    src: /var/lib/rancher/k3s/server/agent-token
+  delegate_to: "{{ groups['login'][0] }}"
+  register: k3s_token_file
+  no_log: true
+
+- name: Install from the verified copies
+  ansible.builtin.include_tasks: install.yml
+  vars:
+    k3s_src: "{{ k3s_stage_dir }}"
+    k3s_token: "{{ k3s_token_file.content | b64decode | trim }}"
+
+- name: Flush handlers
+  ansible.builtin.meta: flush_handlers
+
+- name: This node is Ready in the cluster
+  ansible.builtin.command: >-
+    /usr/local/bin/k3s kubectl get node {{ inventory_hostname }}
+    -o 'jsonpath={.status.conditions[?(@.type=="Ready")].status}'
+  delegate_to: "{{ groups['login'][0] }}"
+  register: k3s_node_ready
+  until: k3s_node_ready.stdout == 'True'
+  retries: 30
+  delay: 10
+  changed_when: false

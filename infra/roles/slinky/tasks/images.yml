@@ -1,0 +1,61 @@
+---
+# Worker images reach compute nodes (no internet) as image archives served by the login node,
+# like K3s's own air-gap images. The embedded peer mirror (Spegel) is not relied on: on 27 Sep
+# it served g003 but returned 404 to a newly joined g004. Every image is addressed by digest.
+- name: Worker check and re-register scripts on the login node (used by login and worker runs)
+  ansible.builtin.copy:
+    src: "{{ item }}.sh"
+    dest: "/usr/local/sbin/{{ item }}"
+    owner: root
+    group: root
+    mode: "0755"
+  loop: [prace-slinky-worker-check, prace-slinky-reregister]
+  delegate_to: "{{ groups['login'][0] }}"
+  run_once: true
+
+- name: Pinned worker images present on the login node (pulled over its campus uplink)
+  ansible.builtin.shell: >-
+    /usr/local/bin/k3s crictl inspecti {{ img.repository }}@{{ img.digest }} >/dev/null 2>&1
+    && echo present
+    || /usr/local/bin/k3s crictl pull {{ img.repository }}@{{ img.digest }}
+  vars:
+    img: "{{ slinky_images[item] }}"
+  loop: "{{ slinky_worker_images }}"
+  register: slinky_pull
+  changed_when: "'present' not in slinky_pull.stdout"
+  delegate_to: "{{ groups['login'][0] }}"
+  run_once: true
+
+- name: Image archives in the private repository (one per pinned digest)
+  ansible.builtin.shell: |
+    set -e
+    d={{ slinky_image_dir }}; f="$d/{{ item }}-{{ img.digest | replace('sha256:', '') }}.tar"
+    mkdir -p "$d"
+    [ -s "$f" ] && { echo present; exit 0; }
+    /usr/local/bin/k3s ctr -n k8s.io images export --platform linux/amd64 "$f.tmp" "{{ img.repository }}@{{ img.digest }}"
+    mv "$f.tmp" "$f"; chmod 0644 "$f"; restorecon -R "$d"
+  vars:
+    img: "{{ slinky_images[item] }}"
+  loop: "{{ slinky_worker_images }}"
+  register: slinky_export
+  changed_when: "'present' not in slinky_export.stdout"
+  delegate_to: "{{ groups['login'][0] }}"
+  run_once: true
+
+- name: Import each worker image unless its digest is already in this node's store
+  ansible.builtin.shell: |
+    set -e
+    ref="{{ img.repository }}@{{ img.digest }}"
+    /usr/local/bin/k3s crictl inspecti "$ref" >/dev/null 2>&1 && { echo present; exit 0; }
+    f=$(mktemp /var/tmp/slinky-image.XXXXXX)
+    curl -fsS -o "$f" "{{ slinky_image_url }}/{{ item }}-{{ img.digest | replace('sha256:', '') }}.tar"
+    /usr/local/bin/k3s ctr -n k8s.io images import --platform linux/amd64 "$f" >/dev/null
+    rm -f "$f"
+    /usr/local/bin/k3s crictl inspecti "$ref" >/dev/null && echo imported
+  vars:
+    img: "{{ slinky_images[item] }}"
+  loop: "{{ slinky_worker_images }}"
+  register: slinky_import
+  changed_when: "'imported' in slinky_import.stdout"
+  failed_when: slinky_import.rc != 0 or not (slinky_import.stdout is search('present|imported'))
+  when: fleet_role != 'login'

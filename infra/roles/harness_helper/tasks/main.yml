@@ -1,0 +1,146 @@
+---
+- name: Helper delivery is limited to the login node and an explicit full pin
+  ansible.builtin.assert:
+    that:
+      - fleet_role == 'login'
+      - harness_helper_revision is match('^[0-9a-f]{40}$')
+      - not (harness_helper_permission_repair_enabled | bool) or (harness_helper_permission_enabled | bool)
+    quiet: true
+
+- name: Source revision (controller only)
+  ansible.builtin.command:
+    argv: [git, -C, "{{ role_path }}/../../..", rev-parse, HEAD]
+  delegate_to: localhost
+  become: false
+  check_mode: false
+  changed_when: false
+  register: harness_helper_source_pin
+
+- name: Source worktree (controller only)
+  ansible.builtin.command:
+    argv: [git, -C, "{{ role_path }}/../../..", status, --porcelain]
+  delegate_to: localhost
+  become: false
+  check_mode: false
+  changed_when: false
+  register: harness_helper_source_status
+
+- name: Deliver exactly the clean execution pin
+  ansible.builtin.assert:
+    that:
+      - harness_helper_source_pin.stdout == harness_helper_revision
+      - harness_helper_source_status.stdout == ''
+    quiet: true
+
+- name: Shared /apps must be mounted (never write below a missing mount)
+  ansible.builtin.command:
+    argv: [findmnt, -no, SOURCE, --mountpoint, "{{ harness_helper_apps }}"]
+  check_mode: false
+  changed_when: false
+  register: harness_helper_mount
+
+- name: Expected apps device
+  ansible.builtin.assert:
+    that: harness_helper_mount.stdout == harness_helper_device
+    quiet: true
+
+- name: Shared /projects must be mounted
+  ansible.builtin.command:
+    argv: [findmnt, -no, SOURCE, --mountpoint, "{{ harness_helper_projects }}"]
+  check_mode: false
+  changed_when: false
+  register: harness_helper_projects_mount
+
+- name: Expected projects device and existing project
+  ansible.builtin.assert:
+    that: harness_helper_projects_mount.stdout == harness_helper_projects_device
+    quiet: true
+
+- name: Existing project directory (read-only)
+  ansible.builtin.stat:
+    path: "{{ harness_helper_projects }}/proj-ops"
+  register: harness_helper_project
+
+- name: Never create a missing project implicitly
+  ansible.builtin.assert:
+    that:
+      - harness_helper_project.stat.isdir | default(false)
+      - not harness_helper_project.stat.islnk | default(false)
+    quiet: true
+
+- name: Pinned shared helper directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ harness_helper_owner }}"
+    group: "{{ harness_helper_group }}"
+    mode: '0755'
+  loop:
+    - "{{ harness_helper_apps }}/prace"
+    - "{{ harness_helper_apps }}/prace/{{ harness_helper_revision }}"
+
+- name: Helper and both companions from the same source revision
+  ansible.builtin.copy:
+    src: "{{ role_path }}/../../../validation/adapters/{{ item }}"
+    dest: "{{ harness_helper_apps }}/prace/{{ harness_helper_revision }}/{{ item }}"
+    owner: "{{ harness_helper_owner }}"
+    group: "{{ harness_helper_group }}"
+    mode: "{{ '0755' if item == 'prace_file_ops_helper.py' else '0644' }}"
+  loop: "{{ harness_helper_files }}"
+
+- name: Explicit permission helper from the same clean source pin
+  ansible.builtin.copy:
+    src: "{{ role_path }}/../../../validation/adapters/prace_permission_helper.py"
+    dest: "{{ harness_helper_apps }}/prace/{{ harness_helper_revision }}/prace_permission_helper.py"
+    owner: "{{ harness_helper_owner }}"
+    group: "{{ harness_helper_group }}"
+    mode: '0755'
+  when: harness_helper_permission_enabled | bool
+
+- name: Explicit operator repair companion from the same clean source pin
+  ansible.builtin.copy:
+    src: "{{ role_path }}/../../../validation/adapters/prace_permission_repair.py"
+    dest: "{{ harness_helper_apps }}/prace/{{ harness_helper_revision }}/prace_permission_repair.py"
+    owner: "{{ harness_helper_owner }}"
+    group: "{{ harness_helper_group }}"
+    mode: "0755"
+  when: harness_helper_permission_repair_enabled | bool
+
+- name: Shared synthetic runs parent (no existing run is modified)
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ harness_helper_owner }}"
+    group: "{{ harness_helper_run_group }}"
+    mode: '3770'
+  loop:
+    - "{{ harness_helper_runs | dirname }}"
+    - "{{ harness_helper_runs }}"
+
+# The project root deliberately has collaborative default ACLs. Only these two
+# synthetic parents opt out; existing runs and the project ACL are untouched.
+- name: Synthetic parent existence (also supports a fresh check-mode preview)
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  loop:
+    - "{{ harness_helper_runs | dirname }}"
+    - "{{ harness_helper_runs }}"
+  register: harness_helper_parent_stats
+
+- name: Read synthetic parent ACLs
+  ansible.builtin.command:
+    argv: [getfacl, --omit-header, --numeric, --absolute-names, "{{ item.item }}"]
+  loop: "{{ harness_helper_parent_stats.results }}"
+  when: item.stat.exists
+  register: harness_helper_parent_acls
+  changed_when: false
+  check_mode: false
+
+- name: Remove inherited access and default ACLs from synthetic parents only
+  ansible.builtin.command:
+    argv: [setfacl, --remove-all, --remove-default, "{{ item.item.item }}"]
+  loop: "{{ harness_helper_parent_acls.results }}"
+  when:
+    - not item.skipped | default(false)
+    - item.stdout | default('') is search('(?m)^(default:|mask:|user:[^:]|group:[^:])')
+  changed_when: true

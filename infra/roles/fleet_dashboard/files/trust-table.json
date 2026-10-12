@@ -1,0 +1,24 @@
+{
+ "schema": 1,
+ "comment": "T1-T3 source trust for scenario records (contract T1-T3; owner question Q4). The evidence builder assigns trust from this table by each event's `src`, never from the record's own content. A source not listed fails that run rather than defaulting to independent. Harness and Component 4 sources added 6 Oct (owner): the agent's trace is actor-written; gateway, tracer and validator are co-located until a privileged read-only observer exists. A user's own terminal recording (user-terminal, 7 Oct) is actor-written.",
+ "sources": {
+  "sacct-controller": {"trust": "independent", "why": "slurmdbd accounting read in the controller pod; no actor has a session or job there"},
+  "observer": {"trust": "independent", "why": "the raw observation pulled from mgmt-git01 through the forced-command observer"},
+  "monitor-history": {"trust": "independent", "why": "the off-node monitor's history on mgmt-git01"},
+  "gitlab": {"trust": "independent", "why": "GitLab issues and notes on mgmt-git01"},
+  "log-md": {"trust": "independent", "why": "LOG.md START/STOP markers in git"},
+  "lease-file": {"trust": "independent", "why": "the cluster lease record on the login host, outside the login pod"},
+  "recovery-points": {"trust": "independent", "why": "recovery-point records written by the operator's capture tool"},
+  "sshd-login-pod": {"trust": "co-located", "why": "the login pod's sshd log: actors have shells in that pod"},
+  "journald-worker": {"trust": "co-located", "why": "journald on a worker where the actor ran a job"},
+  "k3s-events-worker": {"trust": "co-located", "why": "K3s events emitted by the kubelet of a worker where the actor ran a job"},
+  "job-output": {"trust": "actor-written", "why": "the actor's own job output"},
+  "home-files": {"trust": "actor-written", "why": "files under /home written by the actor"},
+  "user-terminal": {"trust": "actor-written", "why": "the user's own terminal recording (script(1) on the user's side): what the user typed and saw, the user's account of the session (7 Oct)"},
+  "agent-trace": {"trust": "actor-written", "why": "the agent harness's own projection of its model and tool spans (digests and action IDs only): the agent's account of what it did, never evidence by itself"},
+  "harness-run": {"trust": "co-located", "why": "the harness run record (attempt boundaries, the declared fixture correction), written by the process that drives the agent"},
+  "c4-gateway": {"trust": "co-located", "why": "Component 4's action gateway: each request it executed and its exit status; it runs beside the agent and acts with the actor's identity"},
+  "c4-cluster-tracer": {"trust": "co-located", "why": "Component 4's post-action layout snapshot; on PRACE it runs as syn-tracer inside the login pod where actors have shells (in a local rehearsal, on the harness host)"},
+  "c4-validator": {"trust": "co-located", "why": "Component 4's validator observations and verdicts: independent of the agent's claims, but read through the same host or pod as the actor until a privileged read-only observer exists"}
+ }
+}

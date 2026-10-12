@@ -1,0 +1,118 @@
+---
+# One administrator/service account's home moves from /home to local disk: copy, prove the copy
+# identical, point the account at it, then move the old copy out of /home (a rename on the root
+# filesystem; nothing is deleted). The pointer change and the completion (labels, the old copy
+# out of /home) are separate: a run interrupted right after usermod finishes on the next run. Afterwards /home holds only cluster users, on every path: the
+# cutover (W1 relocates, W2 copies /home without these accounts) and a fresh install alike.
+# usermod -d refuses ("user busy", exit 8) while the account has processes in the host root:
+# sshd sessions, ProxyJump through admin@login (Ansible's and the tools' multiplexed masters),
+# the mgmt-git01 monitor's prace-observer login every 60 s. Container processes with the same UID
+# (metrics-server runs as 1000 = admin) do not count. Hence: list the blockers, then retry.
+# Consequence (user decision 28 Sep): compute nodes keep admin's passwd home /home/admin, which
+# no longer exists on the export, so admin key logins to the compute nodes end (Ansible and the
+# tools use root there; admin is only the ProxyJump on the login node).
+- name: "{{ lsh_user }}: account"
+  ansible.builtin.getent:
+    database: passwd
+    key: "{{ lsh_user }}"
+    fail_key: false
+
+- name: "{{ lsh_user }}: relocate when its home is still under /home"
+  when:
+    - ansible_facts.getent_passwd[lsh_user] is not none
+    - ansible_facts.getent_passwd[lsh_user][4] != storage_local_home_root ~ '/' ~ lsh_user
+  vars:
+    lsh_old: "{{ ansible_facts.getent_passwd[lsh_user][4] }}"
+    lsh_new: "{{ storage_local_home_root }}/{{ lsh_user }}"
+  block:
+    - name: "{{ lsh_user }}: the old home is /home/{{ lsh_user }}"
+      ansible.builtin.assert:
+        that: lsh_old == '/home/' ~ lsh_user
+        fail_msg: "{{ lsh_user }}'s home is {{ lsh_old }}; only /home/{{ lsh_user }} is relocated"
+        quiet: true
+
+    - name: "{{ lsh_user }}: copy (owners, modes, times, ACLs, xattrs)"
+      ansible.builtin.command: cp -a --no-target-directory {{ lsh_old }} {{ lsh_new }}
+      args:
+        creates: "{{ lsh_new }}"
+
+    - name: "{{ lsh_user }}: the copy is identical"
+      ansible.builtin.shell: |
+        set -euo pipefail
+        a=$(/usr/local/sbin/prace-tree-listing --no-label --summary {{ lsh_old }})
+        b=$(/usr/local/sbin/prace-tree-listing --no-label --summary {{ lsh_new }})
+        [ "$a" = "$b" ] || { echo "copy differs: $a vs $b"; exit 3; }
+        echo "$b"
+      changed_when: false
+      when: not ansible_check_mode
+
+    - name: "{{ lsh_user }}: host processes that would block usermod (for the record)"
+      ansible.builtin.shell: |
+        root=$(stat -Lc %d:%i /)
+        for p in $(pgrep -u {{ lsh_user }}); do
+          [ "$(stat -Lc %d:%i /proc/$p/root 2>/dev/null)" = "$root" ] && ps -o pid=,args= -p "$p"
+        done; true
+      register: lsh_busy
+      changed_when: false
+      check_mode: false
+
+    - name: "{{ lsh_user }}: point the account at the local home (retried while it has host sessions)"
+      ansible.builtin.command: usermod -d {{ lsh_new }} {{ lsh_user }}
+      register: lsh_usermod
+      until: lsh_usermod.rc != 8
+      retries: 20
+      delay: 3
+      failed_when: lsh_usermod.rc != 0
+      when: not ansible_check_mode
+
+# Completion, whenever the account points at its local home: also on the run after an interruption
+# between usermod and these steps (the block above is then skipped).
+- name: "{{ lsh_user }}: account after the pointer change"
+  ansible.builtin.getent:
+    database: passwd
+    key: "{{ lsh_user }}"
+    fail_key: false
+
+- name: "{{ lsh_user }}: complete the relocation"
+  when:
+    - not ansible_check_mode
+    - ansible_facts.getent_passwd[lsh_user] is not none
+    - ansible_facts.getent_passwd[lsh_user][4] == storage_local_home_root ~ '/' ~ lsh_user
+  vars:
+    lsh_old: /home/{{ lsh_user }}
+    lsh_new: "{{ storage_local_home_root }}/{{ lsh_user }}"
+  block:
+    - name: "{{ lsh_user }}: SELinux labels (ssh_home_t on .ssh, so sshd reads the keys)"
+      ansible.builtin.command: restorecon -Rv {{ lsh_new }}
+      register: lsh_label
+      changed_when: lsh_label.stdout | length > 0      # -v prints only what it relabels
+
+    - name: "{{ lsh_user }}: old copy out of /home (only while /home is still the root filesystem)"
+      ansible.builtin.shell: |
+        set -euo pipefail
+        r=0; mountpoint -q /home || r=$?          # 0 a mountpoint, 32 not one, anything else an error
+        [ $r = 0 ] && { echo "/home is a mountpoint; leaving {{ lsh_old }}"; exit 0; }
+        [ $r = 32 ] || { echo "mountpoint /home failed ($r)"; exit 3; }
+        [ -e {{ lsh_old }} ] || { echo "no {{ lsh_old }}"; exit 0; }
+        a=$(/usr/local/sbin/prace-tree-listing --no-label --summary {{ lsh_old }})
+        b=$(/usr/local/sbin/prace-tree-listing --no-label --summary {{ lsh_new }})
+        [ "$a" = "$b" ] || { echo "{{ lsh_old }} differs from {{ lsh_new }} ($a vs $b); not moved"; exit 3; }
+        dest={{ storage_premigration_root }}/leftover-{{ lsh_user }}-$(date +%Y%m%dT%H%M%S)
+        mkdir -p -m 0700 {{ storage_premigration_root }}
+        mv {{ lsh_old }} "$dest"
+        echo "moved to $dest"
+      register: lsh_aside
+      changed_when: "'moved to' in lsh_aside.stdout"
+
+- name: "{{ lsh_user }}: keys readable by sshd"
+  ansible.builtin.shell: |
+    set -euo pipefail
+    h=$(getent passwd {{ lsh_user }} | cut -d: -f6)
+    [ "$h" = "{{ storage_local_home_root }}/{{ lsh_user }}" ] || { echo "home is $h"; exit 3; }
+    [ ! -e "$h/.ssh" ] || ls -Zd "$h/.ssh" | grep -q ssh_home_t || { echo "$h/.ssh not ssh_home_t"; exit 3; }
+    echo ok
+  changed_when: false
+  check_mode: false
+  when:
+    - not ansible_check_mode
+    - ansible_facts.getent_passwd[lsh_user] is not none

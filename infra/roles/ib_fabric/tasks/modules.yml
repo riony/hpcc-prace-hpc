@@ -1,0 +1,25 @@
+---
+- name: Gated
+  ansible.builtin.include_tasks: gated.yml
+
+- name: Changes (a run started past the gates skips everything here)
+  when: ibf_gate_ok | bool
+  block:
+    - name: The InfiniBand kernel modules at every boot (umad for OpenSM, ipoib for IPoIB)
+      ansible.builtin.copy:
+        dest: "{{ ib_fabric_root }}etc/modules-load.d/prace-ib-fabric.conf"
+        mode: "0644"
+        content: |
+          # Managed by Ansible (roles/ib_fabric)
+          {{ ib_fabric_modules | join('\n') }}
+
+    - name: Which of them are loaded
+      ansible.builtin.stat:
+        path: "{{ ib_fabric_sys_module }}/{{ item }}"
+      loop: "{{ ib_fabric_modules }}"
+      register: ibf_mods
+
+    - name: Load the missing ones
+      ansible.builtin.command:
+        argv: "{{ ['modprobe', '-a'] + (ibf_mods.results | rejectattr('stat.exists') | map(attribute='item') | list) }}"
+      when: ibf_mods.results | rejectattr('stat.exists') | list | length > 0 and not ansible_check_mode

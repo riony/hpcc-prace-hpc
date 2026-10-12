@@ -1,0 +1,22 @@
+{
+  "schema": "prace.continuous.v1",
+  "session_id": "night-one",
+  "scenario": "write",
+  "run_root": "/PRIVATE/continuous",
+  "ssh_config": "/PRIVATE/continuous-ssh.json",
+  "policy_file": "/PRIVATE/fixture.json",
+  "lease_id": "0000000000000000",
+  "baseline_id": "REPLACE_WITH_DESIGNATED_DEFAULT_POINT",
+  "nat_python": "/PRIVATE/nat-venv/bin/python",
+  "model": "glm-5.3",
+  "base_url": "http://127.0.0.1:48179/v1",
+  "key_file": "/PRIVATE/glm-api-key",
+  "duration_seconds": 36000,
+  "attempt_seconds": 120,
+  "interval_seconds": 300,
+  "max_attempts": 120,
+  "max_actions": 240,
+  "model_down_seconds": 900,
+  "max_failures": 3,
+  "min_free_bytes": 5368709120
+}

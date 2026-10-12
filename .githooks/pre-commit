@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(git rev-parse --show-toplevel)"
+python3 tools/public-check.py
+gitleaks git --pre-commit --staged --redact=100 --no-banner

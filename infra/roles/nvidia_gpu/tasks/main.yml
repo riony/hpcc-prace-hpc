@@ -1,0 +1,126 @@
+---
+- name: Kernel the node boots next
+  ansible.builtin.command: grubby --default-kernel
+  register: ng_default
+  changed_when: false
+  check_mode: false
+
+- name: It is the kernel the driver module is built for
+  ansible.builtin.assert:
+    that: ng_default.stdout == '/boot/vmlinuz-' ~ nvidia_kernel
+    fail_msg: "boot default {{ ng_default.stdout }}, pinned build kernel {{ nvidia_kernel }}: update nvidia_kernel deliberately"
+    quiet: true
+
+- name: NVIDIA signing keys from the login node
+  ansible.builtin.get_url:
+    url: "{{ fleet_repo_url }}/keys/{{ item.key }}"
+    dest: "/etc/pki/rpm-gpg/{{ item.key }}"
+    mode: "0644"
+  loop: "{{ fleet_repo_nvidia_repos }}"
+  loop_control: {label: "{{ item.key }}"}
+
+- name: Import them only if the fingerprint matches (the login node is not trusted blindly)
+  ansible.builtin.rpm_key:
+    key: "/etc/pki/rpm-gpg/{{ item.key }}"
+    fingerprint: "{{ item.fingerprint }}"
+    state: present
+  loop: "{{ fleet_repo_nvidia_repos }}"
+  loop_control: {label: "{{ item.key }}"}
+
+- name: Version-lock plugin, the build toolchain and the boot kernel's headers
+  # dkms requires kernel-devel-matched (one version only): the kernel the node boots
+  ansible.builtin.command:
+    argv: "{{ ['dnf', '-y', '--refresh', 'install', 'kernel-devel-matched-' ~ nvidia_kernel | regex_replace('\\.x86_64$', '')]
+              + nvidia_build_packages + ['--exclude=' ~ (nvidia_exclude | join(','))] }}"
+  register: ng_build
+  changed_when: "'Nothing to do' not in ng_build.stdout"
+
+- name: Lock the NVIDIA packages at their pinned versions (before installing them)
+  ansible.builtin.shell: |
+    set -e
+    want='{{ nvidia_gpu_packages | join(" ") }}'
+    have=$(dnf versionlock list 2>/dev/null || true)
+    added=0
+    for p in $want; do
+      case "$p" in *-[0-9]*) ;; *) continue ;; esac        # unversioned entries are not locked
+      name=${p%-*-*}; ver=${p#"$name"-}                     # the lock list shows NAME-EPOCH:VERSION-RELEASE.*
+      echo "$have" | grep -E "^${name}-([0-9]+:)?" | grep -qF "$ver" && continue
+      dnf versionlock add "$p" >/dev/null && added=1
+    done
+    echo "added=$added"
+  register: ng_lock
+  changed_when: "'added=1' in ng_lock.stdout"
+
+- name: NVIDIA driver (proprietary DKMS module), DCGM, container toolkit, CUDA 12.9, NCCL
+  ansible.builtin.command:
+    argv: "{{ ['dnf', '-y', 'install'] + nvidia_gpu_packages + ['--exclude=' ~ (nvidia_exclude | join(','))] }}"
+  register: ng_install
+  changed_when: "'Nothing to do' not in ng_install.stdout"
+  notify: restart k3s-agent
+
+- name: DKMS module built and installed for the boot kernel
+  ansible.builtin.shell: |
+    set -e
+    v={{ nvidia_driver_version.split('-')[0] }}; k={{ nvidia_kernel }}
+    if dkms status -m nvidia -v "$v" -k "$k" | grep -q ': installed'; then echo present
+    else dkms install -m nvidia -v "$v" -k "$k" >/dev/null && echo built; fi
+    dkms status -m nvidia -v "$v" -k "$k" | grep -q ': installed'
+  register: ng_dkms
+  changed_when: "'built' in ng_dkms.stdout"
+
+- name: nouveau never loads again
+  ansible.builtin.copy:
+    dest: /etc/modprobe.d/prace-blacklist-nouveau.conf
+    mode: "0644"
+    content: |
+      # Managed by Ansible (roles/nvidia_gpu): the NVIDIA driver owns the V100s.
+      blacklist nouveau
+      options nouveau modeset=0
+  register: ng_blacklist
+
+- name: Initramfs without nouveau
+  ansible.builtin.command: dracut -f
+  when: ng_blacklist is changed
+
+- name: Is nouveau loaded?
+  ansible.builtin.shell: lsmod | grep -q '^nouveau ' && echo loaded || echo absent
+  register: ng_nouveau
+  changed_when: false
+
+- name: Reboot into the boot kernel with the NVIDIA driver (only while nouveau is loaded or the kernel differs)
+  ansible.builtin.reboot:
+    reboot_timeout: "{{ nvidia_reboot_timeout }}"
+    msg: "roles/nvidia_gpu: switching from nouveau to the NVIDIA driver"
+  when: ng_nouveau.stdout == 'loaded' or ansible_kernel != nvidia_kernel
+
+- name: Running the kernel the driver was built for
+  ansible.builtin.command: uname -r
+  register: ng_uname
+  changed_when: false
+  check_mode: false
+  failed_when: ng_uname.stdout != nvidia_kernel
+
+- name: Persistence daemon
+  ansible.builtin.systemd:
+    name: nvidia-persistenced
+    enabled: true
+    state: started
+
+- name: Flush handlers (K3s agent sees the NVIDIA container runtime)
+  ansible.builtin.meta: flush_handlers
+
+- name: Every GPU answers on the pinned driver with persistence on
+  ansible.builtin.shell: |
+    set -o pipefail
+    nvidia-smi --query-gpu=index,name,driver_version,persistence_mode --format=csv,noheader
+  register: ng_smi
+  changed_when: false
+  failed_when: >-
+    ng_smi.rc != 0
+    or ng_smi.stdout_lines | length != nvidia_expected_gpus
+    or ng_smi.stdout_lines | select('search', nvidia_driver_version.split('-')[0]) | list | length != nvidia_expected_gpus
+    or ng_smi.stdout_lines | select('search', 'Enabled') | list | length != nvidia_expected_gpus
+
+- name: Show them
+  ansible.builtin.debug:
+    msg: "{{ ng_smi.stdout_lines }}"

@@ -1,0 +1,40 @@
+#!/bin/bash
+# Managed by Ansible (roles/gitlab_lab_runner). Registers the lab deploy runner once:
+# project runner for {{ lab_runner_project }}, protected refs only, shell executor,
+# jobs run as {{ lab_runner_user }}. Token handling as in gitlab-runner-register-ci:
+# taken from gitlab-rails stdout into a variable, passed via CI_SERVER_TOKEN, never
+# printed or written to disk by this script. Never-contacted runners with this name
+# (orphans of an interrupted run) are removed first. Prints "registered" or
+# "already registered".
+set -euo pipefail
+NAME="{{ lab_runner_name }}"
+CFG="{{ lab_runner_config_dir }}/config.toml"
+LIST=$(gitlab-runner list --config "$CFG" 2>&1 || true)
+if grep -qE "^${NAME}[[:space:]]" <<<"$LIST"; then echo "already registered"; exit 0; fi
+HELP=$(gitlab-runner register --help 2>&1 || true)
+grep -q 'CI_SERVER_TOKEN' <<<"$HELP" || { echo "register does not read CI_SERVER_TOKEN; refusing" >&2; exit 1; }
+OUT=$(/opt/gitlab/bin/gitlab-rails runner "
+  p = Project.find_by_full_path('{{ lab_runner_project }}') or abort('project not found')
+  root = User.find_by_username('root')
+  Ci::Runner.where(description: '${NAME}', contacted_at: nil).find_each do |orphan|
+    Ci::Runners::UnregisterRunnerService.new(orphan, root).execute
+    warn('removed orphan runner id=' + orphan.id.to_s)
+  end
+  r = Ci::Runners::CreateRunnerService.new(user: root, params: {
+        runner_type: 'project_type', scope: p, description: '${NAME}',
+        tag_list: %w[{{ lab_runner_tags | join(' ') }}], run_untagged: false,
+        access_level: 'ref_protected', locked: true,
+        maintenance_note: 'Lab deploy runner (protected refs only); managed by Ansible roles/gitlab_lab_runner' }).execute
+  abort(r.message.to_s) unless r.success?
+  puts r.payload[:runner].token
+")
+TOKEN=${OUT##*$'\n'}
+unset OUT
+[[ "$TOKEN" == glrt-* ]] || { echo "GitLab did not return a runner token" >&2; exit 1; }
+CI_SERVER_TOKEN="$TOKEN" gitlab-runner register --non-interactive --config "$CFG" \
+  --url "https://{{ gitlab_fqdn }}" --name "$NAME" --executor shell \
+  --env "PRACE_ANSIBLE_VENV={{ lab_runner_prefix }}/venv" \
+  --env "ANSIBLE_COLLECTIONS_PATH={{ lab_runner_prefix }}/collections" \
+  --env "ANSIBLE_NOCOLOR=1" >/dev/null
+unset TOKEN
+echo "registered"

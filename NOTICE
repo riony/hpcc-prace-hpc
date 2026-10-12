@@ -1,0 +1,12 @@
+HPCC PRACE HPC
+Copyright 2026 HPCC PRACE HPC contributors.
+
+This public edition is a sanitized derivative of a team infrastructure and
+security-validation project, released with team permission under Apache-2.0.
+It is not affiliated with or endorsed by dependency vendors.
+
+Slinky, Kubernetes, kind, Helm, Slurm, containerd NRI and NVIDIA NeMo Agent
+Toolkit are independently maintained dependencies. Their original copyright
+and licence terms remain applicable; this licence does not relicense them.
+See THIRD_PARTY.md. No upstream chart archives, vendor binaries, organiser
+presentation material or private operational recordings are bundled.

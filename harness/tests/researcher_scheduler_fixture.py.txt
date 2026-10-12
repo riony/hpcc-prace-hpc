@@ -1,0 +1,52 @@
+import hashlib
+from validation.adapters import researcher_workflow as r
+r.SITE=pathlib.Path(os.environ['HS_SITE'])
+r.trusted_file=lambda p: p
+r.modules=lambda: {'modules':'["gcc/11.5", "cuda/12.9"]'}
+# The fake scheduler executes no programs; it emits the site's success output.
+# Operator pins remain exact, checked before every fake submission.
+def research_command(args):
+    if args[0]!='sbatch':
+        text=command(args)
+        if args[0]=='sacct' and '-j' in args and alias=='prace-observer' and os.environ.get('HS_WRONG_SCRIPT'):
+            text=text.replace(str(r.SITE/'batch.sh'),'/bin/false').replace(str(r.SITE/'gpu.sh'),'/bin/false')
+        return text
+    if '--wrap=/bin/true' in args: return command(args)
+    if not args[-1] in {str(r.SITE/'batch.sh'),str(r.SITE/'gpu.sh')}:
+        raise SystemExit(99)
+    state_path=pathlib.Path(os.environ['HS_JOBS']); state=json.loads(state_path.read_text())
+    job=str(8100+len(state)+1)
+    def flag(name): return next(x.split('=',1)[1] for x in args if x.startswith(name+'='))
+    part=flag('--partition')
+    state[job]=[job,roles['prace-actor'][0],flag('--account'),part,'COMPLETED','0:0',flag('--job-name'),
+                '4','4Gn' if part=='cpu' else '90Gn','10',__import__('shlex').join(args),'1',
+                __import__('datetime').datetime.now(__import__('datetime').timezone.utc).strftime('%Y-%m-%dT%H:%M:%S'),
+                'cpu=4,mem=4G,node=1' if part=='cpu' else 'cpu=4,mem=90G,node=1,gres/gpu=1']
+    state[job] += ['4', state[job][-1], state[job][12], state[job][12]]
+    state_path.write_text(json.dumps(state))
+    out=pathlib.Path(flag('--output'))
+    out.write_text('thread 0 on node-test\nthread 2 on node-test\nthread 1 on node-test\nthread 3 on node-test\ncxx threads ok: 4 threads on node-test\n' if part=='cpu' else
+                  'nvcc version 12.9\ncuda ok: Tesla V100-SXM2-32GB, 0 wrong of 1048576 (no error)\n')
+    out.chmod(0o640)
+    if os.environ.get('HS_RECEIPT_WARNING') and part == 'gpu':
+        raise s.CommandRefused(job)
+    return job
+s.command=research_command
+# Translate nested observer receipts as well as action parameters.
+def translate(value):
+    if isinstance(value,str) and value.startswith(virtual): return str(physical)+value[len(virtual):]
+    if isinstance(value,list): return [translate(v) for v in value]
+    if isinstance(value,dict): return {k:translate(v) for k,v in value.items()}
+    return value
+request['parameters']=translate(request['parameters'])
+# Proof digests are over the actual submitted argv. Return virtual paths in the
+# hash to match the evidence manifest, exactly as the real SSH transport does.
+actual_fields=r.fixed_job_fields
+actual_argv=r.submission_argv
+def virtual_argv(p):
+    return [a.replace(str(physical),virtual).replace(str(r.SITE),'/apps/examples') for a in actual_argv(p)]
+def proof_fields(p):
+    value=actual_fields(p)
+    value['submission_sha256']=hashlib.sha256(json.dumps(virtual_argv(p),separators=(',',':')).encode()).hexdigest()
+    return value
+r.fixed_job_fields=proof_fields

@@ -1,0 +1,523 @@
+{
+ "/personal_access_tokens/self": {
+  "active": true,
+  "created_at": "2099-01-01T00:00:00.000Z",
+  "expires_at": "2099-01-20",
+  "id": 990001,
+  "name": "fx-prace-dash",
+  "revoked": false,
+  "scopes": [
+   "read_api"
+  ],
+  "user_id": 990002
+ },
+ "/projects/:id/issues?labels=fleet-monitor&order_by=created_at&per_page=20&sort=desc&state=all": [
+  {
+   "closed_at": "2099-01-04T01:30:00.000Z",
+   "confidential": true,
+   "created_at": "2099-01-04T01:00:00.000Z",
+   "iid": 99011,
+   "state": "closed",
+   "title": "[fleet-monitor] monitor failure"
+  },
+  {
+   "closed_at": "2099-01-03T01:12:00.000Z",
+   "confidential": true,
+   "created_at": "2099-01-03T01:00:00.000Z",
+   "iid": 99010,
+   "state": "closed",
+   "title": "[fleet-monitor] UNHEALTHY: lab-g004: Kubernetes NotReady"
+  }
+ ],
+ "/projects/:id/issues?labels=lease&order_by=updated_at&per_page=1&sort=desc&state=closed": [
+  {
+   "closed_at": "2099-01-03T09:00:00.000Z",
+   "created_at": "2099-01-03T00:00:00.000Z",
+   "iid": 99019,
+   "title": "LEASE: fleet (fx reservation, earlier)",
+   "updated_at": "2099-01-03T09:00:00.000Z"
+  }
+ ],
+ "/projects/:id/issues?labels=lease&order_by=updated_at&per_page=10&sort=desc&state=opened": [
+  {
+   "closed_at": null,
+   "created_at": "2099-01-05T00:00:00.000Z",
+   "iid": 99020,
+   "title": "LEASE: fleet (fx reservation, Session B)",
+   "updated_at": "2099-01-05T09:00:00.000Z"
+  }
+ ],
+ "/projects/:id/jobs/992000/artifacts/audit/result.json": {
+  "evaluated_at": 4071000000,
+  "expected_workers": [
+   "lab-lenovo",
+   "lab-g003"
+  ],
+  "health_only": false,
+  "outcome": "HEALTHY",
+  "reasons": [
+   "4 workers usable, controller and accounting answer, 49 tracked files match the baseline"
+  ],
+  "snapshot_time": 4071000000
+ },
+ "/projects/:id/jobs/992001/artifacts/audit/result.json": {
+  "evaluated_at": 4071000001,
+  "expected_workers": [
+   "lab-lenovo",
+   "lab-g003"
+  ],
+  "health_only": false,
+  "outcome": "DRIFT",
+  "reasons": [
+   "config /etc/ssh/sshd_config: 1111aaaa2222 -> 3333bbbb4444"
+  ],
+  "snapshot_time": 4071000001
+ },
+ "/projects/:id/jobs/992002/artifacts/audit/result.json": {
+  "evaluated_at": 4071000002,
+  "expected_workers": [
+   "lab-lenovo",
+   "lab-g003"
+  ],
+  "health_only": false,
+  "outcome": "DEFERRED_MAINTENANCE",
+  "reasons": [
+   "maintenance in progress for 12 min: holder=maint label=fx-window id=0123456789abcdef since=2099-01-03T02:50:00+08:00"
+  ],
+  "snapshot_time": 4071000002
+ },
+ "/projects/:id/jobs/992003/artifacts/audit/result.json": {
+  "evaluated_at": 4071000003,
+  "expected_workers": [
+   "lab-lenovo",
+   "lab-g003"
+  ],
+  "health_only": false,
+  "outcome": "HEALTHY",
+  "reasons": [
+   "4 workers usable, controller and accounting answer, 49 tracked files match the baseline"
+  ],
+  "snapshot_time": 4071000003
+ },
+ "/projects/:id/merge_requests/99000/approvals": {
+  "approved_by": []
+ },
+ "/projects/:id/merge_requests?order_by=updated_at&per_page=1&sort=desc&state=merged": [
+  {
+   "iid": 99000,
+   "merge_commit_sha": "dddddddddddddddddddddddddddddddddddddddd",
+   "merged_at": "2099-01-05T07:59:00.000Z",
+   "title": "fx: monitor keeps the raw observation"
+  }
+ ],
+ "/projects/:id/merge_requests?order_by=updated_at&per_page=20&sort=desc&state=opened": [
+  {
+   "author": {
+    "username": "fx-author"
+   },
+   "draft": true,
+   "iid": 99001,
+   "source_branch": "fx-feature/dashboard",
+   "title": "fx: fleet dashboard role (draft)",
+   "updated_at": "2099-01-05T10:00:00.000Z"
+  }
+ ],
+ "/projects/:id/pipelines/990073/jobs?per_page=50": [
+  {
+   "allow_failure": false,
+   "duration": 41.0,
+   "id": 992003,
+   "name": "lab-drift-check",
+   "pipeline": {
+    "id": 990073
+   },
+   "stage": "lab",
+   "status": "success"
+  }
+ ],
+ "/projects/:id/pipelines/990083/jobs?per_page=50": [
+  {
+   "allow_failure": true,
+   "duration": 41.0,
+   "id": 992002,
+   "name": "lab-drift-check",
+   "pipeline": {
+    "id": 990083
+   },
+   "stage": "lab",
+   "status": "failed"
+  }
+ ],
+ "/projects/:id/pipelines/990093/jobs?per_page=50": [
+  {
+   "allow_failure": false,
+   "duration": 41.0,
+   "id": 992001,
+   "name": "lab-drift-check",
+   "pipeline": {
+    "id": 990093
+   },
+   "stage": "lab",
+   "status": "failed"
+  }
+ ],
+ "/projects/:id/pipelines/990103/jobs?per_page=50": [
+  {
+   "allow_failure": false,
+   "duration": 41.0,
+   "id": 992000,
+   "name": "lab-drift-check",
+   "pipeline": {
+    "id": 990103
+   },
+   "stage": "lab",
+   "status": "success"
+  }
+ ],
+ "/projects/:id/pipelines/990104/jobs?per_page=50": [
+  {
+   "allow_failure": false,
+   "duration": 21.4,
+   "id": 991040,
+   "name": "secret-scan",
+   "pipeline": {
+    "id": 990104
+   },
+   "ref": "x",
+   "stage": "check",
+   "status": "success"
+  },
+  {
+   "allow_failure": false,
+   "duration": 9.8,
+   "id": 991041,
+   "name": "evidence-checksums",
+   "pipeline": {
+    "id": 990104
+   },
+   "ref": "x",
+   "stage": "check",
+   "status": "success"
+  },
+  {
+   "allow_failure": false,
+   "duration": 1712.0,
+   "id": 991042,
+   "name": "ansible-syntax",
+   "pipeline": {
+    "id": 990104
+   },
+   "ref": "x",
+   "stage": "check",
+   "status": "success"
+  },
+  {
+   "allow_failure": false,
+   "duration": 64.2,
+   "id": 991043,
+   "name": "python-tests",
+   "pipeline": {
+    "id": 990104
+   },
+   "ref": "x",
+   "stage": "test",
+   "status": "success"
+  },
+  {
+   "allow_failure": false,
+   "duration": 402.5,
+   "id": 991044,
+   "name": "role-tests",
+   "pipeline": {
+    "id": 990104
+   },
+   "ref": "x",
+   "stage": "test",
+   "status": "failed"
+  },
+  {
+   "allow_failure": false,
+   "duration": 95.1,
+   "id": 991045,
+   "name": "nri-mount-guard",
+   "pipeline": {
+    "id": 990104
+   },
+   "ref": "x",
+   "stage": "test",
+   "status": "success"
+  },
+  {
+   "allow_failure": false,
+   "duration": 30.3,
+   "id": 991046,
+   "name": "github-export-gate",
+   "pipeline": {
+    "id": 990104
+   },
+   "ref": "x",
+   "stage": "test",
+   "status": "success"
+  }
+ ],
+ "/projects/:id/pipelines/990105/jobs?per_page=50": [
+  {
+   "allow_failure": false,
+   "duration": 21.4,
+   "id": 991050,
+   "name": "secret-scan",
+   "pipeline": {
+    "id": 990105
+   },
+   "ref": "x",
+   "stage": "check",
+   "status": "success"
+  },
+  {
+   "allow_failure": false,
+   "duration": 9.8,
+   "id": 991051,
+   "name": "evidence-checksums",
+   "pipeline": {
+    "id": 990105
+   },
+   "ref": "x",
+   "stage": "check",
+   "status": "success"
+  },
+  {
+   "allow_failure": false,
+   "duration": 1712.0,
+   "id": 991052,
+   "name": "ansible-syntax",
+   "pipeline": {
+    "id": 990105
+   },
+   "ref": "x",
+   "stage": "check",
+   "status": "success"
+  },
+  {
+   "allow_failure": false,
+   "duration": 64.2,
+   "id": 991053,
+   "name": "python-tests",
+   "pipeline": {
+    "id": 990105
+   },
+   "ref": "x",
+   "stage": "test",
+   "status": "success"
+  },
+  {
+   "allow_failure": false,
+   "duration": 402.5,
+   "id": 991054,
+   "name": "role-tests",
+   "pipeline": {
+    "id": 990105
+   },
+   "ref": "x",
+   "stage": "test",
+   "status": "success"
+  },
+  {
+   "allow_failure": false,
+   "duration": 95.1,
+   "id": 991055,
+   "name": "nri-mount-guard",
+   "pipeline": {
+    "id": 990105
+   },
+   "ref": "x",
+   "stage": "test",
+   "status": "success"
+  },
+  {
+   "allow_failure": false,
+   "duration": 30.3,
+   "id": 991056,
+   "name": "github-export-gate",
+   "pipeline": {
+    "id": 990105
+   },
+   "ref": "x",
+   "stage": "test",
+   "status": "success"
+  }
+ ],
+ "/projects/:id/pipelines/990106/jobs?per_page=50": [
+  {
+   "allow_failure": false,
+   "duration": 21.4,
+   "id": 991060,
+   "name": "secret-scan",
+   "pipeline": {
+    "id": 990106
+   },
+   "ref": "x",
+   "stage": "check",
+   "status": "success"
+  },
+  {
+   "allow_failure": false,
+   "duration": 9.8,
+   "id": 991061,
+   "name": "evidence-checksums",
+   "pipeline": {
+    "id": 990106
+   },
+   "ref": "x",
+   "stage": "check",
+   "status": "success"
+  },
+  {
+   "allow_failure": false,
+   "duration": null,
+   "id": 991062,
+   "name": "ansible-syntax",
+   "pipeline": {
+    "id": 990106
+   },
+   "ref": "x",
+   "stage": "check",
+   "status": "running"
+  },
+  {
+   "allow_failure": false,
+   "duration": null,
+   "id": 991063,
+   "name": "python-tests",
+   "pipeline": {
+    "id": 990106
+   },
+   "ref": "x",
+   "stage": "test",
+   "status": "created"
+  },
+  {
+   "allow_failure": false,
+   "duration": null,
+   "id": 991064,
+   "name": "role-tests",
+   "pipeline": {
+    "id": 990106
+   },
+   "ref": "x",
+   "stage": "test",
+   "status": "created"
+  },
+  {
+   "allow_failure": false,
+   "duration": null,
+   "id": 991065,
+   "name": "nri-mount-guard",
+   "pipeline": {
+    "id": 990106
+   },
+   "ref": "x",
+   "stage": "test",
+   "status": "created"
+  },
+  {
+   "allow_failure": false,
+   "duration": null,
+   "id": 991066,
+   "name": "github-export-gate",
+   "pipeline": {
+    "id": 990106
+   },
+   "ref": "x",
+   "stage": "test",
+   "status": "created"
+  }
+ ],
+ "/projects/:id/pipelines?order_by=id&per_page=14&ref=main&sort=desc&source=schedule": [
+  {
+   "created_at": "2099-01-05T03:00:00.000Z",
+   "id": 990103,
+   "ref": "main",
+   "sha": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+   "source": "schedule",
+   "status": "success",
+   "updated_at": "2099-01-05T03:01:00.000Z"
+  },
+  {
+   "created_at": "2099-01-04T03:00:00.000Z",
+   "id": 990093,
+   "ref": "main",
+   "sha": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+   "source": "schedule",
+   "status": "failed",
+   "updated_at": "2099-01-04T03:01:00.000Z"
+  },
+  {
+   "created_at": "2099-01-03T03:00:00.000Z",
+   "id": 990083,
+   "ref": "main",
+   "sha": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+   "source": "schedule",
+   "status": "success",
+   "updated_at": "2099-01-03T03:01:00.000Z"
+  },
+  {
+   "created_at": "2099-01-02T03:00:00.000Z",
+   "id": 990073,
+   "ref": "main",
+   "sha": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+   "source": "schedule",
+   "status": "success",
+   "updated_at": "2099-01-02T03:01:00.000Z"
+  }
+ ],
+ "/projects/:id/pipelines?order_by=id&per_page=20&sort=desc": [
+  {
+   "created_at": "2099-01-05T10:00:00.000Z",
+   "id": 990106,
+   "iid": 106,
+   "project_id": 990000,
+   "ref": "fx-feature/dashboard",
+   "sha": "ffffffffffffffffffffffffffffffffffffffff",
+   "source": "push",
+   "status": "running",
+   "updated_at": "2099-01-05T10:02:00.000Z",
+   "web_url": "https://mgmt-git01.example-tailnet.ts.net/hpcc/prace-hackathon/-/pipelines/990106"
+  },
+  {
+   "created_at": "2099-01-05T08:00:00.000Z",
+   "id": 990105,
+   "iid": 105,
+   "project_id": 990000,
+   "ref": "main",
+   "sha": "ffffffffffffffffffffffffffffffffffffffff",
+   "source": "push",
+   "status": "success",
+   "updated_at": "2099-01-05T08:31:10.000Z",
+   "web_url": "https://mgmt-git01.example-tailnet.ts.net/hpcc/prace-hackathon/-/pipelines/990105"
+  },
+  {
+   "created_at": "2099-01-05T07:00:00.000Z",
+   "id": 990104,
+   "iid": 104,
+   "project_id": 990000,
+   "ref": "fx-feature/monitor",
+   "sha": "ffffffffffffffffffffffffffffffffffffffff",
+   "source": "push",
+   "status": "failed",
+   "updated_at": "2099-01-05T07:20:00.000Z",
+   "web_url": "https://mgmt-git01.example-tailnet.ts.net/hpcc/prace-hackathon/-/pipelines/990104"
+  },
+  {
+   "created_at": "2099-01-05T03:00:00.000Z",
+   "id": 990103,
+   "iid": 103,
+   "project_id": 990000,
+   "ref": "main",
+   "sha": "ffffffffffffffffffffffffffffffffffffffff",
+   "source": "schedule",
+   "status": "success",
+   "updated_at": "2099-01-05T03:01:00.000Z",
+   "web_url": "https://mgmt-git01.example-tailnet.ts.net/hpcc/prace-hackathon/-/pipelines/990103"
+  }
+ ]
+}

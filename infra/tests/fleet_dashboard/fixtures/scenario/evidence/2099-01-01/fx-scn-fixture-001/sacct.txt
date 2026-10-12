@@ -1,0 +1,5 @@
+JobID|User|Account|Partition|State|NodeList
+990143|syn-alice|proj-alpha|gpu|RUNNING|lab-g004
+990150|syn-carol|proj-alpha|cpu|COMPLETED|lab-lenovo
+990143|syn-alice|proj-alpha|gpu|NODE_FAIL|lab-g004
+990151|syn-alice|proj-alpha|gpu|OUT_OF_MEMORY|lab-g004

@@ -1,0 +1,13 @@
+---
+# Managed by Ansible (roles/fleet_observer). The login node runs the observation entry point for
+# the off-node monitor and the scheduled drift audit (login.yml). A native worker (T89:
+# slurm_native_workers) has no slurmd pod to read, so its host serves its own read-only
+# observation on its private address, which the login node's observer nests in the fleet
+# observation (native.yml); a pod worker has none, and a former native worker's is removed.
+- name: A native worker's read-only observation, or its removal from a pod worker
+  ansible.builtin.include_tasks: native.yml
+  when: fleet_role != 'login'
+
+- name: The login node's observation entry point
+  ansible.builtin.include_tasks: login.yml
+  when: fleet_role == 'login'

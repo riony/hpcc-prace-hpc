@@ -1,0 +1,172 @@
+---
+# Target preparation on a GPU host: its metadata LV (ext4 on the RAID1 OS volume group) and its
+# two storage targets (XFS, whole NVMe, bound by serial). files/prace-beegfs-prepare inspects
+# read-only and plans; see its header for the states and the decision table.
+#
+# Formatting is an explicitly armed FIRST USE, never ordinary convergence. It happens only when
+#   -e fleet_armed=true -e beegfs_format_armed=true, this run holds the cluster lease, and
+#   -e beegfs_format_confirm names this host and the item ('meta' or the NVMe's serial),
+# not in check mode, and only on an item that inspection finds blank (no signature, partition,
+# holder or mount: lsblk, wipefs --no-act, blkid -p) right before mkfs. mkfs gets no -f/-F.
+# Existing LVs are never resized, shrunk or removed; nothing is ever wiped here.
+- name: Inspect the metadata LV and the storage targets (read-only) and plan their first use
+  ansible.builtin.script:
+    cmd: "prace-beegfs-prepare {{ bg_prepare_spec | to_json | quote }}"
+    executable: "{{ beegfs_python }}"
+  register: bg_inspect
+  changed_when: false
+  check_mode: false
+
+- name: The plan
+  ansible.builtin.set_fact:
+    bg_plan: "{{ bg_inspect.stdout | from_json }}"
+
+- name: Show it
+  ansible.builtin.debug:
+    msg: >-
+      {{ bg_plan['items'] | map(attribute='name') | zip(bg_plan['items'] | map(attribute='state'),
+         bg_plan['items'] | map(attribute='action', default='-')) | map('join', ': ') | list + bg_plan.notes }}
+
+- name: Nothing inconsistent (refuses non-blank confirmed devices, unrecorded BeeGFS filesystems, missing recorded devices)
+  ansible.builtin.assert:
+    that: bg_plan.errors | length == 0
+    fail_msg: "{{ inventory_hostname }}: BEEGFS PREPARE REFUSED, nothing formatted: {{ bg_plan.errors | join(' | ') }}"
+    quiet: true
+
+- name: Items to create or format in this run
+  ansible.builtin.set_fact:
+    bg_first_use: "{{ bg_plan['items'] | selectattr('action', 'in', ['create', 'format']) | list }}"
+
+- name: Every first-use action is authorised for exactly this item (armed, lease held, confirmed)
+  ansible.builtin.assert:
+    that:
+      - bg_first_use_authorised | bool
+      - bg_first_use | map(attribute='name') | difference(bg_confirm_items) | length == 0
+    fail_msg: "{{ inventory_hostname }}: first use of {{ bg_first_use | map(attribute='name') | list }} is not authorised"
+    quiet: true
+  when: bg_first_use | length > 0
+
+# Recorded for the operator and the qualification record, never fatal: the decision to format a
+# drive with a critical warning or media errors is a human one (docs/runbooks/BEEGFS-QUALIFICATION-PLAN.md).
+- name: NVMe health of each target to be formatted (read-only smart-log; recorded, not judged)
+  ansible.builtin.command:
+    argv: [nvme, smart-log, --output-format=json, "{{ item.dev }}"]
+  loop: "{{ bg_first_use | rejectattr('name', 'equalto', 'meta') | selectattr('dev', 'match', (beegfs_by_id_dir ~ '/') | regex_escape) | list }}"
+  loop_control: {label: "{{ item.name }}"}
+  register: bg_nvme_health
+  changed_when: false
+  check_mode: false
+  failed_when: false
+
+- name: Health record (critical_warning, media_errors, percent_used per target)
+  ansible.builtin.debug:
+    msg: >-
+      {{ item.item.name }}: {{ (item.stdout | from_json) | dict2items | selectattr('key', 'in', ['critical_warning', 'media_errors', 'percent_used', 'num_err_log_entries'])
+         | items2dict if item.rc | default(1) == 0 and (item.stdout | default('') | trim).startswith('{') else 'unreadable (rc ' ~ (item.rc | default('n/a')) ~ ')' }}
+  loop: "{{ bg_nvme_health.results | default([]) }}"
+  loop_control: {label: "{{ item.item.name }}"}
+
+- name: Check mode formats nothing
+  ansible.builtin.debug:
+    msg: "WOULD create/record/format {{ bg_first_use | map(attribute='name') | list }} (check mode: nothing changed)"
+  when: ansible_check_mode and bg_first_use | length > 0
+
+- name: First use (armed, confirmed, lease held; never in check mode)
+  when: not ansible_check_mode and bg_first_use | length > 0 and bg_first_use_authorised | bool
+  block:
+    - name: Create the metadata LV from free extents only (existing LVs untouched)
+      ansible.builtin.command:
+        argv: [lvcreate, --yes, --wipesignatures, "y", --zero, "y", -n, "{{ item.lv }}", -L, "{{ item.size_g }}g", "{{ item.vg }}"]
+      loop: "{{ bg_first_use | selectattr('action', 'equalto', 'create') | list }}"
+      loop_control: {label: "{{ item.vg }}/{{ item.lv }} {{ item.size_g }}g"}
+
+    # Recorded BEFORE mkfs with the planned UUID: an interrupted first use resumes with it.
+    - name: Record each item in fstab (by UUID; nofail, so a missing device does not block boot)
+      ansible.posix.mount:
+        path: "{{ item.mount }}"
+        src: "UUID={{ item.uuid }}"
+        fstype: "{{ item.fstype }}"
+        opts: "{{ beegfs_backing_mount_opts }}"
+        state: present
+        fstab: "{{ beegfs_fstab }}"
+      loop: "{{ bg_first_use }}"
+      loop_control: {label: "{{ item.name }} {{ item.mount }}"}
+
+    - name: Inspect again right before mkfs
+      ansible.builtin.script:
+        cmd: "prace-beegfs-prepare {{ bg_prepare_spec | to_json | quote }}"
+        executable: "{{ beegfs_python }}"
+      register: bg_inspect_mkfs
+      changed_when: false
+
+    - name: Exactly the planned items are blank and recorded with the planned UUID
+      ansible.builtin.assert:
+        that:
+          - (bg_inspect_mkfs.stdout | from_json).errors | length == 0
+          - >-
+            (bg_inspect_mkfs.stdout | from_json)['items'] | selectattr('action', 'equalto', 'format')
+            | map(attribute='name') | sort == bg_first_use | map(attribute='name') | sort
+          - >-
+            (bg_inspect_mkfs.stdout | from_json)['items'] | selectattr('action', 'equalto', 'format')
+            | selectattr('state', 'equalto', 'blank') | map(attribute='uuid') | sort
+            == bg_first_use | map(attribute='uuid') | sort
+          - >-
+            (bg_inspect_mkfs.stdout | from_json)['items'] | selectattr('action', 'equalto', 'format')
+            | rejectattr('name', 'equalto', 'meta') | map(attribute='dev') | reject('match', (beegfs_by_id_dir ~ '/') | regex_escape)
+            | list | length == 0
+        fail_msg: "{{ inventory_hostname }}: the devices changed since the plan; nothing formatted: {{ bg_inspect_mkfs.stdout }}"
+        quiet: true
+
+    # mkfs.ext4 without a terminal re-formats an existing filesystem silently (e2fsprogs asks only on
+    # a TTY; Session B review S-2, bench): the same shell refuses any signature right before mkfs.
+    - name: Make the metadata filesystem (ext4) on the blank LV
+      ansible.builtin.shell: |
+        set -euo pipefail
+        dev={{ item.dev | quote }}
+        if blkid -p -o export "$dev" >/dev/null 2>&1; then echo "REFUSED: $dev carries a signature (blkid -p)"; exit 3; fi
+        sigs=$(wipefs --no-act --noheadings --output TYPE,OFFSET "$dev")
+        [ -z "$sigs" ] || { echo "REFUSED: $dev carries a signature (wipefs): $sigs"; exit 3; }
+        exec {{ (beegfs_meta_mkfs + ['-L', item.label, '-U', item.uuid]) | map('quote') | join(' ') }} "$dev"
+      args: {executable: /bin/bash}
+      loop: "{{ (bg_inspect_mkfs.stdout | from_json)['items'] | selectattr('action', 'equalto', 'format') | selectattr('name', 'equalto', 'meta') | list }}"
+      loop_control: {label: "{{ item.dev }}"}
+
+    - name: Make each storage target's filesystem (XFS) on the blank NVMe, by its by-id link
+      ansible.builtin.shell: |
+        set -euo pipefail
+        dev={{ item.dev | quote }}
+        if blkid -p -o export "$dev" >/dev/null 2>&1; then echo "REFUSED: $dev carries a signature (blkid -p)"; exit 3; fi
+        sigs=$(wipefs --no-act --noheadings --output TYPE,OFFSET "$dev")
+        [ -z "$sigs" ] || { echo "REFUSED: $dev carries a signature (wipefs): $sigs"; exit 3; }
+        exec {{ (beegfs_target_mkfs + ['-L', item.label, '-m', 'uuid=' ~ item.uuid]) | map('quote') | join(' ') }} "$dev"
+      args: {executable: /bin/bash}
+      loop: "{{ (bg_inspect_mkfs.stdout | from_json)['items'] | selectattr('action', 'equalto', 'format') | rejectattr('name', 'equalto', 'meta') | list }}"
+      loop_control: {label: "{{ item.name }} {{ item.dev }}"}
+
+    - name: Inspect after the first use
+      ansible.builtin.script:
+        cmd: "prace-beegfs-prepare {{ bg_prepare_spec | to_json | quote }}"
+        executable: "{{ beegfs_python }}"
+      register: bg_inspect_after
+      changed_when: false
+
+    - name: Every first-use item is now ours, recorded and active
+      ansible.builtin.assert:
+        that:
+          - (bg_inspect_after.stdout | from_json).errors | length == 0
+          - >-
+            (bg_inspect_after.stdout | from_json)['items'] | selectattr('active') | map(attribute='name')
+            | intersect(bg_first_use | map(attribute='name')) | sort == bg_first_use | map(attribute='name') | sort
+        fail_msg: "{{ inventory_hostname }}: first use did not complete: {{ bg_inspect_after.stdout }}"
+        quiet: true
+
+    - name: The plan after the first use
+      ansible.builtin.set_fact:
+        bg_plan: "{{ bg_inspect_after.stdout | from_json }}"
+
+- name: Active items (recorded, ours, same UUID); the rest stays out of /scratch
+  ansible.builtin.set_fact:
+    bg_meta_item: "{{ bg_plan['items'] | selectattr('name', 'equalto', 'meta') | selectattr('active') | first | default(none) }}"
+    bg_active_targets: >-
+      {{ bg_targets | selectattr('serial', 'in', bg_plan['items'] | selectattr('active') | map(attribute='name') | list) | list }}
+    bg_uuids: "{{ dict(bg_plan['items'] | selectattr('active') | map(attribute='name') | zip(bg_plan['items'] | selectattr('active') | map(attribute='uuid'))) }}"

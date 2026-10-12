@@ -1,0 +1,24 @@
+---
+# The InfiniBand ring as a fabric (T64; roles/ib_fabric, playbooks/ib-fabric.yml, docs/runbooks/IB-FABRIC.md).
+# DEFERRED (D42) and forbidden by D43 ("no OpenSM/IPoIB/RDMA") until the owner records a decision that
+# lifts both for the ring. Addresses, link ends and subnet-manager nodes are network.yml ring_links.
+
+# The owner's decision, e.g. "D44 (owner, 2026-10-08): lift D42 and D43 for the InfiniBand ring".
+# Every present run refuses while this is null.
+ib_fabric_decision: null
+
+# The mapping window's evidence directory (raw ib-peer-map.sh output per GPU node, with SHA256SUMS),
+# e.g. evidence/2026-10-08/ib-peer-map. Every present run refuses while this is null; the plan re-proves
+# the map from those files each time (tools/ib-fabric-check.py plan).
+ib_fabric_peer_map: null
+
+# Each point-to-point link is its own subnet, so each needs its own GID subnet prefix: MPI and UCX
+# treat ports with one prefix as one fabric and would try to reach the other links' ports.
+ib_fabric_gid_prefixes:
+  g003-g004: '0xfe80000000000001'
+  g004-g005: '0xfe80000000000002'
+  g005-g003: '0xfe80000000000003'
+
+# IPoIB: datagram mode with a 2048-byte IB MTU (IPoIB MTU 2044), the simplest to qualify first.
+ib_fabric_ipoib_mode: datagram
+ib_fabric_ipoib_mtu: 2044

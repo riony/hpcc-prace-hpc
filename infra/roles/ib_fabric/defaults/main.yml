@@ -1,0 +1,74 @@
+---
+# roles/ib_fabric (T64): the InfiniBand ring as a fabric. One OpenSM per cable, bound to that cable's
+# port GUID on the node network.yml ring_links names (sm), with the link's own GID subnet prefix, and
+# IPoIB on both ends with the link's /30 address. DEFERRED (D42), and D43 says "no OpenSM/IPoIB/RDMA":
+# every present run refuses until ib_fabric_decision records the owner's decision that lifts both for
+# the ring. Not in fleet.yml: only playbooks/ib-fabric.yml runs this role, in an owned closed window
+# (docs/runbooks/IB-FABRIC.md). Nothing here is assumed from slots or written by hand: the
+# plan comes from tools/ib-fabric-check.py, which re-proves the mapping window's recorded peer map.
+
+# present: configure the links of this stage. absent: remove every OpenSM unit, configuration,
+# IPoIB connection and the ring zone this role made (packages stay installed; the stock opensm.service
+# stays masked). Absent needs no decision and no peer map: it is the way back.
+ib_fabric_state: present
+
+# A stage: the ring links of this run, by network.yml name (a list, or one comma-separated string).
+# Empty: all three. Each stage's check judges only its links (and every report for an outside fabric).
+ib_fabric_links: []
+
+# Files are written under this root; tests render under a temporary directory.
+ib_fabric_root: /
+
+# The plan and the check, on the controller from the inventory and the recorded peer map (read-only).
+ib_fabric_tool: ["{{ ansible_playbook_python }}", "{{ playbook_dir }}/../tools/ib-fabric-check.py"]
+ib_fabric_args: >-
+  {{ ['--inventory', inventory_dir | default(ansible_inventory_sources | first)]
+     + (['--peer-map', ib_fabric_peer_map] if ib_fabric_peer_map | default(none, true) else [])
+     + (['--links', ibf_links | join(',')] if ibf_links | length > 0 else []) }}
+ib_fabric_plan_cmd: "{{ ib_fabric_tool + ['plan'] + ib_fabric_args + ['--packages', (ib_fabric_packages + ib_fabric_packages_sm) | join(',')] }}"
+ib_fabric_check_cmd: "{{ ib_fabric_tool + ['check', '--expect', ib_fabric_state] + ib_fabric_args }}"
+
+# The owned closed quiet window (as for BeeGFS): read-only, on the login node, from the controller.
+ib_fabric_window_check: ["{{ ansible_playbook_python }}", "{{ playbook_dir }}/../tools/require-closed-window.py"]
+
+# The node helper and its interpreter (the nodes' Python 3.9). Tests point the helper at a fake sysfs
+# through ib_fabric_env (play-level environment); empty on real nodes.
+ib_fabric_helper_python: /usr/bin/python3
+ib_fabric_env: {}
+
+# Packages, by name; their exact files are pinned in roles/fleet_repo fleet_repo_extra_packages and
+# fetched by --tags extra_repo on the login node first. Every node of a stage gets the tools (the
+# report and the RDMA qualification); a subnet manager's node also gets OpenSM. A package already
+# installed at another version is refused, never upgraded or downgraded.
+ib_fabric_packages: [libibumad, infiniband-diags, libibverbs, libibverbs-utils, librdmacm, perftest]
+ib_fabric_packages_sm: [opensm-libs, opensm]
+ib_fabric_dnf_opts: [--disablerepo=*, --enablerepo=fleet, --setopt=install_weak_deps=False]
+
+# Kernel modules for OpenSM (umad) and IPoIB, loaded now and at every boot.
+ib_fabric_modules: [ib_umad, ib_ipoib]
+ib_fabric_sys_module: /sys/module          # where a loaded module shows; tests point it elsewhere
+
+# The firewalld zone of the ring's IPoIB devices: DROP, ICMP only (the check's pings). RDMA traffic
+# does not pass netfilter; the RDMA tests exchange their connection data over the admin network.
+ib_fabric_zone: prace-ring
+
+# A port reaches ACTIVE once its link's subnet manager has swept it.
+ib_fabric_active_retries: 24
+ib_fabric_active_delay: 5
+
+# OpenSM's own log is truncated at this size (MB).
+ib_fabric_log_max_mb: 32
+
+# Derived (do not set). ibf_plan comes from the controller-side plan (tasks/gates.yml).
+ibf_links: >-
+  {{ (ib_fabric_links.split(',') if ib_fabric_links is string else ib_fabric_links)
+     | map('trim') | reject('equalto', '') | list }}
+ibf_host: "{{ (ibf_plan | default({})).get('hosts', {}).get(inventory_hostname, {'ports': [], 'sm': []}) }}"
+ibf_lease_held: >-
+  {{ fleet_lease is defined and fleet_lease.rc | default(1) == 0 and fleet_lease_id | default('') | length > 0
+     and ('id=' ~ fleet_lease_id | default('') ~ ' ') in (fleet_lease.stdout | default('') ~ ' ')
+     and (' ' ~ fleet_lease.stdout | default('') ~ ' ') is search(' holder=maint ')
+     and (' ' ~ fleet_lease.stdout | default('') ~ ' ') is search(' label=ib-[a-z0-9-]+ ') }}
+ibf_run_gated: "{{ ibf_gates_passed | default(false) | bool and ibf_lease_held | bool and ibf_window_verified | default(false) | bool }}"
+# The same, allowing a --check preview under the lease alone (nothing changes in check mode).
+ibf_gate_ok: "{{ ibf_run_gated | bool or (ansible_check_mode and ibf_gates_passed | default(false) | bool and ibf_lease_held | bool) }}"

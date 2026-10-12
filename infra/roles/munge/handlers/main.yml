@@ -1,0 +1,5 @@
+---
+- name: restart munge
+  ansible.builtin.systemd:
+    name: munge
+    state: restarted

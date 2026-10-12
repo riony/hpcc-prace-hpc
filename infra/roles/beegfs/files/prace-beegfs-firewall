@@ -1,0 +1,136 @@
+#!/usr/bin/env python3
+"""Read-only firewalld check for roles/beegfs (tasks/firewall.yml). Rocky 9 python3.
+
+The fleet accepts private-network traffic through the trusted zone, bound by SOURCE address
+(roles/fleet_net: fleet_trusted_sources); the campus port stays in public (ssh only). BeeGFS
+therefore needs no port of its own: this check proves the two halves of that contract instead of
+opening anything.
+  1. the admin network is bound to the trusted zone (runtime and permanent);
+  2. the trusted zone is bound to exactly the expected sources (the admin, pod and service
+     networks) and to no interface: anything else bound there reaches every port;
+  3. no other zone that traffic can reach (bound to an interface or a source, or the default
+     zone) has target ACCEPT, which accepts every port without listing any (Session A
+     re-review of !77, finding 2: such a zone passed as clean);
+  4. no BeeGFS port is open in any other zone (runtime and permanent): no port, port range,
+     service or rich rule that covers one of them.
+This reads the configuration only. It does not prove that campus traffic is refused: that is a
+packet test from outside, part of the qualification.
+
+  prace-beegfs-firewall '<spec JSON>'   spec: {"admin_network": "10.90.10.0/25", "ports": ["8003/tcp", ...],
+                                              "trusted_sources": ["10.90.10.0/25", "10.42.0.0/16", ...]}
+Prints {"errors": [...]} (exit 0); exit 1 if firewalld cannot be read.
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+
+
+def fw(*args):
+    r = subprocess.run(("firewall-cmd",) + args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                       universal_newlines=True, timeout=60, env=dict(os.environ, LC_ALL="C"))
+    if r.returncode != 0:
+        raise RuntimeError("firewall-cmd %s failed (rc %d): %s" % (" ".join(args), r.returncode, r.stderr.strip()[:300]))
+    return r.stdout
+
+
+def parse_zones(text):
+    """{zone: {"ports", "services", "rich", "interfaces", "sources": [...], "target": str, "default": bool}}
+    from --list-all-zones (the header "name (default, active)" marks the default zone)."""
+    zones, cur, key = {}, None, None
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        if not line[0].isspace():
+            cur = line.split()[0]
+            zones[cur] = {"ports": [], "services": [], "rich": [], "interfaces": [], "sources": [], "target": "default",
+                          "default": "default" in line[len(cur):]}
+            key = None
+            continue
+        if cur is None:
+            continue
+        s = line.strip()
+        m = re.match(r"^([a-z -]+):\s*(.*)$", s)
+        if m and not s.startswith("rule"):
+            key = m.group(1)
+            if key in ("ports", "services", "interfaces", "sources"):
+                zones[cur][key] = m.group(2).split()
+            elif key == "target":
+                zones[cur]["target"] = m.group(2).strip()
+            continue
+        if key == "rich rules" and s.startswith("rule"):
+            zones[cur]["rich"].append(s)
+    return zones
+
+
+def covers(open_port, wanted):
+    """Does a firewalld port entry (8000-8100/tcp) cover a wanted port (8003/tcp)?"""
+    rng, _, proto = open_port.partition("/")
+    lo, _, hi = rng.partition("-")
+    n, _, wproto = wanted.partition("/")
+    try:
+        return proto == wproto and int(lo) <= int(n) <= int(hi or lo)
+    except ValueError:
+        return False
+
+
+def check(spec):
+    errors = []
+    wanted = spec["ports"]
+    numbers = sorted({int(p.split("/")[0]) for p in wanted})
+    service_ports = {}
+
+    def ports_of(svc):
+        if svc not in service_ports:
+            m = re.search(r"^\s*ports:\s*(.*)$", fw("--permanent", "--info-service=" + svc), re.M)
+            service_ports[svc] = m.group(1).split() if m else []
+        return service_ports[svc]
+
+    for perm in ((), ("--permanent",)):
+        label = "permanent" if perm else "runtime"
+        zone = fw(*(perm + ("--get-zone-of-source=" + spec["admin_network"],))).strip()
+        if zone != "trusted":
+            errors.append("%s: %s is in zone %r, not trusted (roles/fleet_net)" % (label, spec["admin_network"], zone))
+        zones = parse_zones(fw(*(perm + ("--list-all-zones",))))
+        trusted = zones.get("trusted", {"sources": [], "interfaces": []})
+        extra = sorted(set(trusted["sources"]) - set(spec["trusted_sources"]))
+        if extra:
+            errors.append("%s: zone trusted also accepts every port from %s" % (label, " ".join(extra)))
+        if trusted["interfaces"]:
+            errors.append("%s: zone trusted is bound to interface(s) %s: every port open on them" % (label, " ".join(trusted["interfaces"])))
+        for name, z in zones.items():
+            if name == "trusted":
+                continue
+            reachable = z["interfaces"] or z["sources"] or z["default"]
+            if reachable and z["target"].upper() == "ACCEPT":
+                errors.append("%s: zone %s has target ACCEPT (every port open) and is bound to %s" % (
+                    label, name, " ".join(z["interfaces"] + z["sources"]) or "nothing, but is the default zone"))
+            for p in z["ports"]:
+                hits = [w for w in wanted if covers(p, w)]
+                if hits:
+                    errors.append("%s: zone %s opens %s (BeeGFS %s)" % (label, name, p, ",".join(hits)))
+            for svc in z["services"]:
+                hits = sorted({w for w in wanted for p in ports_of(svc) if covers(p, w)})
+                if hits:
+                    errors.append("%s: zone %s service %s covers BeeGFS %s" % (label, name, svc, ",".join(hits)))
+            for rule in z["rich"]:
+                # Protocol-blind on purpose: a rich rule touching a BeeGFS port number is refused.
+                spans = [(int(a), int(b or a)) for a, b in re.findall(r'port="?(\d+)(?:-(\d+))?', rule)]
+                svcs = re.findall(r'service name="?([A-Za-z0-9_.-]+)', rule)
+                if any(lo <= n <= hi for lo, hi in spans for n in numbers) or \
+                        any(covers(p, w) for s in svcs for p in ports_of(s) for w in wanted):
+                    errors.append("%s: zone %s rich rule covers a BeeGFS port: %s" % (label, name, rule))
+    return {"errors": errors}
+
+
+def main():
+    if len(sys.argv) != 2:
+        sys.stderr.write(__doc__)
+        return 2
+    print(json.dumps(check(json.loads(sys.argv[1])), sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

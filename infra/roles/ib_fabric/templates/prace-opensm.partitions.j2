@@ -1,0 +1,3 @@
+# Managed by Ansible (roles/ib_fabric). Link {{ item.link }}: the default partition, with the IPoIB
+# broadcast group at a {{ 4096 if ibf_plan.ipoib.mtu == 4092 else 2048 }}-byte IB MTU.
+Default=0x7fff, ipoib, mtu={{ 5 if ibf_plan.ipoib.mtu == 4092 else 4 }} : ALL=full;

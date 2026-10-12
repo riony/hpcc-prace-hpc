@@ -1,0 +1,11 @@
+---
+# lab_deploy_key: authorize the lab deploy runner's public key (generated on mgmt-git01
+# by roles/gitlab_lab_runner) for the account Ansible uses on this host, restricted to
+# the address the runner connects from. Skipped until lab_deploy_pubkey is set.
+- name: Authorize the lab deploy runner's key (source-restricted)
+  ansible.posix.authorized_key:
+    user: "{{ lab_deploy_user }}"
+    key: "{{ lab_deploy_pubkey }}"
+    key_options: 'from="{{ lab_deploy_from }}"'
+    state: present
+  when: lab_deploy_pubkey | default('') | length > 0

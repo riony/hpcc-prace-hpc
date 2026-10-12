@@ -1,0 +1,26 @@
+{
+  "slurm": {
+    "version": "1.2.2",
+    "registry": "oci://ghcr.io/slinkyproject/charts/slurm",
+    "file": "slurm-1.2.2.tgz",
+    "sha256": "5b4fd6e02232818e8a9ba02c9a6feb790fbc455cf758a106c0174762462048a5"
+  },
+  "slurm-operator": {
+    "version": "1.2.2",
+    "registry": "oci://ghcr.io/slinkyproject/charts/slurm-operator",
+    "file": "slurm-operator-1.2.2.tgz",
+    "sha256": "8521035313b9bf936e473e1aa1d452206aa3e5f4073b3b47af48b54d87b9be00"
+  },
+  "slurm-operator-crds": {
+    "version": "1.2.2",
+    "registry": "oci://ghcr.io/slinkyproject/charts/slurm-operator-crds",
+    "file": "slurm-operator-crds-1.2.2.tgz",
+    "sha256": "fdc011a81d4f86de5ce0940b8181dbfacd4c8cb9c22724704bb5898ae18551bd"
+  },
+  "cert-manager": {
+    "version": "v1.18.2",
+    "registry": "oci://quay.io/jetstack/charts/cert-manager",
+    "file": "cert-manager-v1.18.2.tgz",
+    "sha256": "daddf7af7b1f0eaaa10edd790aefa0bd8c2b07830febf659460d843217f5b3c5"
+  }
+}

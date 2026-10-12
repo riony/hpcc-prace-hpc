@@ -1,0 +1,39 @@
+---
+# Licence state, reported before client mounts and never fatal. The role applies no licence and
+# accepts no terms: obtaining one is an owner decision. Since 8.3 a system needs an enterprise,
+# temporary or community licence to comply with the BeeGFS License Agreement (8.4 licensing page),
+# and a community licence is requested through the URL `beegfs license` generates, which sends
+# limited deployment information to ThinkParQ. Unlicensed 8.4 accepts beegfs_unlicensed_client_limit
+# client mounts ("slots"); every rehearsal or test mount counts against them, and whether a slot is
+# released when a client goes away (client-auto-remove-timeout, 30 min by default) is a live check.
+- name: Licence file on the management host (/etc/beegfs/license.pem is the documented default)
+  ansible.builtin.stat:
+    path: "{{ beegfs_conf_dir }}/license.pem"
+    get_checksum: false
+  register: bg_licence_file
+  delegate_to: "{{ beegfs_mgmt_host }}"
+  run_once: true
+  check_mode: false
+
+- name: Licence state from the management (beegfs CLI; failures are only reported)
+  ansible.builtin.command: beegfs license
+  environment:
+    BEEGFS_MGMTD_ADDR: "{{ bg_mgmt_addr }}:{{ beegfs_grpc_port }}"
+    BEEGFS_TLS_DISABLE: "{{ 'true' if beegfs_tls_disable | bool else 'false' }}"
+  register: bg_licence
+  delegate_to: "{{ beegfs_mgmt_host }}"
+  run_once: true
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Licence note
+  ansible.builtin.debug:
+    msg:
+      - "licence file on {{ beegfs_mgmt_host }}: {{ 'present' if bg_licence_file.stat.exists else 'none (unlicensed)' }}"
+      - "beegfs license (rc {{ bg_licence.rc | default('n/a') }}): {{ (bg_licence.stdout_lines | default([]))[:12] | join(' / ') or (bg_licence.stderr | default('') | trim) or (bg_licence.msg | default('')) }}"
+      - >-
+        physical client mounts planned: {{ groups['fleet'] | length }}; an unlicensed system accepts
+        {{ beegfs_unlicensed_client_limit }}. Any additional (rehearsal or test) mount would be refused.
+      - "8.3+: running without any licence does not comply with the BeeGFS License Agreement (owner decision)"
+  run_once: true

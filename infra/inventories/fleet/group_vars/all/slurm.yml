@@ -1,0 +1,16 @@
+---
+# Slurm workers that run a native slurmd on the host instead of a Slinky pod (T89, D39 item 2:
+# the Lenovo as a native CPU worker under the one Slinky controller). When every host of a kind
+# is listed, roles/slinky switches that kind's NodeSet off and writes its NodeSet and partition
+# lines itself; the host's slurmd (OpenHPC, the Slinky images' version) joins by feature.
+# Going live and rolling back are this list plus native_workers in infra/audit/expected.json.
+slurm_native_workers: []
+# The job environment a native worker needs (T88; Session A review R4, 2 Oct): what the slurmd image
+# ships for it, at the image's own builds (evidence/2026-10-02/native-job-environment): Lmod (the
+# `module` command, started by /etc/profile.d/modules.sh), OpenMPI 4.1.1 with mpicc in
+# /usr/lib64/openmpi, and the image's GCC and gfortran (the /apps tree adds g++). Python 3.9 is the
+# host's own. roles/fleet_repo downloads them (tag native_repo, only while a worker is native);
+# roles/slinky native-prepare.yml installs them and native-runtime.yml checks them before the chart
+# changes. A rollback leaves them installed (unused by the pod worker). Renew with the image digest.
+slurm_native_runtime_packages: [Lmod-8.7.65-2.el9, openmpi-4.1.1-7.el9, openmpi-devel-4.1.1-7.el9, gcc-11.5.0-14.el9,
+                                gcc-gfortran-11.5.0-14.el9]

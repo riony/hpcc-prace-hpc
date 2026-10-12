@@ -1,0 +1,78 @@
+# Managed by Ansible (roles/apptainer). Apptainer {{ apptainer_version }}, unprivileged, relocated into
+# {{ apptainer_tree }}.
+#
+# This file is NOT a security boundary. With no setuid starter, Apptainer runs in unprivileged user
+# namespaces as the calling user, and any user can run a copy of Apptainer (or unshare) with a
+# configuration of their own. These are the safe defaults of the supported tool. What actually
+# confines a job is the kernel (user namespaces), Slurm's cgroups (CPUs, memory, GPUs), the
+# nosuid,nodev mounts of /home, /projects and /apps, and the network: see
+# docs/reference/APPTAINER-THREAT-MODEL-2026-10-05.md.
+#
+# Directives left out on purpose take Apptainer's own defaults. That includes every directive that
+# works only in setuid mode (limit container *, allow container *, allow setuid-mount *, allow net *,
+# max loop devices, shared loop devices): Apptainer ignores them while unprivileged user namespaces
+# exist, so setting them here would only look like a control. Likewise no restriction a user's own
+# copy undoes without a purpose (owner, 5 Oct: required functionality, protection outside the
+# experiment, or a demonstrated remediation): --fusemount stays Apptainer's default (allowed).
+
+# No setuid program flow, ever (and there is no setuid starter in this tree to use).
+allow setuid = no
+
+# Namespaces a user may request. The user namespace is required for unprivileged operation.
+allow user ns = yes
+allow pid ns = yes
+allow ipc ns = yes
+allow uts ns = yes
+
+# The calling user and the host's name resolution inside the container.
+config passwd = yes
+config group = yes
+config resolv_conf = yes
+
+# Kernel interfaces and devices as the job sees them (owner's Q9 decision, 6 Oct).
+# Device nodes may be visible without --nv; file permissions and the inherited Slurm device
+# cgroup decide which devices open. --nv supplies NVIDIA libraries, not a wider allocation.
+mount proc = yes
+mount sys = yes
+mount dev = yes
+mount devpts = yes
+
+# As Apptainer does by default: the caller's home (at /root under --fakeroot), /tmp, /var/tmp, the
+# files below, /etc/resolv.conf, the caller's passwd and group entries, /proc (new with --pid) and
+# the host's /sys. No other host file system: /projects/<project> is bound on request (-B), with the
+# caller's own permissions.
+mount home = yes
+mount tmp = yes
+mount hostfs = no
+bind path = /etc/localtime
+bind path = /etc/hosts
+user bind control = yes
+
+# Bind points missing from the image (most images lack the caller's home): underlay, a read-only tmpfs
+# root with the image's entries bound in, so neither the kernel's overlayfs in a user namespace nor
+# fuse-overlayfs sits under every container. Session B's bench, 5 Oct: 10 starts 7.0 s and small-file
+# reads 1.0 s, against 9.0 s and 1.75 s with fuse-overlayfs under the root. --writable-tmpfs and
+# --overlay use fuse-overlayfs (user space). Not a boundary: a user can reach kernel overlayfs with
+# their own tools. Upstream marks underlay deprecated; when it goes, choose between `driver` (slower)
+# and Apptainer's default (kernel overlayfs).
+enable overlay = driver
+enable underlay = preferred
+
+# Host mounts appear in the container as on the host (NFS remounts).
+mount slave = yes
+sessiondir max size = 64
+memory fs type = tmpfs
+
+# NVIDIA libraries only when asked for (--nv), by binding those in nvliblist.conf; no
+# nvidia-container-cli. ROCm is absent here.
+always use nv = no
+use nvidia-container-cli = no
+always use rocm = no
+
+# Capabilities kept by the root user: none (root never runs jobs; this only matters to an operator).
+root default capabilities = no
+
+# Resource limits are Slurm's (cgroups); Apptainer's --cpus/--memory need a user systemd session,
+# which jobs do not have. Image monitoring is not used.
+systemd cgroups = yes
+allow monitoring = no

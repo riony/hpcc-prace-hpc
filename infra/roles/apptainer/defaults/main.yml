@@ -1,0 +1,75 @@
+---
+# Apptainer for the extended applications: deferred until after the first scenario (D42), so the
+# role runs only when asked for (fleet.yml: tags apptainer, never). One unprivileged installation
+# for both worker kinds. The pinned RPMs are unpacked (never installed) into a versioned tree in
+# /apps by roles/apps_env's helper, as T88 does for GCC, with an Lmod module. Jobs in the slurmd pods
+# and on a native worker (T89) use the same tree through the read-only /apps share (nosuid,nodev).
+# Nothing is installed on a host or in an image, and the chart is unchanged: the pods' profile
+# snippet already puts /apps/modulefiles on MODULEPATH.
+#
+# Unprivileged only: apptainer-suid is not carried (roles/fleet_repo), the tree has no setuid file,
+# /apps is nosuid, and `allow setuid = no`. Containers run in unprivileged user namespaces, so
+# apptainer.conf is a set of safe defaults for the supported tool, NOT a security boundary: any user
+# can run their own copy with their own configuration (Apptainer's own conf says its container
+# limits do not apply while unprivileged user namespaces exist). The boundary is the kernel, Slurm's
+# cgroups and the mount options: docs/reference/APPTAINER-THREAT-MODEL-2026-10-05.md.
+apptainer_version: 1.5.4-1.el9
+apptainer_module: "1.5.4"
+apptainer_root: "{{ apps_env_root | default('/apps') }}"
+apptainer_tree: "{{ apptainer_root }}/sw/apptainer/{{ apptainer_version }}"
+apptainer_modulefiles: "{{ apptainer_root }}/modulefiles"
+# Site images, read-only for users: the acceptance probe, and images an operator converts from
+# digest-pinned archives (the private network has no registry and no internet)
+apptainer_images: "{{ apptainer_root }}/containers"
+# Owner of everything the role writes in /apps (tests only: they run unprivileged)
+apptainer_owner: root
+apptainer_group: root
+apptainer_packages_dir: "{{ fleet_repo_dir | default('/srv/fleet-repo') }}/packages"
+# The pinned set's checksum manifest, on the login node's own disk (as roles/apps_env's GCC set)
+apptainer_state_dir: /var/lib/prace-apps
+# The same condition as roles/apps_env's apps_env_enabled: written only while the apps share is
+# declared and not deferred (storage.yml); otherwise nothing
+apptainer_enabled: >-
+  {{ (storage_enable | default(true) | bool) and 'apps' not in (storage_defer | default([]))
+     and (storage_lvs | default([]) | selectattr('name', 'equalto', 'apps') | list | length > 0) }}
+# What /apps must be mounted from before anything is written (as roles/apps_env)
+apptainer_device: "/dev/mapper/{{ storage_vg | default('hpe_vg') }}-apps"
+# The unpacked set: Apptainer and the four libraries its programs need that the pinned slurmd image
+# lacks (ldd in that image, 5 Oct: libsubid for apptainer and starter, liblzo2 for squashfuse_ll and
+# mksquashfs, libfuse3 for squashfuse_ll and fuse-overlayfs, libprotobuf-c for proot). The native
+# hosts have lzo and protobuf-c already; the tree carries its own so both worker kinds run the same
+# files. Not fakeroot: its command is an alternatives link made by a scriptlet, which an unpack
+# does not run, and --fakeroot needs no fakeroot command (the threat model's fakeroot policy).
+# roles/fleet_repo downloads exactly these files (tag extra_repo); a missing or different file
+# stops the unpack before anything is written.
+apptainer_rpms:
+  - {file: apptainer-1.5.4-1.el9.x86_64.rpm, sha256: 474c7c71c804e80eb1ed3e30781fe0cca6e169875a48efb37b280d58c5e5377d}
+  - {file: fuse3-libs-3.10.2-9.el9.x86_64.rpm, sha256: 53288648d76449d1bef5e7cbf93d008f1ed77fba45f51a3ea33c61952c589aa9}
+  - {file: shadow-utils-subid-4.9-16.el9.x86_64.rpm, sha256: 9ccb728e83910880e031544751fd8ef043766c1a0655784e0ff8375eddc13504}
+  - {file: lzo-2.10-7.el9.x86_64.rpm, sha256: e204370ce22c35f18d784ad404c2892e2ffe946d5e0378c8d1044f6554fbe860}
+  - {file: protobuf-c-1.3.3-13.el9.x86_64.rpm, sha256: 084e207869fa9bfd0c4c94e4be1249aa909087fe90229141149b95e517ab74cf}
+# A relocated unprivileged Apptainer takes its paths from its binary's location (buildcfg in the
+# pinned image, 5 Oct): configuration in TREE/usr/etc/apptainer, session directory
+# TREE/usr/var/lib/apptainer/mnt/session (it must exist: /apps is read-only), helpers in
+# TREE/usr/libexec/apptainer. The RPM's own files under TREE/etc stay as unpacked; the role adds the
+# site layer: these files copied from TREE/etc/apptainer, the hardened apptainer.conf
+# (templates/apptainer.conf.j2), and the wrapper in TREE/prace/bin. Not copied: the CNI network
+# configurations (only root can attach a container to a host network; --net --network none needs
+# none), rocmliblist.conf (no AMD GPUs), the cgroups and DMTCP examples.
+apptainer_conf_files: [capability.json, ecl.toml, global-pgp-public, nvliblist.conf, remote.yaml, seccomp-profiles/default.json]
+# The acceptance probe image (files/prace-apptainer-probe.sh): converted on the login node from the
+# alpine archive roles/slinky already keeps in the private repository (exported from containerd by
+# its pinned digest; slinky_images.alpine, which test-apptainer.py keeps equal to this), with
+# /prace-euid-probe, a setuid-root 142-byte program that exits 0 only when it runs as root, for the
+# no-privilege-gain check. Built once; a probe image that differs from its recorded sha256 is
+# refused, never replaced.
+apptainer_probe_digest: "sha256:5291449c3df73caf6ed85e649dec1b9e818b39a5d8c871e97afc13e9cd5e8fa8"
+apptainer_probe_archive: "{{ slinky_image_dir | default('/srv/fleet-repo/k3s/images') }}/alpine-{{ apptainer_probe_digest | replace('sha256:', '') }}.tar"
+apptainer_probe_image: "{{ apptainer_images }}/prace-probe.sif"
+# A native worker (T89) runs jobs on the host. Read-only checks there before the module is offered:
+# unprivileged user namespaces enabled, /dev/fuse present, and no subordinate id range for any
+# cluster user (with one, --fakeroot or newuidmap maps 65536 more ids, whose files on the NFS shares
+# belong to no one and escape the per-user quota). Paths for tests only.
+apptainer_check_userns: /proc/sys/user/max_user_namespaces
+apptainer_check_fuse: /dev/fuse
+apptainer_check_subid: [/etc/subuid, /etc/subgid]

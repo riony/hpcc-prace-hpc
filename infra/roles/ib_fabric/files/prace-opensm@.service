@@ -1,0 +1,27 @@
+# Managed by Ansible (roles/ib_fabric). One OpenSM per InfiniBand ring link (%i), bound by its
+# configuration to that link's port GUID; each instance keeps its own cache (two run on one node).
+[Unit]
+Description=OpenSM for InfiniBand ring link %i (roles/ib_fabric)
+Documentation=man:opensm(8)
+ConditionPathExists=/etc/rdma/prace-opensm-%i.conf
+Wants=contributor@example.org
+After=systemd-modules-load.service contributor@example.org
+# OpenSM 3.3.24 exits 0 when its port GUID is not (yet) there, e.g. at boot before the card's umad
+# device registers: restart it whatever the exit, and never give up.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+Environment=OSM_CACHE_DIR=/var/cache/opensm/%i OSM_TMP_DIR=/var/cache/opensm/%i
+# Only on the planned cable: the neighbour is read at every start, boot and restart included.
+ExecStartPre=/usr/libexec/prace-opensm-peer-check %i
+ExecStart=/usr/sbin/opensm -F /etc/rdma/prace-opensm-%i.conf
+Restart=always
+RestartSec=10
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target

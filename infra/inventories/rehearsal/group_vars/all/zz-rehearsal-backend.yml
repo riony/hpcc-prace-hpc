@@ -1,0 +1,7 @@
+---
+# The virtual rehearsal exercises the native Slurm fallback (D37); the real fleet defaults to slinky.
+fleet_slurm_backend: native
+
+# The workstation rehearsal VMs have no login-node volume group: the storage roles (D39) are
+# rehearsed with inventories/storage-rehearsal instead.
+storage_enable: false

@@ -1,0 +1,10 @@
+---
+# The helper slurm-window.py's lock coordinator runs to re-close the overlay (--refence --lock-fd).
+# Installed by every converge and by the admission-only playbook, so an overlay never exists without it.
+- name: Install the bounded maintenance overlay helper
+  ansible.builtin.copy:
+    src: prace-slinky-maintenance.py
+    dest: /usr/local/sbin/prace-slinky-maintenance
+    owner: root
+    group: root
+    mode: "0755"

@@ -1,0 +1,81 @@
+---
+# The chart manifest written and taken in: K3s applies files in its manifest directory
+# asynchronously, and its Helm controller renders what it last read of the HelmChart and the
+# HelmChartConfig (the maintenance overlay). An ordering that matters (the T89 bridge in login.yml)
+# waits until (1) the API's slurm HelmChart holds the rendered values and (2) the Helm controller's
+# values Secret holds them together with the current overlay's, before the next object changes.
+# slinky_charts_written: the caller already templated the manifest; otherwise it is templated here
+# (with the caller's variables).
+- name: No Helm job for slurm is running (bridge chart write; never write over a running upgrade)
+  ansible.builtin.command:
+    argv: ['/usr/bin/python3', '-c', "{{ lookup('ansible.builtin.file', role_path ~ '/files/prace-slinky-maintenance.py') }}", '--helm-idle']
+  register: slinky_helm_before_bridge
+  changed_when: false
+  when: not slinky_charts_written | default(false)
+
+- name: The charts as K3s HelmChart objects (bridge)
+  ansible.builtin.template:
+    src: prace-slinky-charts.yaml.j2
+    dest: "{{ slinky_manifest_dir }}/prace-slinky-charts.yaml"
+    owner: root
+    group: root
+    mode: "0600"
+  register: slinky_charts_bridge
+  when: not slinky_charts_written | default(false)
+
+- name: The slurm chart values just written (bridge; the same template with the caller's variables)
+  ansible.builtin.include_tasks: chart-values.yml
+  when: slinky_charts_bridge is changed
+
+# NodeSets may come and go at a bridge step (3a parks a kind); the LoginSet, controller and keys may not
+- name: The release settled with those values (bridge), LoginSet, controller and auth keys unchanged
+  ansible.builtin.command:
+    argv: ['/usr/bin/python3', '-c', "{{ lookup('ansible.builtin.file', role_path ~ '/files/prace-slinky-maintenance.py') }}", '--helm-settle']
+    stdin: "{{ {'before': slinky_helm_before_bridge.stdout | from_json, 'values': slinky_chart_values} | to_json }}"
+  changed_when: false
+  when: slinky_charts_bridge is changed
+
+- name: Read the rendered chart manifest
+  ansible.builtin.slurp:
+    src: "{{ slinky_manifest_dir }}/prace-slinky-charts.yaml"
+  register: slinky_charts_rendered
+
+- name: The API holds the rendered slurm chart values (bounded)
+  ansible.builtin.command: "{{ slinky_kubectl }} -n kube-system get helmchart slurm -o jsonpath={.spec.valuesContent}"
+  register: slinky_charts_api
+  until: >-
+    slinky_charts_api.rc == 0 and (slinky_charts_api.stdout | trim) ==
+    ((slinky_charts_rendered.content | b64decode | from_yaml_all | selectattr('metadata.name', 'equalto', 'slurm')
+      | first).spec.valuesContent | trim)
+  retries: "{{ slinky_charts_wait_retries | default(40) }}"
+  delay: "{{ slinky_charts_wait_delay | default(3) }}"
+  changed_when: false
+
+- name: The persistent maintenance overlay, if any
+  ansible.builtin.stat:
+    path: "{{ slinky_manifest_dir }}/prace-slinky-maintenance.yaml"
+    follow: false
+  register: slinky_charts_overlay_stat
+
+- name: Read it
+  ansible.builtin.slurp:
+    src: "{{ slinky_manifest_dir }}/prace-slinky-maintenance.yaml"
+  register: slinky_charts_overlay
+  when: slinky_charts_overlay_stat.stat.exists
+
+- name: K3s's Helm controller has read the chart values and the current overlay (bounded)
+  ansible.builtin.command: "{{ slinky_kubectl }} -n kube-system get secret {{ slinky_chart_values_secret }} -o json"
+  register: slinky_charts_values
+  until: >-
+    slinky_charts_values.rc == 0
+    and ((slinky_charts_rendered.content | b64decode | from_yaml_all | selectattr('metadata.name', 'equalto', 'slurm')
+          | first).spec.valuesContent | trim) in slinky_charts_have
+    and (slinky_charts_overlay is skipped
+         or ((slinky_charts_overlay.content | b64decode | from_json).spec.valuesContent | trim) in slinky_charts_have)
+  retries: "{{ slinky_charts_wait_retries | default(40) }}"
+  delay: "{{ slinky_charts_wait_delay | default(3) }}"
+  changed_when: false
+  vars:
+    slinky_charts_have: >-
+      {{ (slinky_charts_values.stdout | from_json).data | default({}) | dict2items | map(attribute='value')
+         | map('b64decode') | map('trim') | list }}

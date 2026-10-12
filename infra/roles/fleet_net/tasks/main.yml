@@ -1,0 +1,51 @@
+---
+# Managed by Ansible (roles/fleet_net). Adopts the private profile written by the installer
+# (login node) or prace-first-address.service (compute nodes); never picks a port itself.
+- name: D43 persistent unused fibre guard
+  ansible.builtin.import_tasks: disabled-links.yml
+  tags: [disabled_links]
+
+- name: Find the private port by its admin address (already configured at install/first boot)
+  ansible.builtin.set_fact:
+    fleet_private_iface: >-
+      {{ ansible_facts.interfaces
+         | map('regex_replace', '-', '_')
+         | map('extract', ansible_facts)
+         | selectattr('ipv4', 'defined')
+         | selectattr('ipv4.address', 'equalto', admin_ip)
+         | map(attribute='device') | list }}
+
+- name: Exactly one port holds the admin address
+  ansible.builtin.assert:
+    that: fleet_private_iface | length == 1
+    fail_msg: >-
+      {{ fleet_private_iface | length }} ports hold {{ admin_ip }}. The first address comes from
+      the installer (login) or prace-first-address.service (compute); check its console output.
+    quiet: true
+
+- name: Adopt that profile with private_net (content identical, so no change expected)
+  ansible.builtin.include_role:
+    name: private_net
+  vars:
+    private_iface: "{{ fleet_private_iface[0] }}"
+    private_ip: "{{ admin_ip }}"
+    private_prefix: "{{ admin_prefix }}"
+    private_zone: public
+
+- name: Private-subnet traffic goes to the trusted zone (source-based)
+  ansible.posix.firewalld:
+    zone: trusted
+    source: "{{ item }}"
+    permanent: true
+    immediate: true
+    state: enabled
+  loop: "{{ fleet_trusted_sources }}"
+
+- name: Fleet names in /etc/hosts (no DNS on the private network)
+  ansible.builtin.blockinfile:
+    path: /etc/hosts
+    marker: "# {mark} PRACE fleet (roles/fleet_net)"
+    block: |
+      {% for h in groups['fleet'] | sort %}
+      {{ hostvars[h].admin_ip }} {{ h }}
+      {% endfor %}

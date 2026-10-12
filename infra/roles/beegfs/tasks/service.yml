@@ -1,0 +1,122 @@
+---
+# One server service on a GPU host, bg_svc = meta | storage, for its ACTIVE items only: packages,
+# the shipped configuration file with the managed keys, the guard drop-in, then start.
+# storeAllowFirstRunInit (manual_installation.html "safety options") is false in ordinary
+# convergence. Only when an item was initialised in this run (mount.yml: store directory created
+# by an authorised first use) does the service start once with it true; it is switched off and
+# the service restarted before this file ends.
+- name: "beegfs-{{ bg_svc }}: pinned packages"
+  ansible.builtin.include_tasks: packages.yml
+  vars:
+    bg_pkg_names: "{{ beegfs_packages[bg_svc] }}"
+    bg_pkg_extra: []
+
+- name: "beegfs-{{ bg_svc }}: first start of a new item in this run?"
+  ansible.builtin.set_fact:
+    bg_first_run_now: >-
+      {{ not ansible_check_mode and bg_first_use_authorised | bool
+         and bg_initialised_now | default([]) | intersect(bg_backing | selectattr('kind', 'equalto', bg_svc) | map(attribute='name') | list)
+         | length > 0 }}
+
+- name: "beegfs-{{ bg_svc }}: configuration"
+  ansible.builtin.include_tasks: conf-set.yml
+  vars:
+    bg_conf_path: "{{ beegfs_conf_dir }}/beegfs-{{ bg_svc }}.conf"
+    bg_conf_settings: "{{ bg_meta_settings if bg_svc == 'meta' else bg_storage_settings }}"
+    bg_conf_format: conf
+
+- name: "beegfs-{{ bg_svc }}: configuration changed"
+  ansible.builtin.set_fact:
+    bg_svc_conf_changed: "{{ bg_conf_changed | bool or bg_auth is changed or bg_net is changed }}"
+
+- name: "beegfs-{{ bg_svc }}: drop-in directory"
+  ansible.builtin.file:
+    path: "/etc/systemd/system/beegfs-{{ bg_svc }}.service.d"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: "beegfs-{{ bg_svc }}: refuse to start without its own backing filesystems, markers and ID files"
+  ansible.builtin.template:
+    src: guard.conf.j2
+    dest: "/etc/systemd/system/beegfs-{{ bg_svc }}.service.d/10-prace-guard.conf"
+    owner: root
+    group: root
+    mode: "0644"
+  vars:
+    bg_guard: "{{ bg_guard_meta if bg_svc == 'meta' else bg_guard_storage }}"
+  register: bg_dropin
+
+- name: "beegfs-{{ bg_svc }}: running (restarted after a change)"
+  ansible.builtin.systemd:
+    name: "beegfs-{{ bg_svc }}"
+    state: "{{ 'restarted' if bg_svc_conf_changed | bool or bg_dropin is changed or bg_first_run_now | bool else 'started' }}"
+    enabled: true
+    daemon_reload: "{{ bg_dropin is changed }}"
+  when: bg_pkgs_present | bool or not ansible_check_mode
+
+- name: "beegfs-{{ bg_svc }}: first start of new items"
+  when: bg_first_run_now | bool
+  block:
+    - name: "beegfs-{{ bg_svc }}: let it initialise the new store directories"
+      ansible.builtin.pause:
+        seconds: "{{ beegfs_first_run_wait_s }}"
+
+    - name: "beegfs-{{ bg_svc }}: still running after its first start"
+      ansible.builtin.command: systemctl is-active beegfs-{{ bg_svc }}
+      changed_when: false
+
+    - name: "beegfs-{{ bg_svc }}: first-run initialisation off again"
+      ansible.builtin.set_fact:
+        bg_first_run_now: false
+
+    - name: "beegfs-{{ bg_svc }}: configuration without first-run initialisation"
+      ansible.builtin.include_tasks: conf-set.yml
+      vars:
+        bg_conf_path: "{{ beegfs_conf_dir }}/beegfs-{{ bg_svc }}.conf"
+        bg_conf_settings: "{{ bg_meta_settings if bg_svc == 'meta' else bg_storage_settings }}"
+        bg_conf_format: conf
+
+    - name: "beegfs-{{ bg_svc }}: restart without it"
+      ansible.builtin.systemd:
+        name: "beegfs-{{ bg_svc }}"
+        state: restarted
+
+- name: "beegfs-{{ bg_svc }}: settle"
+  ansible.builtin.pause:
+    seconds: "{{ beegfs_service_settle_s }}"
+  when: not ansible_check_mode
+
+- name: "beegfs-{{ bg_svc }}: active, and first-run initialisation is off in its configuration"
+  ansible.builtin.shell: |
+    set -euo pipefail
+    systemctl is-active beegfs-{{ bg_svc }}
+    grep -E '^[[:space:]]*storeAllowFirstRunInit[[:space:]]*=[[:space:]]*false[[:space:]]*$' {{ (beegfs_conf_dir ~ '/beegfs-' ~ bg_svc ~ '.conf') | quote }}
+  args: {executable: /bin/bash}
+  changed_when: false
+  check_mode: false
+  when: not ansible_check_mode
+
+# An active unit is not health: a service whose registration was refused keeps running (bench,
+# Session B review S-5). The management must report this host's items Online and Good. This proves
+# a registration; it does not prove a just-restarted service healthy (a stopped service stays
+# Online at the management for 45-60 s; re-review bench): is-active after the settle covers that.
+- name: "beegfs-{{ bg_svc }}: this host's items registered, Online and Good at the management"
+  ansible.builtin.command:
+    argv: [beegfs, target, list, --state]
+  environment:
+    BEEGFS_MGMTD_ADDR: "{{ bg_mgmt_addr }}:{{ beegfs_grpc_port }}"
+    BEEGFS_TLS_DISABLE: "{{ 'true' if beegfs_tls_disable | bool else 'false' }}"
+  delegate_to: "{{ beegfs_mgmt_host }}"
+  register: bg_fs_raw
+  changed_when: false
+  check_mode: false
+  vars:
+    want: "{{ bg_my_ids | select('match', '^m:' if bg_svc == 'meta' else '^s:') | list }}"
+  until: >-
+    bg_fs_raw.rc | default(1) == 0 and
+    want | difference(bg_fs_raw.stdout_lines | default([]) | map('regex_findall', bg_fs_online_rx) | flatten) | length == 0
+  retries: "{{ beegfs_registration_retries }}"
+  delay: "{{ beegfs_registration_delay_s }}"
+  when: not ansible_check_mode

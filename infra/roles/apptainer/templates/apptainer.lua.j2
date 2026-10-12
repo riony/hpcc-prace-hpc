@@ -1,0 +1,21 @@
+-- Managed by Ansible (roles/apptainer). Apptainer {{ apptainer_version }}, unprivileged (no setuid), unpacked into /apps.
+local root = "{{ apptainer_tree }}"
+help([[Apptainer {{ apptainer_version }} in unprivileged mode: containers run in a user namespace as you, with your
+own permissions; nothing in a container runs as root on the node, and setuid programs in an
+image gain nothing. Your home and /tmp are mounted; bind a project directory with
+-B /projects/<project>. GPUs: --nv in a job that has them (-p gpu --gres=gpu:1).
+Images: no registry or internet on the cluster network. Site images are in {{ apptainer_images }};
+bring your own SIF file through the login node. --fakeroot maps only your own id (no
+subordinate id ranges), and your home is then /root inside: bind what else you need with -B.
+`apptainer overlay create` needs mkfs.ext3, which the pod workers lack: use --writable-tmpfs or a
+directory overlay there. `singularity` is the same command. Use inside jobs (srun/sbatch), not on
+the login pod's CPUs.]])
+whatis("Name: Apptainer")
+whatis("Version: {{ apptainer_version }}")
+whatis("Description: unprivileged containers (SIF), no setuid")
+if mode() == "load" and not isDir(pathJoin(root, "prace/bin")) then
+  LmodError("apptainer/{{ apptainer_module }}: ", root, " is missing here (/apps not mounted?)")
+end
+prepend_path("PATH", pathJoin(root, "prace/bin"))
+prepend_path("MANPATH", pathJoin(root, "usr/share/man"))
+setenv("PRACE_APPTAINER_IMAGES", "{{ apptainer_images }}")

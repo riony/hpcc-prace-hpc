@@ -1,0 +1,8 @@
+---
+# Host SSH (28 Sep, user decision): cluster users reach the Slinky login pod (private NodePort
+# 32222), never a shell on a fleet host. Their keys live in the shared /home, so without this
+# list any cluster user could log in to the login host (the K3s, NFS and MariaDB server).
+# Only these accounts may log in over SSH: root and admin everywhere (Ansible connects as root
+# through admin@login), and prace-observer on the login node (the off-node monitor's
+# forced-command key).
+host_ssh_allow_users: "{{ ['root', 'admin'] + (['prace-observer'] if fleet_role | default('') == 'login' else []) }}"

@@ -1,0 +1,8 @@
+# Tested with Python 3.12; transitive pins are in the companion lock.
+-c requirements-nemo.lock.txt
+# Agent runtime only; Component 4 and the scripted driver stay stdlib-only.
+nvidia-nat==1.9.0
+nvidia-nat-langchain[nvidia,openai]==1.9.0
+
+# NAT HTTP server uses SQLAlchemy asyncio; the CLI path did not need this.
+greenlet==3.5.6

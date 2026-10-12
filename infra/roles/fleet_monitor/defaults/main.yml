@@ -1,0 +1,14 @@
+---
+# fleet_monitor: off-node fleet health monitor on mgmt-git01 (outside the mini-cluster) and the
+# CI drift audit's key. Read-only probes of the login node through forced-command keys
+# (roles/fleet_observer there); alerts are GitLab issues. No automatic remediation.
+fleet_monitor_user: prace-monitor
+fleet_monitor_home: /var/lib/prace-monitor
+fleet_monitor_lib: /usr/local/lib/prace-monitor
+fleet_monitor_etc: /etc/prace-monitor
+fleet_monitor_target: prace-observer@192.0.2.205
+fleet_monitor_project: hpcc/prace-hackathon
+fleet_monitor_owner: team-user01                # alert issues are assigned to and mention this user
+fleet_monitor_token_expires: "2026-10-31"      # project access token (api, Reporter) for alert issues
+fleet_monitor_interval_s: 60
+fleet_audit_user: labdeploy                    # the lab runner user (roles/gitlab_lab_runner) runs the drift audit

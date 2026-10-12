@@ -1,0 +1,241 @@
+---
+# The InfiniBand ring as a fabric (T64, roles/ib_fabric): one OpenSM per cable, bound to its port GUID
+# on the node ring_links names, and IPoIB on both ends with the link's /30. DEFERRED (D42), and D43
+# says "no OpenSM/IPoIB/RDMA": every present run refuses until the owner's decision lifting both for
+# the ring is recorded (ib_fabric_decision, group_vars/all/ib_fabric.yml). NOT part of fleet.yml.
+# Procedure, stages, qualification and the way back: docs/runbooks/IB-FABRIC.md.
+#
+# Prerequisites: the mapping window (docs/runbooks/IB-PEER-MAP-2026-10-02.md) recorded its raw maps
+# with SHA256SUMS under evidence/ and ib_fabric_peer_map names that directory; the pinned files are in
+# the fleet repository (R --limit lab-dl380 --tags extra_repo). Every run happens inside an OWNED,
+# CLOSED, QUIET window under the window tool's lease for this work (holder=maint label=ib-<stage>):
+#   id=$(W lease-take --label ib-<stage> | tail -1); [[ $id =~ ^[0-9a-f]{16}$ ]] || { echo STOP; false; }
+#   W close --lease-id "$id" && W check --lease-id "$id"
+#   I() { F && infra/tools/run-ansible.sh -i inventories/fleet playbooks/ib-fabric.yml -e fleet_armed=true \
+#           -e fleet_lease_id="$id" -e "@$intent" "$@"; }
+#   I --check -e ib_fabric_links=g003-g004     # preview: read-only steps run, nothing changes
+#   I -e ib_fabric_links=g003-g004             # one cable first; then the other two
+#   I -e ib_fabric_state=absent                # the way back, on every link and every GPU node (no decision or
+#                                              # peer map needed): units, files, connections, zone; ports reset to INIT
+#   O && W lease-release --lease-id "$id"
+#
+# Gates, in order, repeated in every play (a --limit or --start-at-task cannot skip them):
+#  1. armed: every host pattern is empty unless -e fleet_armed=true;
+#  2. no --tags/--skip-tags (every check must run);
+#  3. tasks/gates.yml: the owner's decision (present only); a lease id; the plan, re-proved by
+#     tools/ib-fabric-check.py from the recorded raw maps (hashes, reciprocity, inventory), with each
+#     package's exact pinned file;
+#  4. the cluster lease held by this run, an ib-<stage> lease of the window tool;
+#  5. the owned closed quiet window (tools/require-closed-window.py with -e @<intent>);
+#  6. preflight on each GPU node (read-only): every ring port of the stage here, on its PCI function,
+#     linked, and its neighbour, read now, the planned other end; no port outside the ring linked or
+#     addressed; no subnet manager but this role's (absent only warns: the way back always runs).
+# A present run takes the decision and the peer map only as committed (never -e) and needs every GPU
+# node in the play (stage with ib_fabric_links, never --limit). Every task file that changes a node
+# repeats the gated check, so --start-at-task changes nothing.
+# The last play reports every node (pinging each peer over its IPoIB device) and judges the reports
+# with tools/ib-fabric-check.py on the controller: the run fails unless the stage is proved.
+- name: Arming gate (clear message; controller only)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Refuse unless explicitly armed
+      ansible.builtin.assert:
+        that: fleet_armed | default(false) | bool
+        fail_msg: "Not armed: pass -e fleet_armed=true"
+        quiet: true
+      tags: [always]
+    - name: No tag filtering (every check must run)
+      ansible.builtin.assert:
+        that: ansible_run_tags | list == ['all'] and ansible_skip_tags | list == []
+        fail_msg: "ib-fabric.yml takes no --tags/--skip-tags"
+        quiet: true
+      tags: [always]
+
+- name: InfiniBand fabric preflight (GPU nodes, read-only)
+  hosts: "{{ 'gpu' if (fleet_armed | default(false) | bool) else 'ib_fabric_not_armed_no_hosts' }}"
+  gather_facts: false
+  any_errors_fatal: true
+  environment: "{{ ib_fabric_env | default({}) }}"
+  tasks:
+    - &armed
+      name: Armed (checked again before any connection)
+      ansible.builtin.assert:
+        that: fleet_armed | default(false) | bool
+        fail_msg: "Not armed: pass -e fleet_armed=true"
+        quiet: true
+    # Twice: the always-tagged copy refuses --tags X, the untagged copy refuses --skip-tags always.
+    - &tags_always
+      name: No tag filtering (checked again inside the play, --tags)
+      ansible.builtin.assert:
+        that: ansible_run_tags | list == ['all'] and ansible_skip_tags | list == []
+        fail_msg: "ib-fabric.yml takes no --tags/--skip-tags"
+        quiet: true
+      tags: [always]
+    - &tags_untagged
+      name: No tag filtering (checked again inside the play, --skip-tags)
+      ansible.builtin.assert:
+        that: ansible_run_tags | list == ['all'] and ansible_skip_tags | list == []
+        fail_msg: "ib-fabric.yml takes no --tags/--skip-tags"
+        quiet: true
+    - &gates
+      name: Controller-side gates (no connection)
+      ansible.builtin.include_role:
+        name: ib_fabric
+        tasks_from: gates.yml
+        public: true
+    - &lease
+      name: Cluster lease on the login node (no other operation may hold it)
+      ansible.builtin.include_tasks: tasks/cluster-lease-check.yml
+    - &held
+      name: This run holds the lease
+      ansible.builtin.assert:
+        that: ibf_lease_held | bool
+        fail_msg: >-
+          Take the cluster lease first, with the window tool and for this work (W lease-take --label ib-<stage>),
+          and pass its id (-e fleet_lease_id=<id>); see the header of playbooks/ib-fabric.yml.
+          Lease now: {{ fleet_lease.stdout | default('none') }}
+        quiet: true
+    - &window
+      name: The owned closed quiet window (tools/require-closed-window.py; read-only, login node)
+      ansible.builtin.command:
+        argv: "{{ ib_fabric_window_check }}"
+        stdin: "{{ {'lease_id': fleet_lease_id | default(''), 'intent': slurm_window_intent | default(none)} | to_json }}"
+      environment:
+        PRACE_LOGIN: "{{ hostvars[groups['login'][0]].ansible_host | default(hostvars[groups['login'][0]].admin_ip) }}"
+      delegate_to: localhost
+      become: false
+      run_once: true
+      changed_when: false
+      check_mode: false
+      register: ibf_window
+      when: ibf_lease_held | bool and not ansible_check_mode
+    - &windowed
+      name: This run is inside its owned closed quiet window
+      ansible.builtin.set_fact:
+        # --check previews under the lease alone: nothing changes in check mode.
+        ibf_window_verified: >-
+          {{ (ansible_check_mode and ibf_lease_held | bool)
+             or (ibf_window.rc | default(1) == 0 and 'owned closed window verified' in ibf_window.stdout | default('')) }}
+    - name: Preflight
+      ansible.builtin.include_role:
+        name: ib_fabric
+        tasks_from: preflight.yml
+
+- name: Subnet managers (one OpenSM per cable, on its ring_links node)
+  hosts: "{{ 'gpu' if (fleet_armed | default(false) | bool) else 'ib_fabric_not_armed_no_hosts' }}"
+  serial: 1
+  gather_facts: false
+  any_errors_fatal: true
+  environment: "{{ ib_fabric_env | default({}) }}"
+  tasks:
+    - *armed
+    - *tags_always
+    - *tags_untagged
+    - *gates
+    - *lease
+    - *held
+    - *window
+    - *windowed
+    - &gated
+      name: This run passed its gates (a run started past them changes nothing)
+      ansible.builtin.assert:
+        that: ibf_run_gated | bool or (ansible_check_mode and ibf_gates_passed | default(false) | bool and ibf_lease_held | bool)
+        fail_msg: "Gates not passed in this run; nothing is changed"
+        quiet: true
+    - name: Packages, modules and this node's subnet managers
+      when: ib_fabric_state == 'present' and ibf_host.sm | length > 0
+      block:
+        - {name: Packages, ansible.builtin.include_role: {name: ib_fabric, tasks_from: packages.yml}}
+        - {name: Modules, ansible.builtin.include_role: {name: ib_fabric, tasks_from: modules.yml}}
+        - {name: Subnet managers, ansible.builtin.include_role: {name: ib_fabric, tasks_from: sm.yml}}
+
+- name: IPoIB on each ring port (or, absent, the way back)
+  hosts: "{{ 'gpu' if (fleet_armed | default(false) | bool) else 'ib_fabric_not_armed_no_hosts' }}"
+  serial: 1
+  gather_facts: false
+  any_errors_fatal: true
+  environment: "{{ ib_fabric_env | default({}) }}"
+  tasks:
+    - *armed
+    - *tags_always
+    - *tags_untagged
+    - *gates
+    - *lease
+    - *held
+    - *window
+    - *windowed
+    - *gated
+    - name: Packages, modules and IPoIB
+      when: ib_fabric_state == 'present' and ibf_host.ports | length > 0
+      block:
+        - {name: Packages, ansible.builtin.include_role: {name: ib_fabric, tasks_from: packages.yml}}
+        - {name: Modules, ansible.builtin.include_role: {name: ib_fabric, tasks_from: modules.yml}}
+        - {name: IPoIB, ansible.builtin.include_role: {name: ib_fabric, tasks_from: ipoib.yml}}
+    - name: The way back
+      ansible.builtin.include_role:
+        name: ib_fabric
+        tasks_from: absent.yml
+      when: ib_fabric_state == 'absent'
+
+- name: Fabric check (every GPU node reports; the controller judges)
+  hosts: "{{ 'gpu' if (fleet_armed | default(false) | bool) else 'ib_fabric_not_armed_no_hosts' }}"
+  gather_facts: false
+  any_errors_fatal: true
+  environment: "{{ ib_fabric_env | default({}) }}"
+  tasks:
+    - *armed
+    - *tags_always
+    - *tags_untagged
+    - *gates
+    - *lease
+    - *held
+    - *window
+    - *windowed
+    - *gated
+    - name: Report, pinging each peer of this node's ports over its IPoIB device
+      ansible.builtin.include_role:
+        name: ib_fabric
+        tasks_from: report.yml
+      vars:
+        ibf_ping: "{{ ibf_host.ports | map(attribute='peer_ip') | list }}"
+    - name: Judge the reports on the controller
+      delegate_to: localhost
+      become: false
+      check_mode: false
+      block:
+        - name: A private directory for the reports
+          ansible.builtin.tempfile:
+            state: directory
+            prefix: prace-ib-fabric-
+          run_once: true
+          register: ibf_reports
+          changed_when: false          # controller bookkeeping, not a change to the fabric
+        - name: Each node's report
+          ansible.builtin.copy:
+            content: "{{ ibf_report_run.stdout }}"
+            dest: "{{ ibf_reports.path }}/{{ inventory_hostname }}.json"
+            mode: "0600"
+          changed_when: false
+        - name: The stage proved (tools/ib-fabric-check.py check; read-only)
+          ansible.builtin.command:
+            argv: >-
+              {{ ib_fabric_check_cmd
+                 + (ansible_play_hosts | map('regex_replace', '^', ibf_reports.path ~ '/') | map('regex_replace', '$', '.json') | list) }}
+          run_once: true
+          changed_when: false
+          register: ibf_check
+          when: not ansible_check_mode
+        - name: The check's verdict
+          ansible.builtin.debug:
+            msg: "{{ ibf_check.stdout_lines | default(['(check mode: not judged)']) }}"
+          run_once: true
+      always:
+        - name: The reports are removed from the controller
+          ansible.builtin.file:
+            path: "{{ ibf_reports.path }}"
+            state: absent
+          run_once: true
+          when: ibf_reports.path is defined
+          changed_when: false          # controller bookkeeping, not a change to the fabric

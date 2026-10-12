@@ -1,0 +1,84 @@
+---
+# Managed by Ansible (roles/slinky). A native worker's slurmd starts, AFTER tasks/login.yml switched
+# its kind's NodeSet off; tasks/native-prepare.yml installed and configured it before the chart
+# changed. One daemon per node: the NodeSet's pod and its Slurm record are gone before the native
+# slurmd starts. In --check the chart has not been applied and the pod is still there, so this
+# only previews (it neither waits for the pod nor starts anything).
+- name: Preview only - the native slurmd starts once the chart has removed the pod
+  ansible.builtin.debug:
+    msg: >-
+      preview: after the chart switches the {{ fleet_role }} NodeSet off, {{ inventory_hostname }}'s slurmd
+      pod and its record are removed, then the native slurmd starts at {{ admin_ip }} and the node is
+      tainted {{ slinky_native_taint }}
+  when: ansible_check_mode
+
+- name: Start the native slurmd
+  when: not ansible_check_mode
+  block:
+    - name: No slurmd pod left on this node (the chart switched its NodeSet off)
+      ansible.builtin.command: >-
+        {{ slinky_kubectl }} -n slurm get pods -l app.kubernetes.io/name=slurmd
+        --field-selector spec.nodeName={{ inventory_hostname }} -o name
+      delegate_to: "{{ groups['login'][0] }}"
+      register: slinky_native_pods
+      until: slinky_native_pods.rc == 0 and slinky_native_pods.stdout == ''
+      retries: 30
+      delay: 10
+      changed_when: false
+
+    - name: This node's Slurm record (the pod's, until it is replaced)
+      ansible.builtin.command: "{{ slinky_kubectl }} -n slurm exec slurm-controller-0 -c slurmctld -- scontrol show node {{ inventory_hostname }} -o"
+      delegate_to: "{{ groups['login'][0] }}"
+      register: slinky_native_record
+      changed_when: false
+      failed_when: >-
+        slinky_native_record.rc != 0 and
+        ('Node ' ~ inventory_hostname ~ ' not found') not in (slinky_native_record.stdout ~ slinky_native_record.stderr)
+
+    - name: The pod's leftover record is removed (only when it holds no job)
+      ansible.builtin.shell: |
+        set -o pipefail
+        S="{{ slinky_kubectl }} -n slurm exec slurm-controller-0 -c slurmctld --"
+        jobs=$($S squeue -h -w {{ inventory_hostname }} -o %i) || { echo "queue query failed"; exit 1; }
+        [ -z "$jobs" ] || { echo "jobs on the node: $jobs"; exit 1; }
+        $S scontrol delete nodename={{ inventory_hostname }} && echo deleted
+      delegate_to: "{{ groups['login'][0] }}"
+      register: slinky_native_delete
+      changed_when: "'deleted' in slinky_native_delete.stdout"
+      when:
+        - slinky_native_record.rc == 0
+        - ('NodeAddr=' ~ admin_ip ~ ' ') not in (slinky_native_record.stdout ~ ' ')
+
+    - name: slurmd enabled and running (restarted when its key, address or drop-in changed)
+      ansible.builtin.systemd_service:
+        name: slurmd
+        enabled: true
+        state: "{{ 'restarted' if (slinky_key_file is changed or slinky_hosts is changed or slinky_dropin is changed) else 'started' }}"
+        daemon_reload: "{{ slinky_dropin is changed }}"
+
+    - name: No Kubernetes workload on a native worker (taint; one slurmd is ensured above, not by the taint)
+      ansible.builtin.shell: |
+        set -o pipefail
+        K="{{ slinky_kubectl }}"
+        t=$($K get node {{ inventory_hostname }} -o jsonpath='{range .spec.taints[*]}{.key}={.value}:{.effect}{"\n"}{end}') || exit 1
+        grep -qx '{{ slinky_native_taint }}' <<<"$t" && exit 0
+        $K taint node {{ inventory_hostname }} '{{ slinky_native_taint }}' --overwrite >/dev/null && echo tainted
+      args:
+        executable: /bin/bash
+      delegate_to: "{{ groups['login'][0] }}"
+      register: slinky_native_taint_set
+      changed_when: "'tainted' in slinky_native_taint_set.stdout"
+
+    - name: Registered natively (usable, NodeAddr on the private network)
+      ansible.builtin.command: >-
+        {{ slinky_kubectl }} -n slurm exec slurm-controller-0 -c slurmctld --
+        sinfo -h -N -n {{ inventory_hostname }} -o '%T %o'
+      delegate_to: "{{ groups['login'][0] }}"
+      register: slinky_native_state
+      until: >-
+        slinky_native_state.rc == 0 and
+        (slinky_native_state.stdout_lines | map('split') | map('last') | unique | list) == [admin_ip] and
+        (slinky_native_state.stdout_lines | map('split') | map('first') | unique | list | first | default('')) in ['idle', 'mixed', 'allocated', 'completing']
+      retries: 30
+      delay: 10
+      changed_when: false

@@ -1,0 +1,48 @@
+---
+- name: Artifact directory next to the package repository (served by httpd, private address only)
+  ansible.builtin.file:
+    path: "{{ k3s_artifact_dir }}"
+    state: directory
+    mode: "0755"
+
+- name: Download each pinned artifact (fails unless its SHA-256 matches)
+  ansible.builtin.get_url:
+    url: "{{ item.url }}"
+    dest: "{{ k3s_artifact_dir }}/{{ item.name }}"
+    checksum: "sha256:{{ item.sha256 }}"
+    mode: "0644"
+  loop: "{{ k3s_artifacts }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: SELinux labels for the served files
+  ansible.builtin.command: restorecon -Rv {{ k3s_artifact_dir }}
+  register: k3s_served_labels
+  # restorecon also prints 'not reset as customized' for runtime container labels (untouched)
+  changed_when: "'Relabeled' in k3s_served_labels.stdout"
+
+- name: Agent-only join secret, generated on this node (never printed or copied off it)
+  ansible.builtin.shell: umask 077; mkdir -p /etc/rancher/k3s; openssl rand -hex 32 > {{ k3s_agent_secret_file }}
+  args:
+    creates: "{{ k3s_agent_secret_file }}"
+
+- name: Install from the verified copies
+  ansible.builtin.include_tasks: install.yml
+  vars:
+    k3s_src: "{{ k3s_artifact_dir }}"
+
+- name: Flush handlers (a changed configuration restarts the server before agents join)
+  ansible.builtin.meta: flush_handlers
+
+- name: API ready
+  ansible.builtin.command: /usr/local/bin/k3s kubectl get --raw /readyz
+  register: k3s_ready
+  until: k3s_ready.rc == 0 and k3s_ready.stdout == 'ok'
+  retries: 30
+  delay: 10
+  changed_when: false
+
+- name: Agent token exists (agents read it from here; the server token stays on this node)
+  ansible.builtin.wait_for:
+    path: /var/lib/rancher/k3s/server/agent-token
+    timeout: 120

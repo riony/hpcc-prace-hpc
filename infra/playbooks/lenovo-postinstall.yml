@@ -1,0 +1,22 @@
+---
+# Lenovo lab-lenovo post-install. private-postinstall.yml runs the same roles
+# on every private node (Lenovo + g005); this file is the Lenovo-only entry point.
+#
+# Run AFTER the private-switch cable is in (T39) and private_iface is set in
+# host_vars/lab-lenovo.yml. The private_net role fails closed (with a clear
+# message) if the interface is unset or has no carrier :  nothing is written.
+#
+#   /home/operator/HPCC/hpcc-prace-hpc/infra/tools/run-ansible.sh playbooks/lenovo-postinstall.yml -e ansible_user=root
+#
+# The deployed private baseline is complete. Offline mode verifies its installed
+# packages; missing packages require approved staging (not --skip-tags packages).
+# See docs/history/LENOVO-POSTINSTALL-PREP.md for the completed deployment and rebuild recipe.
+- name: Lenovo post-install
+  hosts: lenovo
+  become: true
+  gather_facts: true
+  roles:
+    # private_* vars are mapped from host_vars network: in group_vars/private_nodes.yml
+    - private_net      # static 10.88.0.2/24, no gateway :  gives bastion reachability
+    - host_base        # packages, time, timezone, firewall, SELinux
+    - lab_deploy_key   # authorize the mgmt-git01 lab deploy runner (source-restricted)

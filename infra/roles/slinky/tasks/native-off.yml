@@ -1,0 +1,140 @@
+---
+# Managed by Ansible (roles/slinky). A worker that is not in slurm_native_workers but was set up for
+# a native slurmd (its transition marker or drop-in, tasks/native-prepare.yml), or still carries
+# the native taint (a host reinstalled while its Kubernetes node kept it): take the native side
+# down BEFORE tasks/login.yml switches the kind's NodeSet back on, so the returning pod is the
+# node's only slurmd. Every step is checked; a failed one stops this host, and login.yml then
+# refuses the NodeSet change (it needs slinky_native_stopped from every leaving host). The marker
+# says "leaving" until tasks/worker-check.yml has seen the pod worker usable, so a rerun after any
+# failure repeats the whole rollback. The packages stay (inert without the drop-in); the cluster key
+# does not (T89c, 5 Oct: the rollback had left /etc/slurm/slurm.key on the Lenovo).
+- name: Native setup on this host (transition marker and drop-in)
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    get_checksum: false
+  loop: [ "{{ slinky_native_marker }}", "{{ slinky_native_dropin }}" ]
+  register: slinky_native_setup
+
+- name: The taints on this Kubernetes node (read on the login node; only NotFound, a node not yet joined, means none)
+  ansible.builtin.shell: |
+    out=$({{ slinky_kubectl }} get node {{ inventory_hostname }} -o jsonpath='{range .spec.taints[*]}{.key}{"\n"}{end}' 2>&1) \
+      && { printf '%s\n' "$out"; exit 0; }
+    case $out in *"(NotFound)"*) exit 0 ;; esac
+    echo "$out" >&2; exit 1
+  args:
+    executable: /bin/bash
+  delegate_to: "{{ groups['login'][0] }}"
+  register: slinky_native_taint_now
+  changed_when: false
+  check_mode: false          # read-only
+
+- name: Take the native slurmd down
+  when: >-
+    slinky_native_setup.results | selectattr('stat.exists') | list | length > 0
+    or (slinky_native_taint.split('=')[0]) in slinky_native_taint_now.stdout_lines
+  block:
+    - name: Transition marker directory (a reinstalled host may have only the leftover taint)
+      ansible.builtin.file: {path: "{{ slinky_native_marker | dirname }}", state: directory, mode: "0755"}
+
+    - name: Transition marker - leaving (kept until the pod worker passes its check)
+      ansible.builtin.copy:
+        dest: "{{ slinky_native_marker }}"
+        content: "leaving\n"
+        mode: "0644"
+
+    - name: Scheduling fence on the native record, and no job on the node (a drain that stays if one is left)
+      ansible.builtin.command:
+        argv: [bash, -s, --, fence, "{{ inventory_hostname }}", "{{ admin_ip }}", "{{ slinky_native_taint }}"]
+        stdin: "{{ lookup('ansible.builtin.file', role_path ~ '/files/prace-native-release.sh') }}"
+      environment:
+        PRACE_KUBECTL: "{{ slinky_kubectl }}"
+      delegate_to: "{{ groups['login'][0] }}"
+      register: slinky_native_fence
+      changed_when: "'drained' in slinky_native_fence.stdout"
+
+    - name: slurmd stopped and disabled (its unit inactive, no main process)
+      ansible.builtin.shell: |
+        set -o pipefail
+        load=$(systemctl show -p LoadState --value slurmd) || { echo "systemctl failed"; exit 1; }
+        [ "$load" = not-found ] && { echo "no slurmd unit"; exit 0; }
+        was="$(systemctl show -p ActiveState --value slurmd)/$(systemctl is-enabled slurmd 2>/dev/null)"
+        out=$(systemctl disable --now slurmd 2>&1) || { echo "disable --now failed: $out"; exit 1; }
+        state=$(systemctl show -p ActiveState --value slurmd) pid=$(systemctl show -p MainPID --value slurmd)
+        case $state in inactive|failed) ;; *) echo "slurmd is still $state"; exit 1 ;; esac
+        [ "$pid" = 0 ] || { echo "slurmd main PID $pid is left"; exit 1; }
+        echo "stopped (was $was)"
+      args:
+        executable: /bin/bash
+      register: slinky_native_stop
+      changed_when: >-
+        'no slurmd unit' not in slinky_native_stop.stdout and
+        ('was inactive/disabled' not in slinky_native_stop.stdout and 'was failed/disabled' not in slinky_native_stop.stdout)
+
+    - name: Drop-in removed (slurmd no longer points at the controller)
+      ansible.builtin.file:
+        path: "{{ slinky_native_dropin }}"
+        state: absent
+      register: slinky_native_dropin_off
+
+    - name: Controller name no longer pinned in /etc/hosts
+      ansible.builtin.blockinfile:
+        path: "{{ slinky_native_hosts_file }}"
+        marker: "# {mark} prace Slinky controller (roles/slinky, native worker)"
+        state: absent
+
+    - name: systemd reloaded
+      ansible.builtin.command: systemctl daemon-reload
+      when: slinky_native_dropin_off is changed
+
+    - name: The native record removed and the taint lifted, each verified (the pod registers afresh)
+      ansible.builtin.command:
+        argv: [bash, -s, --, release, "{{ inventory_hostname }}", "{{ admin_ip }}", "{{ slinky_native_taint }}"]
+        stdin: "{{ lookup('ansible.builtin.file', role_path ~ '/files/prace-native-release.sh') }}"
+      environment:
+        PRACE_KUBECTL: "{{ slinky_kubectl }}"
+      delegate_to: "{{ groups['login'][0] }}"
+      register: slinky_native_release
+      changed_when: "'removed' in slinky_native_release.stdout"
+
+# T89c (5 Oct, draft for Session A): the cluster key on a host that is not a native worker, whether the
+# rollback above just ran or an earlier one left it (the Lenovo, 5 Oct). It is removed only in an owned
+# closed window (owner, 5 Oct) and only while no slurmd runs on the host, which is after the stop above
+# (a pod worker's slurmd reads the key from its Secret); otherwise it is kept and reported.
+- name: A leftover cluster key on this host
+  ansible.builtin.stat:
+    path: "{{ slinky_native_key_file }}"
+    get_checksum: false
+  register: slinky_key_left
+
+- name: slurmd on this host (a leftover key is removed only while none runs)
+  ansible.builtin.command: systemctl show -p ActiveState --value slurmd
+  register: slinky_left_slurmd
+  changed_when: false
+  check_mode: false          # read-only
+  when: slinky_key_left.stat.exists
+
+- name: The leftover cluster key removed (owned closed window, no slurmd running)
+  ansible.builtin.file:
+    path: "{{ slinky_native_key_file }}"
+    state: absent
+  when:
+    - slinky_key_left.stat.exists
+    - (slurm_window_intent | default({})).phase | default('') == 'closed'
+    - slinky_left_slurmd.stdout | trim in ['inactive', 'failed']
+
+- name: A leftover cluster key that stays (outside an owned closed window, or slurmd runs) is reported
+  ansible.builtin.debug:
+    msg: >-
+      {{ slinky_native_key_file }} is still on {{ inventory_hostname }} (slurmd
+      {{ slinky_left_slurmd.stdout | default('?') | trim }}); it is removed only in an owned closed window
+      while no slurmd runs
+  when:
+    - slinky_key_left.stat.exists
+    - >-
+      (slurm_window_intent | default({})).phase | default('') != 'closed'
+      or slinky_left_slurmd.stdout | trim not in ['inactive', 'failed']
+
+# login.yml requires this from every host leaving the native list (in --check: the preview passed)
+- name: The native side is down (or was never set up)
+  ansible.builtin.set_fact:
+    slinky_native_stopped: true

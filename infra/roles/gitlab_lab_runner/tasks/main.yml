@@ -1,0 +1,119 @@
+---
+# gitlab_lab_runner: the lab deploy runner on mgmt-git01. Requires roles/gitlab and
+# roles/gitlab_runner (package installed). The public key it generates must then be
+# authorized on the lab by roles/lab_deploy_key (inventories/lab group_vars).
+
+- name: Deploy user (owns the lab SSH key; nothing else runs as it)
+  ansible.builtin.user:
+    name: "{{ lab_runner_user }}"
+    shell: /bin/bash
+    create_home: true
+    home: "/home/{{ lab_runner_user }}"
+
+- name: Python 3.11 for the pinned Ansible controller
+  ansible.builtin.dnf:
+    name: [python3.11, python3.11-pip]
+    state: present
+
+- name: Controller virtualenv
+  ansible.builtin.command: python3.11 -m venv {{ lab_runner_prefix }}/venv
+  args:
+    creates: "{{ lab_runner_prefix }}/venv/bin/python"
+
+- name: Pinned ansible-core in the virtualenv
+  ansible.builtin.pip:
+    name: "ansible-core=={{ lab_runner_ansible_core }}"
+    executable: "{{ lab_runner_prefix }}/venv/bin/pip"
+
+- name: Read the installed ansible.posix version
+  ansible.builtin.command: >-
+    python3 -c "import json;print(json.load(open('{{ lab_runner_prefix }}/collections/ansible_collections/ansible/posix/MANIFEST.json'))['collection_info']['version'])"
+  register: lr_posix
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Pinned ansible.posix collection
+  ansible.builtin.command: >-
+    {{ lab_runner_prefix }}/venv/bin/ansible-galaxy collection install --force
+    ansible.posix:{{ lab_runner_ansible_posix }} -p {{ lab_runner_prefix }}/collections
+  when: (lr_posix.stdout | trim) != lab_runner_ansible_posix
+
+- name: Deploy user's .ssh directory
+  ansible.builtin.file:
+    path: "/home/{{ lab_runner_user }}/.ssh"
+    state: directory
+    owner: "{{ lab_runner_user }}"
+    group: "{{ lab_runner_user }}"
+    mode: "0700"
+
+- name: Deploy key (generated on the VM; the private key never leaves it)
+  ansible.builtin.command: >-
+    ssh-keygen -q -t ed25519 -N "" -C "{{ lab_runner_user }}@{{ mgmt_hostname | default(inventory_hostname) }}"
+    -f /home/{{ lab_runner_user }}/.ssh/id_ed25519
+  args:
+    creates: "/home/{{ lab_runner_user }}/.ssh/id_ed25519"
+  become_user: "{{ lab_runner_user }}"
+
+- name: Verified lab host keys (copied from the controller's verified known_hosts)
+  ansible.builtin.copy:
+    dest: "/home/{{ lab_runner_user }}/.ssh/known_hosts"
+    owner: "{{ lab_runner_user }}"
+    group: "{{ lab_runner_user }}"
+    mode: "0644"
+    content: "{{ lab_runner_known_hosts | join('\n') }}\n"
+
+- name: Runner config directory (root only)
+  ansible.builtin.file:
+    path: "{{ lab_runner_config_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+
+- name: Separate runner service running jobs as the deploy user
+  ansible.builtin.command: >-
+    gitlab-runner install --user {{ lab_runner_user }} --working-directory /home/{{ lab_runner_user }}
+    --config {{ lab_runner_config_dir }}/config.toml --service {{ lab_runner_service }}
+  args:
+    creates: "/etc/systemd/system/{{ lab_runner_service }}.service"
+
+- name: Registration script (token never printed; see the script header)
+  ansible.builtin.template:
+    src: register-lab-runner.j2
+    dest: /usr/local/sbin/gitlab-runner-register-lab
+    owner: root
+    group: root
+    mode: "0700"
+
+- name: Register the lab runner once
+  ansible.builtin.command: /usr/local/sbin/gitlab-runner-register-lab
+  register: lr_register
+  changed_when: "lr_register.stdout == 'registered'"
+  when: not ansible_check_mode
+
+- name: Lab runner service enabled and running
+  ansible.builtin.systemd:
+    name: "{{ lab_runner_service }}"
+    enabled: true
+    state: started
+    daemon_reload: true
+
+- name: Verify the lab runner can talk to GitLab
+  ansible.builtin.command: >-
+    gitlab-runner verify --config {{ lab_runner_config_dir }}/config.toml --name {{ lab_runner_name }}
+  register: lr_verify
+  changed_when: false
+  failed_when: "'is valid' not in (lr_verify.stdout + lr_verify.stderr)"
+  when: not ansible_check_mode
+
+- name: Read the deploy public key (public; authorize it via roles/lab_deploy_key)
+  ansible.builtin.slurp:
+    src: "/home/{{ lab_runner_user }}/.ssh/id_ed25519.pub"
+  register: lr_pub
+  when: not ansible_check_mode
+
+- name: Show the deploy public key
+  ansible.builtin.debug:
+    msg: "{{ lr_pub.content | b64decode | trim }}"
+  when: not ansible_check_mode

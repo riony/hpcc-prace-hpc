@@ -1,0 +1,48 @@
+{# The persistent maintenance overlay: a K3s HelmChartConfig whose values Helm merges over the
+   slurm HelmChart's valuesContent at every reconcile. Closed: every partition INACTIVE and the
+   LoginSet at zero. Opening: exactly the window's saved and declared states and replicas. #}
+{% set intent = slurm_window_intent | default(none) %}
+{# exactly the standalone partitions the chart renders: a partition without NodeSets fails the chart #}
+{% set standalone = (['debug'] if slinky_debug_partition is defined else []) + ([slinky_payg.partition] if slinky_payg is defined else []) %}
+{% set rendered = slinky_nodesets + standalone %}
+{% if intent is none %}
+{{ {'intent': none, 'overlay': none, 'rendered': rendered} | to_json }}
+{% else %}
+{% set closed = intent.phase == 'closed' %}
+{% set states = intent.original.partitions | combine(intent.declared_partitions) %}
+{% set ns = namespace(nodesets={}, partitions={}, native={}) %}
+{# the native list this overlay describes: the deployed chart's (slinky_native_deployed, read by
+   maintenance-topology.yml at the start of the run) until the T89 bridge in login.yml names another;
+   equal to slurm_native_workers whenever the topology does not change. Without that reading (the gate
+   did not run in this play) it refuses to guess. #}
+{% if slinky_overlay_native_workers is not defined and slinky_charts_ondisk is not defined %}
+{{ slinky_topology_gate_must_run_before_the_overlay }}
+{% endif %}
+{% set overlay_native = slinky_overlay_native_workers | default(slinky_native_deployed) %}
+{% for kind in slinky_nodesets %}
+{% set state = 'INACTIVE' if closed else states[kind] %}
+{% set ns.nodesets = ns.nodesets | combine({kind: {'partition': {'configMap': {'State': state}}}}) %}
+{% if groups[kind] | default([]) | length > 0 and groups[kind] | default([]) | difference(overlay_native) | length == 0 %}
+{# a native kind (T89): the chart writes its partition as the controller's PartitionName line, so the
+   overlay carries that whole line with the state; the chart replaces the string, it does not merge it.
+   During a native topology change no native line exists for a changing kind until the new chart is
+   in the API (the bridge in tasks/login.yml). #}
+{% set r = slinky_nodeset_resources[kind] %}
+{% set mib = ((r.memory[:-2] | int) * (1024 if r.memory.endswith('Gi') else 1) // (r.cpu | int)) | string %}
+{% set share = {'DefMemPerCPU': mib, 'MaxMemPerCPU': mib} if kind == 'cpu' else {'DefCpuPerGPU': slinky_gpu_share.cpus | string, 'DefMemPerGPU': slinky_gpu_share.mem_mib | string} %}
+{% set pc = namespace(line=kind ~ ' Nodes=' ~ kind) %}
+{% for k, v in ({'Default': 'YES' if kind == 'cpu' else 'NO'} | combine(share) | combine(slinky_partition_policy[kind]) | combine({'State': state})).items() %}
+{% set pc.line = pc.line ~ ' ' ~ k ~ '=' ~ v %}
+{% endfor %}
+{% set ns.native = {'extraConfMap': {'PartitionName': pc.line}} %}
+{% endif %}
+{% endfor %}
+{% for name in standalone %}
+{% set ns.partitions = ns.partitions | combine({name: {'configMap': {'State': 'INACTIVE' if closed else states[name]}}}) %}
+{% endfor %}
+{% set values = {'nodesets': ns.nodesets, 'partitions': ns.partitions, 'loginsets': {'prace': {'replicas': 0 if closed else intent.original.loginsets['slurm-login-prace'].replicas}}} %}
+{% if ns.native %}{% set values = values | combine({'controller': ns.native}) %}{% endif %}
+{{ {'intent': intent, 'overlay': {'apiVersion': 'helm.cattle.io/v1', 'kind': 'HelmChartConfig',
+    'metadata': {'name': 'slurm', 'namespace': 'kube-system', 'annotations': {'prace.fleet/window-id': intent.lease_id, 'prace.fleet/window-phase': intent.phase}},
+    'spec': {'valuesContent': values | to_json, 'failurePolicy': 'abort'}}} | to_json }}
+{% endif %}

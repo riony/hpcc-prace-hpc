@@ -1,0 +1,8 @@
+---
+cluster_groups: []
+cluster_users: []            # {name, uid, groups: [], comment, shell, ssh_keys: [], state}
+cluster_default_shell: /bin/bash
+# The host that owns /home (the login node, NFS server) creates home directories and
+# manages authorized_keys; NFS clients only get the passwd/group entries.
+cluster_home_owner: "{{ fleet_role | default('') == 'login' }}"
+cluster_forbidden_groups: [wheel, adm, root, sudo, libvirt, docker, disk, systemd-journal, kvm]

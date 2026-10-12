@@ -1,0 +1,6 @@
+{
+{% for host in slurm_native_workers | default([]) | sort %}
+  "{{ host }}": {"address": "{{ hostvars[host].admin_ip }}"}{% if not loop.last %},{% endif %}
+
+{% endfor %}
+}

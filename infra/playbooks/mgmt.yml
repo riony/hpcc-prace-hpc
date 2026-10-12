@@ -1,0 +1,18 @@
+---
+# Management VM (mgmt-git01) baseline. Separate inventory; never mixed with the lab.
+#
+#   infra/tools/run-ansible.sh -i inventories/mgmt playbooks/mgmt.yml -e ansible_user=root
+#
+# -e ansible_user=root: admin's sudo needs a password; root key login works.
+- name: Management VM baseline
+  hosts: mgmt
+  become: true
+  gather_facts: true
+  roles:
+    - host_base   # packages (online), timezone, chrony, firewall = exactly ssh, SELinux
+    - mgmt_host   # hostname, boot target, keys/accounts, SSH policy, GitLab data storage
+    - {role: gitlab, tags: [gitlab]}   # GitLab CE (pinned), Tailscale TLS cert + renewal, settings, nightly backup, /prace-dash/ location
+    - {role: gitlab_runner, tags: [gitlab_runner]}  # CI runner: rootless Podman executor, group runner for hpcc (no lab keys)
+    - gitlab_lab_runner  # lab deploy runner: own user/service, protected refs only, lab SSH key
+    - {role: fleet_monitor, tags: [fleet_monitor]}   # off-node fleet health monitor + drift-audit key (read-only)
+    - {role: fleet_dashboard, tags: [fleet_dashboard]}   # read-only dashboard: reads the monitor's files, GitLab API, shipped evidence

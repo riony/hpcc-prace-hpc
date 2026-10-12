@@ -1,0 +1,27 @@
+#!/bin/bash
+# Managed by Ansible (roles/ib_fabric). ExecStartPre of prace-opensm@<link>: OpenSM starts only on the
+# cable it was planned for, at boot and on every restart too. Reads this instance's port GUID from its
+# configuration and the planned other end from /etc/rdma/prace-opensm-<link>.peer, then asks the
+# neighbour now (directed-route NodeInfo, read-only, no subnet manager needed). Any doubt: exit 1, and
+# systemd retries later (Restart=always) without OpenSM ever binding a moved cable.
+set -u
+link=${1:?link}
+etc=${PRACE_IB_ETC:-/etc/rdma}                      # PRACE_IB_ETC, PRACE_IB_SYSFS: tests only
+sysfs=${PRACE_IB_SYSFS:-/sys/class/infiniband}
+want=$(tr -d ' \n' < "$etc/prace-opensm-$link.peer" 2>/dev/null)
+guid=$(awk '$1 == "guid" {print $2}' "$etc/prace-opensm-$link.conf" 2>/dev/null); guid=${guid#0x}
+[[ $want =~ ^[0-9a-f]{16}$ && $guid =~ ^[0-9a-f]{16}$ ]] || { echo "prace-opensm@$link: no usable port or peer GUID" >&2; exit 1; }
+for p in "$sysfs"/*/ports/*; do
+  [ "$(cat "$p/link_layer" 2>/dev/null)" = InfiniBand ] || continue
+  g=$(cut -d: -f5-8 "$p/gids/0" 2>/dev/null | tr -d ':')
+  [ "$g" = "$guid" ] || continue
+  ca=$(basename "$(dirname "$(dirname "$p")")"); port=$(basename "$p")
+  out=$(timeout 15 smpquery -C "$ca" -P "$port" -D nodeinfo "0,$port" 2>&1) || { echo "prace-opensm@$link: neighbour query failed: ${out%%$'\n'*}" >&2; exit 1; }
+  got=$(printf '%s\n' "$out" | sed -n 's/^PortGuid:\.*//p' | head -n1 | tr -d ' ' | tr 'A-F' 'a-f'); got=${got#0x}
+  type=$(printf '%s\n' "$out" | sed -n 's/^NodeType:\.*//p' | head -n1)
+  if [ "$got" = "$want" ] && [ "$type" = "Channel Adapter" ]; then exit 0; fi
+  echo "prace-opensm@$link: the cable's other end is ${got:-unknown} (${type:-?}), planned $want: not starting" >&2
+  exit 1
+done
+echo "prace-opensm@$link: port $guid not present (yet)" >&2
+exit 1

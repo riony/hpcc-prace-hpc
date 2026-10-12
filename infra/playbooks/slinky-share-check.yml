@@ -1,0 +1,15 @@
+---
+# Read-only; run after controlled reopening and before workload acceptance.
+- name: Verify actual share startup commands and complete worker/login coverage
+  hosts: "{{ 'login' if fleet_armed | default(false) | bool else 'fleet_not_armed_no_hosts' }}"
+  gather_facts: false
+  tasks:
+    - name: Require explicit expected phase
+      ansible.builtin.assert:
+        that:
+          - slurm_window_intent is defined
+          - slurm_window_intent.phase in ['closed', 'opening']
+    - name: Verify the deployed pod commands
+      ansible.builtin.include_role:
+        name: slinky
+        tasks_from: share-pods.yml

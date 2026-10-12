@@ -1,0 +1,100 @@
+---
+# Managed by Ansible (roles/cluster_accounts). Workload accounts only: locked passwords,
+# key-only login, never sudo or an admin group. state: absent removes a user (home kept
+# unless remove_home: true), then its private group.
+- name: Split present and absent users
+  ansible.builtin.set_fact:
+    cluster_users_present: "{{ cluster_users | rejectattr('state', 'defined') | list
+      + (cluster_users | selectattr('state', 'defined') | selectattr('state', 'equalto', 'present') | list) }}"
+    cluster_users_absent: "{{ cluster_users | selectattr('state', 'defined') | selectattr('state', 'equalto', 'absent') | list }}"
+
+- name: Account data is consistent (unique names/IDs, known states, no admin groups)
+  ansible.builtin.assert:
+    that:
+      - (cluster_users_present | length) + (cluster_users_absent | length) == (cluster_users | length)
+      - (cluster_users | map(attribute='name') | unique | length) == (cluster_users | length)
+      - (cluster_users | map(attribute='uid') | unique | length) == (cluster_users | length)
+      - (cluster_groups | map(attribute='gid') | unique | length) == (cluster_groups | length)
+      - (cluster_groups | map(attribute='gid') | intersect(cluster_users | map(attribute='uid')) | length) == 0
+      - (cluster_users | map(attribute='groups', default=[]) | flatten | intersect(cluster_forbidden_groups) | length) == 0
+    quiet: true
+    fail_msg: cluster_users/cluster_groups are inconsistent, use an unknown state, or grant an admin group
+
+- name: Shared groups
+  ansible.builtin.group:
+    name: "{{ item.name }}"
+    gid: "{{ item.gid }}"
+  loop: "{{ cluster_groups }}"
+  loop_control: {label: "{{ item.name }}"}
+
+- name: Private group per user (GID = UID)
+  ansible.builtin.group:
+    name: "{{ item.name }}"
+    gid: "{{ item.uid }}"
+  loop: "{{ cluster_users_present }}"
+  loop_control: {label: "{{ item.name }}"}
+
+- name: Users (password locked; exact supplementary groups)
+  ansible.builtin.user:
+    name: "{{ item.name }}"
+    uid: "{{ item.uid }}"
+    group: "{{ item.name }}"
+    groups: "{{ item.groups | default([]) }}"
+    append: false
+    comment: "{{ item.comment | default(omit) }}"
+    shell: "{{ item.shell | default(cluster_default_shell) }}"
+    home: "/home/{{ item.name }}"
+    create_home: "{{ cluster_home_owner | bool }}"
+    password: "!"
+    update_password: always
+  loop: "{{ cluster_users_present }}"
+  loop_control: {label: "{{ item.name }}"}
+
+# Explicit path: in --check on a fresh host the user does not exist yet, and the module
+# cannot look up its home without it.
+- name: Authorized keys, exactly as listed (home owner only)
+  ansible.posix.authorized_key:
+    user: "{{ item.name }}"
+    path: "/home/{{ item.name }}/.ssh/authorized_keys"
+    key: "{{ item.ssh_keys | join('\n') }}"
+    exclusive: true
+    manage_dir: true
+  loop: "{{ cluster_users_present | selectattr('ssh_keys', 'defined') | selectattr('ssh_keys') | list }}"
+  loop_control: {label: "{{ item.name }}"}
+  when: cluster_home_owner | bool
+
+- name: No authorized_keys for users without keys (placeholders cannot log in)
+  ansible.builtin.file:
+    path: "/home/{{ item.name }}/.ssh/authorized_keys"
+    state: absent
+  loop: "{{ cluster_users_present | rejectattr('ssh_keys', 'defined') | list
+    + (cluster_users_present | selectattr('ssh_keys', 'defined') | rejectattr('ssh_keys') | list) }}"
+  loop_control: {label: "{{ item.name }}"}
+  when: cluster_home_owner | bool
+
+# Removal: the user first, then its private group (a group cannot be deleted while it is
+# still some user's primary group).
+- name: Remove users marked absent
+  ansible.builtin.user:
+    name: "{{ item.name }}"
+    state: absent
+    remove: "{{ item.remove_home | default(false) }}"
+  loop: "{{ cluster_users_absent }}"
+  loop_control: {label: "{{ item.name }}"}
+
+- name: Remove the private groups of absent users
+  ansible.builtin.group:
+    name: "{{ item.name }}"
+    state: absent
+  loop: "{{ cluster_users_absent }}"
+  loop_control: {label: "{{ item.name }}"}
+
+- name: None of these accounts can use sudo (read-only check)
+  ansible.builtin.command: sudo -n -l -U {{ item.name }}
+  register: gl_sudo
+  changed_when: false
+  check_mode: false
+  # Fails only if sudo lists commands the user may run (an absent user in --check cannot sudo).
+  failed_when: "'may run the following commands' in gl_sudo.stdout"
+  loop: "{{ cluster_users_present }}"
+  loop_control: {label: "{{ item.name }}"}

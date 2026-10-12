@@ -1,0 +1,8 @@
+---
+# The disposable container itself; never a real host (run.sh refuses outside a container).
+fleet:
+  hosts:
+    localhost:
+      ansible_connection: local
+      ansible_python_interpreter: /usr/bin/python3.11
+      fleet_role: login

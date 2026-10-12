@@ -1,0 +1,134 @@
+{
+  "schema": "prace.scenario.v1",
+  "id": "unauthorized-compute",
+  "version": 1,
+  "title": "Unauthorized partition job submission",
+  "status": "feasibility_required",
+  "description": "A bounded actor submits one Slurm job that requests a partition the project is not authorized to use. Activation requires independent proof that the academic partition/QoS policy is enforceable on the final mixed topology; otherwise the scenario stays gated. Replaces the older detached-process concept from planning drafts.",
+  "actor": {
+    "identity": "agent-cleanup01",
+    "project": "proj-beta",
+    "intent": "malicious"
+  },
+  "boundaries": {
+    "action_targets": [
+      "login-pod"
+    ],
+    "observation_targets": [
+      "slurm-controller",
+      "native-lenovo"
+    ],
+    "paths": [
+      "/projects/proj-beta/.prace-fixtures/unauthorized-compute-v1"
+    ],
+    "action_kinds": [
+      "slurm.submit",
+      "slurm.wait"
+    ]
+  },
+  "budgets": {
+    "max_actions": 4,
+    "max_seconds": 300,
+    "max_output_bytes": 65536
+  },
+  "actions": [
+    {
+      "id": "submit-unauthorized-partition",
+      "kind": "slurm.submit",
+      "target": "login-pod",
+      "identity": "agent-cleanup01",
+      "parameters": {
+        "account": "proj-beta",
+        "partition": "gpu",
+        "script_path": "/projects/proj-beta/.prace-fixtures/unauthorized-compute-v1/authorized-cpu.sh",
+        "nodes": 1,
+        "tasks": 1,
+        "time_limit_seconds": 60,
+        "note": "proj-beta must lack gpu partition authorization for the vulnerable baseline"
+      },
+      "timeout_seconds": 30,
+      "capture": {
+        "job_id": "job_id",
+        "submit_status": "submit_status"
+      }
+    },
+    {
+      "id": "wait-for-denied-or-end",
+      "kind": "slurm.wait",
+      "target": "login-pod",
+      "identity": "agent-cleanup01",
+      "parameters": {
+        "job_id": "${job_id}",
+        "terminal_states": [
+          "COMPLETED",
+          "CANCELLED",
+          "TIMEOUT",
+          "FAILED",
+          "NODE_FAIL"
+        ],
+        "deadline_seconds": 120
+      },
+      "timeout_seconds": 150,
+      "capture": {}
+    }
+  ],
+  "assertions": [
+    {
+      "id": "vulnerable-partition-accepted",
+      "phase": "attack",
+      "category": "security_failure",
+      "description": "Under the vulnerable baseline, the unauthorized gpu partition request is accepted and the job reaches a running or completed state on a GPU worker."
+    },
+    {
+      "id": "patched-partition-denied",
+      "phase": "replay",
+      "category": "security_blocked",
+      "description": "After exact replay under the patched policy, the unauthorized partition request is refused at submit or held without allocation; no GPU worker runs the job."
+    },
+    {
+      "id": "normal-cpu-job",
+      "phase": "regression",
+      "category": "functional",
+      "description": "A normal bounded proj-beta CPU job on an authorized partition completes on the qualified worker."
+    },
+    {
+      "id": "worker-remains-healthy",
+      "phase": "regression",
+      "category": "functional",
+      "description": "The worker and scheduler remain healthy after the denial path and the legitimate job."
+    },
+    {
+      "id": "fixture-and-policy-reset",
+      "phase": "reset",
+      "category": "cleanup",
+      "description": "No scenario job remains and fixture plus partition authorization match the recorded baseline."
+    }
+  ],
+  "redaction": {
+    "keys": [
+      "password",
+      "token",
+      "secret",
+      "private_key"
+    ],
+    "patterns": [
+      "-----BEGIN [A-Z ]*PRIVATE KEY-----",
+      "(?i)bearer [A-Za-z0-9._-]{16,}"
+    ]
+  },
+  "gates": [
+    "native_lenovo_qualified",
+    "partition_qos_policy_enforceable",
+    "external_timeout_and_cleanup_ready",
+    "final_restore_qualified",
+    "physical_fibre_removed",
+    "bmc_inband_contained",
+    "owned_cluster_window"
+  ],
+  "cleanup": {
+    "required": true,
+    "check_ids": [
+      "fixture-and-policy-reset"
+    ]
+  }
+}

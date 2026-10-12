@@ -1,0 +1,31 @@
+---
+# What the management reports online (read-only): `beegfs target list --state` as root on the
+# management host, which holds the CLI, the certificate and the secret (only root can read it).
+# Registers bg_fs_raw; defaults derive bg_fs_online (the IDs, e.g. 'm:3', 's:301', whose
+# reachability is Online and consistency Good) with the pattern bg_fs_online_rx, and bg_fs_ready.
+# The table layout is the 8.4.1 CLI's default (ctl/internal/cmd/target/list.go: id first, then
+# reachability before consistency); the qualification records the real output (Q5/Q6).
+- name: Targets the management reports (read-only)
+  ansible.builtin.command:
+    argv: [beegfs, target, list, --state]
+  environment:
+    BEEGFS_MGMTD_ADDR: "{{ bg_mgmt_addr }}:{{ beegfs_grpc_port }}"
+    BEEGFS_TLS_DISABLE: "{{ 'true' if beegfs_tls_disable | bool else 'false' }}"
+  delegate_to: "{{ beegfs_mgmt_host }}"
+  register: bg_fs_raw
+  changed_when: false
+  check_mode: false
+  failed_when: false
+  # The CLI answers rc 1 for about a second after a management restart (re-review N-8, bench).
+  until: bg_fs_raw.rc | default(1) == 0 or ansible_check_mode
+  retries: 3
+  delay: 2
+
+- name: The management answered (a check-mode preview of a fresh system only notes it)
+  ansible.builtin.assert:
+    that: bg_fs_raw.rc | default(1) == 0
+    fail_msg: >-
+      {{ inventory_hostname }}: the management at {{ bg_mgmt_addr }} could not be queried (rc {{ bg_fs_raw.rc | default('n/a') }}):
+      {{ (bg_fs_raw.stderr | default('') | trim)[:400] }}
+    quiet: true
+  when: not ansible_check_mode

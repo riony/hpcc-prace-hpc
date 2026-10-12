@@ -1,0 +1,110 @@
+---
+# Managed by Ansible (roles/slinky, from login.yml, before the native list and the chart change).
+# A worker changes backend in this run when it joins or leaves slurm_native_workers compared with
+# what is deployed: the login node's native list from the last run (slinky_native_file), the
+# Kubernetes nodes carrying the native taint, and live NodeSets of kinds that are to be native.
+# Every changing worker must be in this run and still active, and must have finished its own side
+# BEFORE the chart changes: a leaving host took its native slurmd down (tasks/native-off.yml,
+# slinky_native_stopped); a joining host is installed and configured (tasks/native-prepare.yml,
+# slinky_native_prepared). Each observation must succeed: an unreadable state is never "no
+# change". Only a fresh bootstrap (no NodeSet CRD yet) has no NodeSets to read.
+- name: NodeSet CRD installed (absent only before the first bootstrap)
+  ansible.builtin.command: "{{ slinky_kubectl }} get crd nodesets.slinky.slurm.net -o name --ignore-not-found"
+  register: slinky_nodeset_crd
+  changed_when: false
+  check_mode: false          # read-only
+
+- name: NodeSets running now
+  ansible.builtin.command: "{{ slinky_kubectl }} -n slurm get nodesets -o jsonpath={.items[*].metadata.name}"
+  register: slinky_live_nodesets
+  changed_when: false
+  check_mode: false          # read-only
+  when: slinky_nodeset_crd.stdout | trim | length > 0
+
+- name: Kubernetes nodes and their taint keys
+  ansible.builtin.command:
+    argv:
+      - bash
+      - -c
+      - >-
+        {{ slinky_kubectl }} get nodes -o
+        jsonpath='{range .items[*]}{.metadata.name}{range .spec.taints[*]}{" "}{.key}{end}{"\n"}{end}'
+  register: slinky_node_taints
+  changed_when: false
+  check_mode: false          # read-only
+
+- name: The native list deployed by the last run
+  ansible.builtin.stat:
+    path: "{{ slinky_native_file }}"
+    get_checksum: false
+  register: slinky_native_file_stat
+
+- name: Read it (must succeed when it exists)
+  ansible.builtin.slurp:
+    src: "{{ slinky_native_file }}"
+  register: slinky_native_file_now
+  when: slinky_native_file_stat.stat.exists
+
+- name: Workers that change backend in this run
+  ansible.builtin.set_fact:
+    slinky_native_previous: "{{ (slinky_native_listed + slinky_native_tainted) | unique | sort }}"
+    slinky_native_joining: >-
+      {{ (slurm_native_workers | default([])) | difference(slinky_native_listed + slinky_native_tainted)
+         | union(slinky_native_live_forward) | unique | sort }}
+    slinky_native_leaving: >-
+      {{ (slinky_native_listed + slinky_native_tainted) | unique | difference(slurm_native_workers | default([])) | sort }}
+  vars:
+    slinky_native_listed: >-
+      {{ (slinky_native_file_now.content | b64decode).splitlines() | reject('match', '^ *(#|$)') | map('split') | map('first') | list
+         if slinky_native_file_now is not skipped else [] }}
+    slinky_native_tainted: >-
+      {{ slinky_node_taints.stdout_lines | select('search', ' ' ~ (slinky_native_taint.split('=')[0] | regex_escape) ~ '( |$)')
+         | map('split') | map('first') | list }}
+    slinky_native_live_kinds: >-
+      {{ (slinky_live_nodesets.stdout | default('')).split() | select('match', '^slurm-worker-') | map('regex_replace', '^slurm-worker-', '') | list }}
+    slinky_native_live_forward: >-
+      {{ slinky_nodesets | select('in', slinky_native_live_kinds) | select('in', groups) | map('extract', groups) | flatten
+         | intersect(slurm_native_workers | default([])) }}
+
+- name: Whether the native topology changes in this run (login.yml's bridge; against the deployed chart)
+  ansible.builtin.set_fact:
+    slinky_native_changing: "{{ (slurm_native_workers | default([]) | sort) != slinky_native_deployed }}"
+
+- name: Any backend change (chart, list file, taint or live NodeSet) only inside a closed window
+  ansible.builtin.assert:
+    that: >-
+      not (slinky_native_changing or (slinky_native_joining + slinky_native_leaving) | length > 0)
+      or (slurm_window_intent | default({})).phase | default('') == 'closed'
+    fail_msg: >-
+      native workers change here (joining {{ slinky_native_joining }}, leaving {{ slinky_native_leaving }},
+      chart {{ slinky_native_deployed }} to {{ slurm_native_workers | default([]) | sort }}): take the maintenance
+      window first (runbook step 7), also to finish or back out an interrupted change
+    quiet: true
+
+- name: Native transition in this run
+  ansible.builtin.debug:
+    msg: "plan: native workers joining {{ slinky_native_joining }}, leaving {{ slinky_native_leaving }}"
+  when: slinky_native_joining | length > 0 or slinky_native_leaving | length > 0
+
+- name: Every changing worker runs with the login node and is still active
+  ansible.builtin.assert:
+    that: (slinky_native_joining + slinky_native_leaving) | difference(ansible_play_hosts) | length == 0
+    fail_msg: >-
+      {{ (slinky_native_joining + slinky_native_leaving) | difference(ansible_play_hosts) }} change backend
+      (joining {{ slinky_native_joining }}, leaving {{ slinky_native_leaving }}) but are not in this run or
+      failed earlier in it: add them to --limit (or fix their failure) before the NodeSet changes
+    quiet: true
+
+- name: Every leaving worker took its native slurmd down (tasks/native-off.yml)
+  ansible.builtin.assert:
+    that: hostvars[item].slinky_native_stopped | default(false) | bool
+    fail_msg: "{{ item }} leaves the native list but its native slurmd was not taken down in this run"
+    quiet: true
+  loop: "{{ slinky_native_leaving }}"
+
+- name: Every joining worker is installed and configured (tasks/native-prepare.yml)
+  ansible.builtin.assert:
+    that: hostvars[item].slinky_native_prepared | default(false) | bool
+    fail_msg: "{{ item }} joins the native list but was not prepared in this run"
+    quiet: true
+  loop: "{{ slinky_native_joining }}"

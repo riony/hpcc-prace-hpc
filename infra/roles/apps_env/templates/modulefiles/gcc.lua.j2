@@ -1,0 +1,18 @@
+-- Managed by Ansible (roles/apps_env). GCC {{ apps_env_gcc.version }} with C++, unpacked from the fleet repository (T88).
+local root = "{{ apps_env_sw }}/gcc/{{ apps_env_gcc.version }}/usr"
+help([[GCC {{ apps_env_gcc.version }}: gcc, g++ and cpp from Rocky's {{ apps_env_gcc.rpms | map(attribute='file') | map('regex_replace', '-[0-9].*$', '') | join(', ') }}
+packages, unpacked into {{ apps_env_sw }}. gfortran stays the image's own (the same GCC 11.5).
+OpenMPI's mpicc and mpicxx use this g++ once both modules are loaded.]])
+whatis("Name: GCC")
+whatis("Version: {{ apps_env_gcc.version }}")
+family("compiler")
+if mode() == "load" and not isDir(pathJoin(root, "bin")) then
+  LmodError("gcc/{{ apps_env_gcc.module }}: ", root, " is missing here (/apps not mounted?)")
+end
+prepend_path("PATH", pathJoin(root, "bin"))
+-- the tree's libstdc++ (the one its g++ links against), ahead of the image's
+prepend_path("LD_LIBRARY_PATH", pathJoin(root, "lib64"))
+prepend_path("MANPATH", pathJoin(root, "share/man"))
+setenv("CC", "gcc")
+setenv("CXX", "g++")
+setenv("FC", "gfortran")

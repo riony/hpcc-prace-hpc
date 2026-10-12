@@ -1,0 +1,29 @@
+# Managed by Ansible (roles/k3s). The login node: the only server. Cluster traffic uses the
+# private network; the campus side is firewalled to ssh only (roles/host_base).
+node-name: {{ inventory_hostname }}
+node-ip: {{ admin_ip }}
+advertise-address: {{ admin_ip }}
+tls-san:
+  - {{ admin_ip }}
+  - {{ inventory_hostname }}
+flannel-iface: {{ k3s_iface[0] }}
+cluster-cidr: {{ k3s_cluster_cidr }}
+service-cidr: {{ k3s_service_cidr }}
+selinux: true
+# Nodes pull images from each other (Spegel); workers have no internet, the login node does.
+embedded-registry: true
+write-kubeconfig-mode: "0600"
+# Workers join with this agent-only secret; K3s writes the full agent token (with the CA hash)
+# to /var/lib/rancher/k3s/server/agent-token.
+agent-token-file: {{ k3s_agent_secret_file }}
+disable:
+  - traefik
+  - servicelb
+node-label:
+  - prace.fleet/role={{ fleet_role }}
+kubelet-arg:
+  - system-reserved={{ k3s_system_reserved }}
+# NodePorts only on the admin network: kube-proxy rewrites NodePort traffic before firewalld's
+# input zone sees it, so the campus zone alone does not keep them private.
+kube-proxy-arg:
+  - nodeport-addresses={{ admin_network }}

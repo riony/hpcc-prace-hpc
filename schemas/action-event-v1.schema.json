@@ -1,0 +1,201 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://prace-hpc.invalid/schemas/action-event-v1.schema.json",
+  "title": "PRACE-HPC action event v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "event_type",
+    "run_id",
+    "sequence",
+    "timestamp",
+    "source",
+    "phase",
+    "scenario",
+    "action_id",
+    "action",
+    "request_sha256",
+    "result"
+  ],
+  "properties": {
+    "schema": {
+      "const": "prace.action-event.v1"
+    },
+    "event_type": {
+      "const": "action"
+    },
+    "run_id": {
+      "$ref": "#/$defs/name"
+    },
+    "sequence": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "source": {
+      "const": "agent_gateway"
+    },
+    "phase": {
+      "enum": [
+        "attack",
+        "record",
+        "replay"
+      ]
+    },
+    "scenario": {
+      "$ref": "#/$defs/scenario"
+    },
+    "action_id": {
+      "$ref": "#/$defs/name"
+    },
+    "action": {
+      "$ref": "#/$defs/action"
+    },
+    "request_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "result": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "exit_code",
+        "executed_sha256",
+        "stdout_sha256",
+        "stderr_sha256",
+        "duration_ms",
+        "output_bytes",
+        "bindings"
+      ],
+      "properties": {
+        "status": {
+          "enum": [
+            "ok",
+            "denied",
+            "error",
+            "timeout",
+            "refused",
+            "budget_exhausted"
+          ]
+        },
+        "exit_code": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "executed_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "stdout_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "stderr_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "duration_ms": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "output_bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "bindings": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string",
+            "maxLength": 4096
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "name": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "scenario": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "version"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/name"
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "action": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "target",
+        "identity",
+        "parameters"
+      ],
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/name"
+        },
+        "target": {
+          "$ref": "#/$defs/name"
+        },
+        "identity": {
+          "$ref": "#/$defs/name"
+        },
+        "parameters": {
+          "type": "object"
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "action": {
+            "properties": {
+              "kind": {
+                "enum": [
+                  "file.list",
+                  "file.stat"
+                ]
+              }
+            }
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "result": {
+            "properties": {
+              "bindings": {
+                "additionalProperties": {
+                  "type": "string",
+                  "maxLength": 256
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

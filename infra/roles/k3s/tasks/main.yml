@@ -1,0 +1,48 @@
+---
+# Managed by Ansible (roles/k3s). Runs for the Slinky backend only (playbooks/fleet.yml).
+# Task order matters: the server is installed and Ready before any agent asks for its token.
+- name: The private port (holds the admin address; set by the installer or first boot)
+  ansible.builtin.set_fact:
+    k3s_iface: >-
+      {{ ansible_facts.interfaces | map('regex_replace', '-', '_') | map('extract', ansible_facts)
+         | selectattr('ipv4', 'defined') | selectattr('ipv4.address', 'equalto', admin_ip)
+         | map(attribute='device') | list }}
+
+- name: Exactly one private port
+  ansible.builtin.assert:
+    that: k3s_iface | length == 1
+    fail_msg: "{{ k3s_iface | length }} ports hold {{ admin_ip }}; run the net role first"
+    quiet: true
+
+- name: Swap off now (the kubelet does not start with swap)
+  ansible.builtin.command: swapoff -a
+  when: ansible_facts.swaptotal_mb | int > 0
+  changed_when: true
+
+- name: Swap stays off after a reboot (the swap LV itself is kept)
+  ansible.builtin.replace:
+    path: /etc/fstab
+    regexp: '^([^#\s]\S*\s+\S+\s+swap\s.*)$'
+    replace: '# \1   # disabled for Kubernetes (roles/k3s)'
+
+- name: Pod and service networks are trusted like the admin network
+  ansible.posix.firewalld:
+    zone: trusted
+    source: "{{ item }}"
+    permanent: true
+    immediate: true
+    state: enabled
+  loop: ["{{ k3s_cluster_cidr }}", "{{ k3s_service_cidr }}"]
+
+- name: Container SELinux policy (Rocky package, from the fleet repository on compute nodes)
+  ansible.builtin.dnf:
+    name: container-selinux
+    state: present
+
+- name: Server (login node)
+  ansible.builtin.include_tasks: server.yml
+  when: fleet_role == 'login'
+
+- name: Agents (compute nodes)
+  ansible.builtin.include_tasks: agent.yml
+  when: fleet_role != 'login'

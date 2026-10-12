@@ -1,0 +1,17 @@
+---
+# GitLab Runner on the management VM: rootless Podman ("docker" executor) for CI jobs.
+# No lab credentials here; a separate protected deploy runner is future work.
+gitlab_runner_version: "19.4.1-1"               # match the GitLab minor version
+gitlab_runner_name: mgmt-git01-podman
+gitlab_runner_group: hpcc                        # group runner: every hpcc project can use it
+gitlab_runner_tags: [podman, ci]
+gitlab_runner_default_image: docker.io/library/python:3.11   # fully qualified: no short-name prompts
+# Four ansible test jobs run per pipeline (6 Oct). 4 is a trial on this 8 vCPU / 31 GiB VM beside
+# GitLab: measure CPU, memory and I/O with one and two pipelines before treating it as settled.
+gitlab_runner_concurrent: 4
+gitlab_runner_user: gitlab-runner
+# Podman gives every container a random SELinux category pair, so files one CI job
+# leaves in the reused build volume cannot be deleted by the next job's container
+# (git clean -> Permission denied). All job containers share this fixed level: still
+# confined as container_t (host protected); jobs of this CI can share the build dir.
+gitlab_runner_selinux_level: "s0:c100,c200"

@@ -1,0 +1,26 @@
+---
+# Post-install baseline for every private-only node (group private_nodes:
+# Lenovo 10.88.0.2, g005 10.88.0.3). Nodes are reached via ProxyJump through
+# .205; they have no gateway, DNS or repository path.
+#
+# Prerequisites (see docs/history/LENOVO-POSTINSTALL-PREP.md):
+#   - private address already bootstrapped (console; private_net cannot create
+#     its own first reachable address)
+#   - missing baseline RPMs staged offline (host_base_offline only verifies)
+#   - .205 serving NTP to 10.88.0.0/24 (apply host.yml to lab_hosts first)
+#
+#   cd infra
+#   ANSIBLE_COLLECTIONS_PATH=collections \
+#     /home/operator/venvs/ansible-prace/bin/ansible-playbook \
+#     -i inventories/lab/hosts.yml playbooks/private-postinstall.yml -e ansible_user=root
+#
+# -e ansible_user=root: admin's sudo needs a password on these nodes (policy
+# undecided); root key login works. Alternatively add --ask-become-pass.
+- name: Private-node post-install
+  hosts: private_nodes
+  become: true
+  gather_facts: true
+  roles:
+    - private_net      # static private address, no gateway (adopts the bootstrap keyfile)
+    - host_base        # packages (verify-only offline), time via .205, firewall, SELinux
+    - lab_deploy_key   # authorize the mgmt-git01 lab deploy runner (source-restricted)

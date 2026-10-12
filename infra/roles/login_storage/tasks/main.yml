@@ -1,0 +1,312 @@
+---
+# login_storage (D39 storage step; user decisions 28 Sep): one LV per share on the login node,
+# XFS with quotas enabled at mount, administrator/service homes on local disk, and a fail-closed
+# guard in front of nfs-server. Rule per share that is not in storage_defer:
+#   mounted from its own LV  -> verify only
+#   mounted from anything else -> fail
+#   not mounted and empty (or absent) -> immutable mountpoint, mount, relabel
+#   not mounted and populated -> fail: a populated /home moves only with tools/storage-cutover.sh
+# A deferred share's LV is created and formatted but left unmounted. Nothing is ever deleted.
+- name: Storage tools
+  ansible.builtin.dnf:
+    name: [xfsprogs, quota, acl, rsync, lvm2, policycoreutils-python-utils]
+    state: present
+
+- name: Storage helpers
+  ansible.builtin.copy:
+    src: "{{ item }}"
+    dest: "/usr/local/sbin/{{ item }}"
+    owner: root
+    group: root
+    mode: "0755"
+  loop: [prace-storage-check, prace-tree-listing]
+
+# --- administrator and service homes on local disk (not exported)
+- name: SELinux labels local homes like /home
+  ansible.builtin.shell: |
+    set -euo pipefail
+    if semanage fcontext -l -C | grep -qE '^{{ storage_local_home_root }} = /home$'; then echo present
+    else semanage fcontext -a -e /home {{ storage_local_home_root }}; echo added; fi
+  register: ls_fc
+  changed_when: "'added' in ls_fc.stdout"
+
+- name: Local home root
+  ansible.builtin.file:
+    path: "{{ storage_local_home_root }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Relocate administrator and service homes
+  ansible.builtin.include_tasks: relocate_home.yml
+  loop: "{{ storage_local_home_users }}"
+  loop_control:
+    loop_var: lsh_user
+
+# --- volume group and logical volumes
+- name: The volume group sits only on the expected disk
+  ansible.builtin.shell: |
+    set -euo pipefail
+    pvs=$(pvs --noheadings -o pv_name --select vg_name={{ storage_vg }})
+    [ -n "$pvs" ] || { echo "no PV in {{ storage_vg }}"; exit 3; }
+    for pv in $pvs; do
+      disk=$(lsblk -ndo PKNAME "$pv"); [ -n "$disk" ] || disk=$(basename "$(readlink -f "$pv")")
+      lsblk -ndo SERIAL "/dev/$disk"
+    done | sort -u
+  register: ls_vg_serials
+  changed_when: false
+  check_mode: false
+
+- name: Assert the volume group's disk
+  ansible.builtin.assert:
+    that: ls_vg_serials.stdout_lines | map('trim') | list == [storage_pv_serial]
+    fail_msg: "{{ storage_vg }} is on {{ ls_vg_serials.stdout_lines }}, expected only {{ storage_pv_serial }}"
+    quiet: true
+
+- name: Existing LVs and free space
+  ansible.builtin.shell: |
+    set -euo pipefail
+    echo "vfree $(vgs --noheadings --units g --nosuffix -o vg_free {{ storage_vg }} | tr -d ' ')"
+    lvs --noheadings --units g --nosuffix -o lv_name,lv_size {{ storage_vg }}
+  register: ls_vg
+  changed_when: false
+  check_mode: false
+
+- name: Plan the LVs
+  ansible.builtin.set_fact:
+    ls_vfree: "{{ (ls_vg.stdout_lines | select('match', '^vfree ') | first).split()[1] | float }}"
+    ls_have: "{{ dict(ls_vg.stdout_lines | reject('match', '^vfree ') | map('trim') | map('split') | list) }}"
+
+# Space to allocate now: missing LVs, plus growth when requested. The reserve gates only an
+# allocation; a steady-state converge with nothing to allocate never fails on it.
+- name: Space to allocate
+  ansible.builtin.set_fact:
+    ls_need: >-
+      {% set ns = namespace(need=0) %}
+      {% for lv in storage_lvs %}
+      {%   if lv.name not in ls_have %}{% set ns.need = ns.need + lv.size_g %}
+      {%   elif storage_allow_grow | default(false) | bool and ls_have[lv.name] | float < lv.size_g %}{% set ns.need = ns.need + lv.size_g - ls_have[lv.name] | float %}
+      {%   endif %}
+      {% endfor %}{{ ns.need }}
+
+- name: Room for the allocation above the reserve
+  ansible.builtin.assert:
+    that: ls_need | float == 0 or ls_need | float + storage_vg_reserve_g <= ls_vfree | float
+    fail_msg: "{{ storage_vg }} has {{ ls_vfree }}g free; allocating {{ ls_need }}g would go below the {{ storage_vg_reserve_g }}g reserve"
+    quiet: true
+
+- name: Existing LVs are at least their declared size (never shrunk; growth only on request)
+  ansible.builtin.assert:
+    that: ls_have[item.name] | float >= item.size_g - 0.01 or storage_allow_grow | default(false) | bool
+    fail_msg: "LV {{ item.name }} is {{ ls_have[item.name] }}g, smaller than {{ item.size_g }}g (grow with -e storage_allow_grow=true)"
+    quiet: true
+  loop: "{{ storage_lvs | selectattr('name', 'in', ls_have.keys() | list) | list }}"
+  loop_control: {label: "{{ item.name }}"}
+
+- name: Create missing LVs
+  ansible.builtin.command: lvcreate -y -n {{ item.name }} -L {{ item.size_g }}g {{ storage_vg }}
+  loop: "{{ storage_lvs | rejectattr('name', 'in', ls_have.keys() | list) | list }}"
+  loop_control: {label: "{{ item.name }} {{ item.size_g }}g"}
+
+- name: Grow LVs on request (lvextend -r; never shrinks)
+  ansible.builtin.command: lvextend -r -L {{ item.size_g }}g {{ storage_vg }}/{{ item.name }}
+  loop: "{{ storage_lvs | selectattr('name', 'in', ls_have.keys() | list) | list }}"
+  loop_control: {label: "{{ item.name }}"}
+  when: storage_allow_grow | default(false) | bool and ls_have[item.name] | float < item.size_g - 0.01
+
+- name: Filesystem signature of each LV
+  ansible.builtin.command: blkid -p -o value -s TYPE /dev/{{ storage_vg }}/{{ item.name }}
+  register: ls_sig
+  failed_when: ls_sig.rc not in [0, 2]
+  changed_when: false
+  check_mode: false
+  loop: "{{ storage_lvs }}"
+  loop_control: {label: "{{ item.name }}"}
+  when: not ansible_check_mode or item.name in ls_have
+
+- name: Only XFS or blank
+  ansible.builtin.assert:
+    that: item.rc == 2 or item.stdout == 'xfs'
+    fail_msg: "LV {{ item.item.name }} carries {{ item.stdout }}, not XFS; refusing to format it"
+    quiet: true
+  loop: "{{ ls_sig.results | selectattr('rc', 'defined') | list }}"
+  loop_control: {label: "{{ item.item.name }}"}
+
+- name: XFS on blank LVs
+  ansible.builtin.command: mkfs.xfs -m crc=1 -L {{ item.item.label }} /dev/{{ storage_vg }}/{{ item.item.name }}
+  loop: "{{ ls_sig.results | selectattr('rc', 'defined') | selectattr('rc', 'equalto', 2) | list }}"
+  loop_control: {label: "{{ item.item.name }}"}
+
+# --- mounts
+- name: Mount state of each share
+  ansible.builtin.shell: |
+    set -euo pipefail
+    p={{ item.path }}
+    # findmnt exits 1 both for "not mounted" (silent) and on an error (a message); ls must succeed
+    r=0; src=$(findmnt -no SOURCE --mountpoint "$p" 2>&1) || r=$?
+    [ $r = 0 ] || { [ $r = 1 ] && [ -z "$src" ]; } || { echo "findmnt $p failed: $src" >&2; exit 3; }
+    if [ $r = 0 ]; then echo "mounted $src"
+    elif [ ! -e "$p" ]; then echo absent
+    else
+      l=$(ls -A "$p") || { echo "cannot list $p" >&2; exit 3; }
+      if [ -z "$l" ]; then echo empty; else echo "populated $(paste -sd, - <<<"$l")"; fi
+    fi
+  register: ls_mnt
+  changed_when: false
+  check_mode: false
+  loop: "{{ storage_lvs | rejectattr('name', 'in', storage_defer) | list }}"
+  loop_control: {label: "{{ item.path }}"}
+
+- name: A share mounted from anything but its own LV is an error
+  ansible.builtin.assert:
+    that: not item.stdout.startswith('mounted ') or item.stdout == 'mounted /dev/mapper/' ~ storage_vg ~ '-' ~ item.item.name
+    fail_msg: "{{ item.item.path }} is {{ item.stdout }}, expected /dev/mapper/{{ storage_vg }}-{{ item.item.name }}"
+    quiet: true
+  loop: "{{ ls_mnt.results }}"
+  loop_control: {label: "{{ item.item.path }}"}
+
+# A fresh install (kickstart) leaves only the relocated accounts' old copies in /home; they
+# move aside when identical to the relocated homes. Anything else in an unmounted share fails.
+- name: Fresh-install leftovers in /home move aside
+  ansible.builtin.shell: |
+    set -euo pipefail
+    allowed=" {{ storage_local_home_users | join(' ') }} "
+    entries=$(ls -A /home)          # set -e: a failed listing stops here
+    for e in $entries; do
+      case "$allowed" in *" $e "*) ;; *) echo "/home is populated ($e): move it with tools/storage-cutover.sh"; exit 3;; esac
+      [ -d "{{ storage_local_home_root }}/$e" ] || { echo "no relocated copy of /home/$e"; exit 3; }
+      a=$(prace-tree-listing --no-label --summary "/home/$e")
+      b=$(prace-tree-listing --no-label --summary "{{ storage_local_home_root }}/$e")
+      [ "$a" = "$b" ] || { echo "/home/$e differs from {{ storage_local_home_root }}/$e ($a vs $b)"; exit 3; }
+    done
+    dest={{ storage_premigration_root }}/leftover-$(date +%Y%m%dT%H%M%S)
+    mkdir -p -m 0700 "$dest"
+    for e in $entries; do mv "/home/$e" "$dest/"; done
+    echo "moved to $dest"
+  loop: "{{ ls_mnt.results | selectattr('stdout', 'match', '^populated ') | list }}"
+  loop_control: {label: "{{ item.item.path }}"}
+  when: item.item.name == 'home'
+
+- name: Any other populated, unmounted share is an error
+  ansible.builtin.assert:
+    that: false
+    fail_msg: "{{ item.item.path }} is {{ item.stdout }} and not mounted; refusing to mount over it"
+    quiet: true
+  loop: "{{ ls_mnt.results | selectattr('stdout', 'match', '^populated ') | rejectattr('item.name', 'equalto', 'home') | list }}"
+  loop_control: {label: "{{ item.item.path }}"}
+
+- name: Mountpoints of unmounted shares
+  ansible.builtin.file:
+    path: "{{ item.item.path }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  loop: "{{ ls_mnt.results | rejectattr('stdout', 'match', '^mounted ') | list }}"
+  loop_control: {label: "{{ item.item.path }}"}
+
+# An immutable empty mountpoint: if the LV is ever not mounted, nothing can be written into
+# the directory underneath (by root either), so writes fail instead of landing on the root fs.
+- name: Immutable empty mountpoints
+  ansible.builtin.shell: |
+    set -euo pipefail
+    p={{ item.item.path }}
+    r=0; src=$(findmnt -no SOURCE --mountpoint "$p" 2>&1) || r=$?
+    [ $r = 0 ] && { echo mounted; exit 0; }
+    [ $r = 1 ] && [ -z "$src" ] || { echo "findmnt $p failed: $src"; exit 3; }
+    l=$(ls -A "$p") || { echo "cannot list $p"; exit 3; }
+    [ -z "$l" ] || { echo "not empty"; exit 3; }
+    if lsattr -d "$p" | cut -d' ' -f1 | grep -q i; then echo immutable; else chattr +i "$p"; echo set; fi
+  register: ls_immutable
+  changed_when: "'set' in ls_immutable.stdout"
+  loop: "{{ ls_mnt.results | rejectattr('stdout', 'match', '^mounted ') | list }}"
+  loop_control: {label: "{{ item.item.path }}"}
+
+- name: Mount each share from its LV (quota options take effect only at mount)
+  ansible.posix.mount:
+    path: "{{ item.path }}"
+    src: "/dev/{{ storage_vg }}/{{ item.name }}"
+    fstype: xfs
+    opts: "{{ storage_mount_opts }}{{ (',' ~ item.quota) if item.quota else '' }}"
+    state: mounted
+  register: ls_mounted
+  loop: "{{ storage_lvs | rejectattr('name', 'in', storage_defer) | list }}"
+  loop_control: {label: "{{ item.path }}"}
+  notify: storage daemon-reload
+
+- name: Relabel newly mounted shares
+  ansible.builtin.command: restorecon -R {{ item.item.path }}
+  loop: "{{ ls_mounted.results | selectattr('changed') | list }}"
+  loop_control: {label: "{{ item.item.path }}"}
+
+- name: fstab parses cleanly
+  ansible.builtin.command: findmnt --verify --verbose
+  register: ls_verify
+  changed_when: false
+  check_mode: false
+  failed_when: ls_verify.rc != 0 or '[E]' in ls_verify.stdout
+
+# --- guard: configuration for prace-storage-check and the nfs-server drop-in
+- name: Storage configuration directory
+  ansible.builtin.file:
+    path: /etc/prace-storage
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Shares prace-storage-check requires (not deferred)
+  ansible.builtin.copy:
+    dest: /etc/prace-storage/mounts.json
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      [
+      {% for s in storage_lvs | rejectattr('name', 'in', storage_defer) %}
+        {"path": "{{ s.path }}", "source": "/dev/mapper/{{ storage_vg }}-{{ s.name }}", "quota": "{{ s.quota }}"}{{ '' if loop.last else ',' }}
+      {% endfor %}
+      ]
+
+- name: nfs-server drop-in directory
+  ansible.builtin.file:
+    path: /etc/systemd/system/nfs-server.service.d
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: nfs-server starts only when every share is on its LV with quotas on
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/nfs-server.service.d/10-prace-storage.conf
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      # Managed by Ansible (roles/login_storage)
+      [Unit]
+      RequiresMountsFor={{ storage_lvs | rejectattr('name', 'in', storage_defer) | map(attribute='path') | join(' ') }}
+      [Service]
+      ExecStartPre=/usr/local/sbin/prace-storage-check
+  notify: storage daemon-reload
+
+- name: Apply unit changes now
+  ansible.builtin.meta: flush_handlers
+
+- name: Quotas are on (accounting and enforcement)
+  ansible.builtin.command: /usr/local/sbin/prace-storage-check
+  changed_when: false
+  check_mode: false
+  when: not ansible_check_mode
+
+# --- /apps skeleton (the software step fills it; written only by root on the login node)
+- name: /apps layout
+  ansible.builtin.file:
+    path: "/apps/{{ item }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  loop: [software, modulefiles]
+  when: "'apps' not in storage_defer and storage_lvs | selectattr('name', 'equalto', 'apps') | list | length > 0"

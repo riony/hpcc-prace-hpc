@@ -1,0 +1,14 @@
+---
+# Lab deploy runner: a SEPARATE gitlab-runner service running as its own user, holding
+# the only CI key into the lab. Project runner, protected refs only (merged main), tag
+# lab-deploy. The rootless-Podman CI runner cannot reach this user's files.
+lab_runner_user: labdeploy
+lab_runner_service: gitlab-runner-lab
+lab_runner_config_dir: /etc/gitlab-runner-lab
+lab_runner_name: mgmt-git01-lab-deploy
+lab_runner_project: hpcc/prace-hackathon
+lab_runner_tags: [lab-deploy]
+lab_runner_prefix: /opt/prace-ansible             # pinned controller: venv + collections
+lab_runner_ansible_core: "2.19.13"                # as infra/requirements-controller.txt
+lab_runner_ansible_posix: "2.2.2"                 # as infra/requirements.yml
+lab_runner_known_hosts: []                        # verified host-key lines (host_vars)

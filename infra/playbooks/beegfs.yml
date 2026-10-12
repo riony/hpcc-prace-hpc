@@ -1,0 +1,242 @@
+---
+# BeeGFS /scratch over the admin network (Session A plan A4, roles/beegfs). DEFERRED until after the
+# first scenario (D42): a review-ready draft. It is NOT part of fleet.yml, no role there runs it,
+# and it has never run against a host. Notes and every unverified 8.x assumption:
+# agents/handoffs/BEEGFS-ROLE-DRAFT-2026-10-02.md.
+#
+# Before the first run (outside git, on the controller, mode 0600):
+#   install -d -m 0700 ~/.config/prace-lab/beegfs
+#   (umask 077; dd if=/dev/random of=~/.config/prace-lab/beegfs/conn.auth bs=128 count=1)
+#   (umask 077; openssl req -x509 -nodes -days 365 -newkey rsa:2048 -subj /CN=lab-dl380 \
+#      -addext 'subjectAltName=IP:10.90.10.1,DNS:lab-dl380' \
+#      -keyout ~/.config/prace-lab/beegfs/mgmtd-key.pem -out ~/.config/prace-lab/beegfs/mgmtd-cert.pem)
+# the BeeGFS repository on the login node (roles/fleet_repo, --tags beegfs_repo, in a window), and
+# the qualification record in inventories/fleet/group_vars/all/beegfs.yml (every run refuses until
+# beegfs_qualified_release names the release whose pinned files the qualification accepted).
+#
+# Every run happens inside an OWNED, CLOSED, QUIET Slurm window: the window tool's lease taken for
+# BeeGFS, every partition INACTIVE, no login pod, an empty queue (docs/runbooks/SLURM-WINDOW-2026-10-01.md
+# defines W, F and O; docs/runbooks/BEEGFS-QUALIFICATION-PLAN.md gives the stage order). From the
+# reviewed checkout on the controller:
+#   id=$(W lease-take --label beegfs-<stage> | tail -1); [[ $id =~ ^[0-9a-f]{16}$ ]] || { echo STOP; false; }
+#   W close --lease-id "$id" && W check --lease-id "$id"
+#   B() { F && infra/tools/run-ansible.sh -i inventories/fleet playbooks/beegfs.yml -e fleet_armed=true \
+#           -e fleet_lease_id="$id" -e "@$intent" "$@"; }        # F: a fresh closed intent before every run
+#   ... B runs, each followed by W check ...
+#   O && W lease-release --lease-id "$id"
+# Each play re-verifies that window with tools/require-closed-window.py (read-only, on the login
+# node) before its first host task, so a lease of another operation, an open fence or a job in the
+# queue stops the run before anything changes. A --check preview needs only the BeeGFS lease. A client or service restart unmounts or stalls
+# /scratch: the quiet window is what makes that safe.
+#
+# Order: one stage per run; check the result before the next. Stages 1-4 are FIRST USE: they add
+# -e beegfs_format_armed=true and name exactly what may be initialised or formatted
+# (beegfs_format_confirm: <host>:<item>[,<item>...], several entries joined with '+'). A first use
+# that names a metadata or storage item opens the management's registration for that run only; the
+# last play closes it again (after a failed run, the next ordinary run closes it).
+#   1. management:  B --limit lab-dl380 -e beegfs_format_armed=true -e beegfs_format_confirm=lab-dl380:mgmtd
+#   2. metadata:    B --limit lab-dl380,gpu -e beegfs_format_armed=true \
+#                     -e beegfs_format_confirm=lab-g003:meta+lab-g004:meta+lab-g005:meta
+#   3. ONE storage target, then a disposable test namespace (a directory written, read back and
+#      removed through one client; the login node's client counts as one of the five mounts):
+#                   B --limit lab-dl380,lab-g003 -e beegfs_format_armed=true -e beegfs_format_confirm=lab-g003:<first serial>
+#   4. the other five targets (serials exactly as nvme_serials in host_vars; one word, no spaces):
+#                   C=lab-g003:<second serial>+lab-g004:<serial>,<serial>+lab-g005:<serial>,<serial>
+#                   B --limit lab-dl380,gpu -e beegfs_format_armed=true -e beegfs_format_confirm=$C
+#   5. clients on all five hosts (/scratch): B
+# (The management host is in stages 2-4 so that its registration opens and closes in the same run.
+# Clients come up only once the management reports a metadata target and a storage target Online
+# and Good: stages 1-2 skip them, stage 3 mounts on its hosts, stage 5 on all five.)
+# Without -e beegfs_format_armed=true (ordinary convergence) nothing is formatted or initialised:
+# items not yet prepared stay out of /scratch, and anything inconsistent stops the run. --check
+# previews (read-only inspections run; nothing is created, recorded, formatted or started).
+# Session B binds /scratch into pods and owns admission and budgets; B must not require scratch
+# before A hands it over.
+#
+# Gates, in order. All but the last two contact no host:
+#  1. armed: every host pattern is empty unless -e fleet_armed=true (as in fleet.yml);
+#  2. no --tags/--skip-tags (every check must run);
+#  3. tasks/gates.yml of the role, repeated in every play (--limit skips the controller play):
+#     qualified release recorded and equal to every pinned BeeGFS package; every package the role
+#     installs pinned; data file consistent with host_vars; a lease id given; the first-use
+#     confirmation names hosts of this run and only their items; TLS on (or a recorded decision);
+#     the controller-private files present, private and outside git;
+#  4. the cluster lease must be held, by -e fleet_lease_id, and be a BeeGFS lease of the window
+#     tool (holder=maint label=beegfs-<stage>; tasks/cluster-lease-check.yml);
+#  5. the owned closed quiet window (tools/require-closed-window.py with -e @<intent>).
+- name: Arming gate (clear message; controller only)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Refuse unless explicitly armed
+      ansible.builtin.assert:
+        that: fleet_armed | default(false) | bool
+        fail_msg: "Not armed: pass -e fleet_armed=true"
+        quiet: true
+      tags: [always]
+    - name: No tag filtering (every check must run)
+      ansible.builtin.assert:
+        that: ansible_run_tags | list == ['all'] and ansible_skip_tags | list == []
+        fail_msg: "beegfs.yml takes no --tags/--skip-tags"
+        quiet: true
+      tags: [always]
+    - name: Controller-side gates
+      ansible.builtin.include_role:
+        name: beegfs
+        tasks_from: gates.yml
+
+- name: BeeGFS management (DL380)
+  hosts: "{{ 'login' if (fleet_armed | default(false) | bool) else 'beegfs_not_armed_no_hosts' }}"
+  serial: 1
+  any_errors_fatal: true
+  gather_facts: false
+  tasks:
+    - &armed
+      name: Armed (checked again before any connection)
+      ansible.builtin.assert:
+        that: fleet_armed | default(false) | bool
+        fail_msg: "Not armed: pass -e fleet_armed=true"
+        quiet: true
+    # Twice: the always-tagged copy refuses --tags X, the untagged copy refuses --skip-tags always.
+    - &tags_always
+      name: No tag filtering (checked again inside the play, --tags)
+      ansible.builtin.assert:
+        that: ansible_run_tags | list == ['all'] and ansible_skip_tags | list == []
+        fail_msg: "beegfs.yml takes no --tags/--skip-tags"
+        quiet: true
+      tags: [always]
+    - &tags_untagged
+      name: No tag filtering (checked again inside the play, --skip-tags)
+      ansible.builtin.assert:
+        that: ansible_run_tags | list == ['all'] and ansible_skip_tags | list == []
+        fail_msg: "beegfs.yml takes no --tags/--skip-tags"
+        quiet: true
+    - &gates
+      name: Controller-side gates (no connection)
+      ansible.builtin.include_role:
+        name: beegfs
+        tasks_from: gates.yml
+        public: true
+    - &lease
+      name: Cluster lease on the login node (no other operation may hold it)
+      ansible.builtin.include_tasks: tasks/cluster-lease-check.yml
+    - &held
+      name: This run holds the lease
+      ansible.builtin.assert:
+        that: bg_lease_held | bool
+        fail_msg: >-
+          Take the cluster lease first, with the window tool and for BeeGFS (W lease-take --label beegfs-<stage>),
+          and pass its id (-e fleet_lease_id=<id>); see the header of playbooks/beegfs.yml.
+          Lease now: {{ fleet_lease.stdout | default('none') }}
+        quiet: true
+    - &window
+      name: The owned closed quiet window (tools/require-closed-window.py; read-only, login node)
+      ansible.builtin.command:
+        argv: "{{ beegfs_window_check }}"
+        stdin: "{{ {'lease_id': fleet_lease_id | default(''), 'intent': slurm_window_intent | default(none)} | to_json }}"
+      environment:
+        PRACE_LOGIN: "{{ hostvars[groups['login'][0]].ansible_host | default(hostvars[groups['login'][0]].admin_ip) }}"
+      delegate_to: localhost
+      become: false
+      run_once: true
+      changed_when: false
+      check_mode: false
+      register: bg_window
+      when: bg_lease_held | bool and not ansible_check_mode
+    - &windowed
+      name: This run is inside its owned closed quiet window
+      ansible.builtin.set_fact:
+        # --check previews under the BeeGFS lease alone (Session B review N-3): nothing changes and no
+        # first use happens in check mode, so a drift preview needs no outage.
+        bg_window_verified: >-
+          {{ (ansible_check_mode and bg_lease_held | bool)
+             or (bg_window.rc | default(1) == 0 and 'owned closed window verified' in bg_window.stdout | default('')) }}
+    - &facts
+      name: Gather facts (only after the gates)
+      ansible.builtin.setup:
+      when: bg_run_gated | default(false) | bool       # --start-at-task here: no gates, no connection
+    - name: Management service
+      ansible.builtin.include_role:
+        name: beegfs
+        tasks_from: management.yml
+
+- name: BeeGFS metadata and storage (GPU hosts, one at a time)
+  hosts: "{{ 'gpu' if (fleet_armed | default(false) | bool) else 'beegfs_not_armed_no_hosts' }}"
+  serial: 1
+  any_errors_fatal: true
+  gather_facts: false
+  tasks:
+    - *armed
+    - *tags_always
+    - *tags_untagged
+    - *gates
+    - *lease
+    - *held
+    - *window
+    - *windowed
+    - *facts
+    - name: Target preparation, metadata and storage services
+      ansible.builtin.include_role:
+        name: beegfs
+        tasks_from: server.yml
+
+- name: BeeGFS clients (/scratch on all five hosts)
+  hosts: "{{ 'fleet' if (fleet_armed | default(false) | bool) else 'beegfs_not_armed_no_hosts' }}"
+  any_errors_fatal: true
+  gather_facts: false
+  tasks:
+    - *armed
+    - *tags_always
+    - *tags_untagged
+    - *gates
+    - *lease
+    - *held
+    - *window
+    - *windowed
+    - *facts
+    # A run whose gates did not pass must fail here, not end green having skipped everything below
+    # (Session B re-review S-11): the stage gate would otherwise hide client.yml's own assert.
+    - name: This run passed its gates and holds the lease (clients)
+      ansible.builtin.assert:
+        that: bg_run_gated | default(false) | bool
+        fail_msg: "{{ inventory_hostname }}: nothing done: the gates of playbooks/beegfs.yml did not pass in this run"
+        quiet: true
+    # Stage gate (8.4.1 refuses a client mount until a metadata target and a storage target exist):
+    # stages 1 and 2 skip clients, stage 3 mounts on the hosts of its run once target 301 is online.
+    - name: What the management reports online (read-only)
+      ansible.builtin.include_role:
+        name: beegfs
+        tasks_from: fs-state.yml
+      when: bg_run_gated | default(false) | bool
+    - name: Clients wait for a metadata and a storage target
+      ansible.builtin.debug:
+        msg: >-
+          /scratch not mounted in this run: the management reports {{ bg_fs_online | join(', ') or 'no online target' }};
+          clients need a metadata target and a storage target Online and Good
+      when: bg_run_gated | default(false) | bool and not bg_fs_ready | bool
+    - name: Client
+      ansible.builtin.include_role:
+        name: beegfs
+        tasks_from: client.yml
+      when: bg_fs_ready | bool
+
+# Registration closed again after a first use that opened it (management.yml; clients excluded).
+- name: BeeGFS management registration closed (only after a first use that opened it)
+  hosts: "{{ 'login' if (fleet_armed | default(false) | bool) else 'beegfs_not_armed_no_hosts' }}"
+  any_errors_fatal: true
+  gather_facts: false
+  tasks:
+    - *armed
+    - *tags_always
+    - *tags_untagged
+    - *gates
+    - *lease
+    - *held
+    - *window
+    - *windowed
+    - name: Registration
+      ansible.builtin.include_role:
+        name: beegfs
+        tasks_from: registration-close.yml
+      when: bg_registration_open | bool

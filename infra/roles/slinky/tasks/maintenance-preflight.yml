@@ -1,0 +1,12 @@
+---
+# Opening is an admission-only operation, never a full converge after jobs can start.
+- name: Full convergence must not carry an opening intent
+  ansible.builtin.assert:
+    that: slurm_window_intent is not defined or slurm_window_intent.phase == 'closed'
+    fail_msg: Use playbooks/slurm-window-overlay.yml for prepare-open; full convergence stays fenced
+    quiet: true
+
+- name: The native worker topology is unchanged, or changes inside a closed window (the T89 bridge)
+  ansible.builtin.include_tasks: maintenance-topology.yml
+  vars:
+    slinky_topology_change_allowed: "{{ (slurm_window_intent | default({})).phase | default('') == 'closed' }}"

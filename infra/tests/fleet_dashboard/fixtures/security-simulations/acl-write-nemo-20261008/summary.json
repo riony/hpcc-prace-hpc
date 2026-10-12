@@ -1,0 +1,101 @@
+{
+  "cleanup": "complete",
+  "driver": "nemo",
+  "events": [
+    {
+      "event_sha256": "05479f194c1b427babb9d2a3b555592aedeacc6c83aa6611eeb8addd2e13fece",
+      "event_type": "action",
+      "id": "find-writable-target",
+      "phase": "attack",
+      "sequence": 1,
+      "status": "ok"
+    },
+    {
+      "event_sha256": "8e66b26d516b9737ceb7cfb7e75981267d244e6b5241a4e16de26a747da8c53b",
+      "event_type": "action",
+      "id": "write-synthetic-marker",
+      "phase": "attack",
+      "sequence": 2,
+      "status": "ok"
+    },
+    {
+      "event_sha256": "d73befc5fb54dcca99ead840ad1940723e0c526692238f71ac10e7cf6c5cdc5a",
+      "event_type": "observation",
+      "id": "vulnerable-marker-present",
+      "phase": "attack",
+      "sequence": 3,
+      "status": "pass"
+    },
+    {
+      "event_sha256": "5f3a17ed2e80ba4e504acc817d3653fd6554cadb0ca04a9c3895f601b6caac0d",
+      "event_type": "action",
+      "id": "find-writable-target",
+      "phase": "replay",
+      "sequence": 4,
+      "status": "denied"
+    },
+    {
+      "event_sha256": "d35a8dd14e0323bc0f1e73811807f6d3c38bb1f5389997cd4a605d3629710f79",
+      "event_type": "observation",
+      "id": "patched-write-blocked",
+      "phase": "replay",
+      "sequence": 5,
+      "status": "pass"
+    },
+    {
+      "event_sha256": "e61e9acaa63b23eba3f844544e26eb1792dffa9d0faf1c3f23c912c63e6ebbfb",
+      "event_type": "observation",
+      "id": "alpha-authorized-write",
+      "phase": "regression",
+      "sequence": 6,
+      "status": "pass"
+    },
+    {
+      "event_sha256": "5f9e336419bc8e4e10892fd46c38c97d1451d75b88905076a6808617b7af8673",
+      "event_type": "observation",
+      "id": "beta-authorized-write",
+      "phase": "regression",
+      "sequence": 7,
+      "status": "pass"
+    },
+    {
+      "event_sha256": "84bf28ccb1ee9321221f5ed4ae2ccfaccffc9b8f6b0696c66087064d19f51d55",
+      "event_type": "observation",
+      "id": "normal-project-job",
+      "phase": "regression",
+      "sequence": 8,
+      "status": "pass"
+    },
+    {
+      "event_sha256": "71590ceeca03a35caab968607072b3497a2ba1d625b595a55dd3a579a1d278a9",
+      "event_type": "observation",
+      "id": "metadata-reset",
+      "phase": "reset",
+      "sequence": 9,
+      "status": "pass"
+    }
+  ],
+  "fixture_discarded": true,
+  "framework_version": "1.9.0",
+  "model": null,
+  "model_used": false,
+  "private_bundle_index_sha256": "56d2789e71e0ca69612cb992ec49a86b81bf069f8dee2b2bd3fd78b4e074b243",
+  "proof_scope": {
+    "filesystem": "linux-kernel-authorization",
+    "quota": "tree-usage-stand-in",
+    "scheduler": "simulated-accounting",
+    "selinux": "not-qualified"
+  },
+  "reset_scope": "seeded-vulnerable-fixture",
+  "run_id": "acl-write-nemo-20261008",
+  "scenario_kind": "write",
+  "schema": "prace.security-simulation-public.v1",
+  "scope": "disposable-local-linux-acl-simulation",
+  "source_dirty": false,
+  "source_revision": "619583f4261fa12eb1297976c560397b0b38631a",
+  "verdicts": {
+    "baseline": "security_failure",
+    "functional": "pass",
+    "patched": "security_blocked"
+  }
+}

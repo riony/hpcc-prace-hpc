@@ -1,0 +1,178 @@
+#!/usr/bin/env python3
+"""Prepare an UNMOUNTED NFS mountpoint without deleting its old contents.
+
+The operator must fence users/jobs and unmount normally first. This helper never
+unmounts, force-unmounts, follows old home symlinks, or deletes archived data.
+--check observes an unmounted directory without changing it. A mounted directory
+is always refused; inspect its underlying directory in a private mount namespace
+or use the fenced preparation window. Exit 3 means a failed/unsafe observation.
+"""
+import argparse
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import subprocess
+import sys
+
+
+class Refused(Exception):
+    pass
+
+
+def command(args):
+    try:
+        r = subprocess.run(args, capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise Refused('command unavailable or timed out: ' + args[0]) from e
+    if r.returncode:
+        raise Refused('command failed: ' + args[0])
+    return r.stdout
+
+
+def unmounted(path):
+    try:
+        r = subprocess.run(['findmnt', '-rn', '--mountpoint', str(path)],
+                           capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise Refused('mount observation failed') from e
+    if r.returncode == 1 and not r.stdout.strip() and not r.stderr.strip():
+        return
+    raise Refused('directory is mounted or its mount state is unknown')
+
+
+def directory(path):
+    s = path.lstat()
+    if not stat.S_ISDIR(s.st_mode) or s.st_uid != 0:
+        raise Refused('expected a root-owned directory, not a symlink')
+    return s
+
+
+def immutable(path):
+    lines = command(['lsattr', '-d', str(path)]).splitlines()
+    if len(lines) != 1 or len(lines[0].split()) != 2:
+        raise Refused('unreadable filesystem attributes')
+    flags, observed = lines[0].split()
+    if observed != str(path) or not re.fullmatch(r'[-a-zA-Z]+', flags):
+        raise Refused('unexpected filesystem attributes')
+    return 'i' in flags
+
+
+def identity(path):
+    s = path.lstat()
+    return [s.st_dev, s.st_ino, s.st_mode]
+
+
+def sync_dir(path):
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def save(path, value):
+    # Write-ahead manifest, fsynced before each move. Its parent is root-only.
+    tmp = path.with_suffix('.tmp')
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        with os.fdopen(fd, 'w') as f:
+            json.dump(value, f, sort_keys=True)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        dfd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+    finally:
+        # An interrupted write is deliberately retained and refuses a retry.
+        pass
+
+
+def archive_root(root):
+    if not root.exists():
+        root.mkdir(mode=0o700)
+    directory(root)
+    if root.stat().st_mode & 0o077:
+        raise Refused('archive parent must be root-only')
+    # Also flush an existing root: it may be from an interrupted earlier setup.
+    sync_dir(root.parent)
+
+
+def prepare(path, archive=None, check=False):
+    directory(path)
+    unmounted(path)
+    entries = sorted(path.iterdir())  # failure is fatal, never interpreted as empty
+    guarded = immutable(path)
+    if guarded and entries:
+        raise Refused('immutable directory has data; do not hide it')
+    if check:
+        if not guarded or entries:
+            raise Refused('underlying directory is not empty and immutable')
+        return {'guarded': True, 'changed': False}
+    if entries:
+        if archive is None:
+            raise Refused('nonempty directory needs an explicit preservation destination')
+        directory(archive.parent)
+        if archive.exists() or archive.is_symlink():
+            raise Refused('archive destination exists; inspect its receipt before resuming')
+        if archive.parent.stat().st_dev != path.stat().st_dev:
+            raise Refused('preservation must be on the same filesystem')
+        archive.mkdir(mode=0o700)
+        sync_dir(archive.parent)
+        data = archive / 'data'
+        data.mkdir(mode=0o700)
+        sync_dir(archive)
+        manifest = {'source': str(path), 'source_identity': identity(path),
+                    'state': 'moving', 'entries': {p.name: identity(p) for p in entries}}
+        receipt = archive / 'receipt.json'
+        save(receipt, manifest)
+        for p in entries:
+            unmounted(path)
+            if identity(path) != manifest['source_identity'] or identity(p) != manifest['entries'][p.name]:
+                raise Refused('directory changed during preservation')
+            os.rename(p, data / p.name)
+            sync_dir(path)
+            sync_dir(data)
+            if identity(data / p.name) != manifest['entries'][p.name]:
+                raise Refused('preserved entry identity differs')
+        manifest['state'] = 'preserved'
+        save(receipt, manifest)
+    unmounted(path)
+    if list(path.iterdir()):
+        raise Refused('new content appeared; do not hide it')
+    if not guarded:
+        command(['chattr', '+i', str(path)])
+    if not immutable(path) or list(path.iterdir()):
+        raise Refused('guard did not take effect')
+    return {'guarded': True, 'changed': not guarded, 'archive': str(archive) if entries else None}
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument('--path', choices=['/home', '/projects', '/apps'], required=True)
+    p.add_argument('--check', action='store_true')
+    p.add_argument('--preserve-home', metavar='RUN_ID')
+    a = p.parse_args()
+    if os.geteuid() != 0:
+        p.error('root is required')
+    if a.preserve_home and (a.path != '/home' or a.check or not re.fullmatch('[a-z0-9-]{8,64}', a.preserve_home)):
+        p.error('--preserve-home requires /home, a safe run identifier and apply mode')
+    try:
+        archive = None
+        if a.preserve_home:
+            root = Path('/var/lib/prace-home-premigration')
+            archive_root(root)
+            archive = root / ('worker-underlay-' + a.preserve_home)
+        print(json.dumps(prepare(Path(a.path), archive, a.check), sort_keys=True))
+        return 0
+    except (Refused, OSError) as e:
+        print('REFUSED: ' + str(e), file=sys.stderr)
+        return 3
+
+
+if __name__ == '__main__':
+    sys.exit(main())

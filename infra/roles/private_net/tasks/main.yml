@@ -1,0 +1,129 @@
+---
+# private_net: one static private-segment address on a spare NIC, with NO default
+# gateway, for admin reachability through the .205 bastion.
+#
+# Deliberately uses a NetworkManager keyfile (not community.general.nmcli, which
+# is not bundled here) so the only collection dependency is ansible.posix.
+#
+# Required vars (host_vars):
+#   private_iface    interface to configure :  chosen at CABLE TIME by carrier and
+#                    permanent MAC, never guessed from the name alone
+#   private_ip       e.g. 10.88.0.2
+#   private_prefix   e.g. 24
+# Optional:
+#   private_con_name   NM connection name (default: private-<iface>)
+#   private_zone       firewalld zone for this interface (default: public); written
+#                      as zone= in the keyfile, then verified against firewalld
+#
+# Idempotent: the keyfile is the single source of truth; the profile is brought up
+# only if it is not already active.
+
+- name: Require explicit private-NIC variables
+  ansible.builtin.assert:
+    that:
+      - private_iface is defined and (private_iface | length > 0)
+      - private_ip is defined and (private_ip | length > 0)
+      - private_prefix is defined
+    fail_msg: >-
+      private_net needs private_iface/private_ip/private_prefix. Set them in
+      host_vars once the port is chosen. Pick the port by carrier (a NO-CARRIER
+      port is uncabled) and confirm it by permanent MAC :  do not guess.
+
+- name: Set derived connection name
+  ansible.builtin.set_fact:
+    pn_conn: "{{ private_con_name | default('private-' ~ private_iface) }}"
+
+- name: Confirm the interface exists
+  ansible.builtin.stat:
+    path: "/sys/class/net/{{ private_iface }}"
+  register: pn_iface
+
+- name: Fail if the interface does not exist
+  ansible.builtin.assert:
+    that: pn_iface.stat.exists
+    fail_msg: "{{ private_iface }} does not exist on this host"
+
+- name: Read carrier state of the private interface
+  ansible.builtin.command: "cat /sys/class/net/{{ private_iface }}/carrier"
+  check_mode: false         # read-only; must also run under --check
+  register: pn_carrier
+  changed_when: false
+  failed_when: false
+
+- name: Fail with a clear message if the cable is not in
+  ansible.builtin.assert:
+    that: (pn_carrier.stdout | default('0') | trim) == '1'
+    fail_msg: >-
+      {{ private_iface }} reports no carrier: the private-switch cable is not
+      connected, or this is the wrong port. Connect the cable, confirm carrier
+      (ip -br link), then re-run. No configuration was written.
+
+- name: Write the private NetworkManager keyfile (no gateway by design)
+  ansible.builtin.copy:
+    dest: "/etc/NetworkManager/system-connections/{{ pn_conn }}.nmconnection"
+    owner: root
+    group: root
+    mode: "0600"
+    content: |
+      # Managed by Ansible private_net. Do not edit by hand.
+      [connection]
+      id={{ pn_conn }}
+      type=ethernet
+      interface-name={{ private_iface }}
+      autoconnect=true
+      zone={{ private_zone | default('public') }}
+
+      [ipv4]
+      method=manual
+      address1={{ private_ip }}/{{ private_prefix }}
+      never-default=true
+
+      [ipv6]
+      method=disabled
+
+      [proxy]
+  notify: reload private network
+
+- name: Apply the keyfile now, before activating the profile
+  ansible.builtin.meta: flush_handlers
+
+- name: Read active NetworkManager connections
+  ansible.builtin.command: nmcli -t -f NAME connection show --active
+  check_mode: false         # read-only; must also run under --check
+  register: pn_active
+  changed_when: false
+
+- name: Bring the private profile up if it is not already active
+  ansible.builtin.command: "nmcli connection up {{ pn_conn }}"
+  when: pn_conn not in pn_active.stdout_lines
+  register: pn_up
+  changed_when: pn_up.rc == 0
+
+# The zone is owned by the keyfile's zone= line (NetworkManager hands it to
+# firewalld on activation). A separate permanent firewalld interface binding would
+# give the interface two owners and never report idempotent; verify instead.
+- name: Read the firewalld zone actually applied to the private interface
+  ansible.builtin.command: "firewall-cmd --get-zone-of-interface={{ private_iface }}"
+  register: pn_zone
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Verify the private interface is in its intended zone
+  ansible.builtin.assert:
+    that: (pn_zone.stdout | trim) == (private_zone | default('public'))
+    fail_msg: >-
+      {{ private_iface }} is in zone '{{ pn_zone.stdout | trim }}', expected
+      '{{ private_zone | default('public') }}'. Re-activate the profile
+      (nmcli connection up {{ pn_conn }}) so NetworkManager re-applies zone=.
+  when: not ansible_check_mode or pn_conn in pn_active.stdout_lines
+
+- name: Report the resulting address and route
+  ansible.builtin.command: "ip -br addr show {{ private_iface }}"
+  check_mode: false         # read-only; must also run under --check
+  register: pn_report
+  changed_when: false
+
+- name: Show the private interface state
+  ansible.builtin.debug:
+    msg: "{{ pn_report.stdout }}"

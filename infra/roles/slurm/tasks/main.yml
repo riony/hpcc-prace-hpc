@@ -1,0 +1,168 @@
+---
+# Managed by Ansible (roles/slurm): slurmctld + slurmdbd (MariaDB) on the login node, slurmd
+# on compute nodes, one slurm.conf everywhere. Needs munge and the fleet repository first.
+- name: slurm group and user with a fixed ID on every node (before the packages)
+  block:
+    - ansible.builtin.group: {name: slurm, gid: "{{ slurm_uid }}", system: true}
+    - ansible.builtin.user:
+        name: slurm
+        uid: "{{ slurm_uid }}"
+        group: slurm
+        system: true
+        shell: /sbin/nologin
+        home: /var/lib/slurm
+        create_home: false
+
+- name: Slurm packages (pinned)
+  ansible.builtin.dnf:
+    name: "{{ ['slurm-ohpc-' ~ slurm_version]
+              + (['slurm-slurmctld-ohpc-' ~ slurm_version, 'slurm-slurmdbd-ohpc-' ~ slurm_version, 'mariadb-server']
+                 if fleet_role == 'login' else ['slurm-slurmd-ohpc-' ~ slurm_version]) }}"
+    state: present
+
+- name: Configuration directory (the OpenHPC packages expect /etc/slurm but do not create it)
+  ansible.builtin.file:
+    path: /etc/slurm
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: slurm
+    group: slurm
+    mode: "0755"
+  loop: "{{ ['/var/log/slurm'] + (['/var/spool/slurmctld'] if fleet_role == 'login' else ['/var/spool/slurmd']) }}"
+
+- name: Hardware as slurmd sees it (compute nodes)
+  ansible.builtin.command: slurmd -C
+  register: sl_c
+  changed_when: false
+  check_mode: false
+  when: fleet_role != 'login'
+
+# slurm.conf lists EVERY compute node of the inventory from its static slurm_node line, so it is
+# identical on every node whichever hosts a run includes (--limit one node at a time is safe);
+# nodes not up yet are simply DOWN. Each compute node checks its line against slurmd -C.
+- name: The inventory's node definition matches this hardware (topology equal, memory not above)
+  ansible.builtin.assert:
+    that:
+      - (hw.CPUs, hw.SocketsPerBoard, hw.CoresPerSocket, hw.ThreadsPerCore) == (want.CPUs, want.SocketsPerBoard, want.CoresPerSocket, want.ThreadsPerCore)
+      - want.RealMemory | int <= hw.RealMemory | int
+    fail_msg: >-
+      slurm_node for {{ inventory_hostname }} is "{{ slurm_node }}" but slurmd -C reports
+      "{{ sl_c.stdout_lines[0] }}". Update slurm_node in the inventory (host_vars).
+    quiet: true
+  vars:
+    hw: "{{ dict(sl_c.stdout_lines[0].split() | map('split', '=') | list) }}"
+    want: "{{ dict(slurm_node.split() | map('split', '=') | list) }}"
+  when: fleet_role != 'login'
+
+- name: Compute nodes (all of the inventory's, sorted)
+  ansible.builtin.set_fact:
+    slurm_compute_nodes: "{{ groups['compute'] | default([]) | sort }}"
+
+- name: slurm.conf and cgroup.conf
+  ansible.builtin.template:
+    src: slurm.conf.j2
+    dest: /etc/slurm/slurm.conf
+    mode: "0644"
+  notify: [restart slurmctld, restart slurmd]
+
+- name: cgroup.conf
+  ansible.builtin.copy:
+    dest: /etc/slurm/cgroup.conf
+    mode: "0644"
+    content: |
+      # Managed by Ansible (roles/slurm)
+      ConstrainCores=yes
+      ConstrainRAMSpace=yes
+      ConstrainDevices=yes
+  notify: [restart slurmctld, restart slurmd]
+
+- name: Accounting database and controller (login node)
+  when: fleet_role == 'login'
+  block:
+    - name: MariaDB running
+      ansible.builtin.systemd: {name: mariadb, state: started, enabled: true}
+
+    - name: Database password generated on this node (never printed or copied off it)
+      ansible.builtin.shell: umask 077; openssl rand -hex 24 > {{ slurm_db_password_file }}
+      args:
+        creates: "{{ slurm_db_password_file }}"
+
+    - name: Read it into memory
+      ansible.builtin.slurp:
+        src: "{{ slurm_db_password_file }}"
+      register: sl_pw
+      no_log: true
+
+    - name: Accounting database and user (SQL on stdin, not argv)
+      ansible.builtin.command: mysql
+      args:
+        stdin: |
+          CREATE DATABASE IF NOT EXISTS slurm_acct_db;
+          CREATE USER IF NOT EXISTS 'slurm'@'localhost' IDENTIFIED BY '{{ sl_pw.content | b64decode | trim }}';
+          ALTER USER 'slurm'@'localhost' IDENTIFIED BY '{{ sl_pw.content | b64decode | trim }}';
+          GRANT ALL ON slurm_acct_db.* TO 'slurm'@'localhost';
+      changed_when: false
+      no_log: true
+
+    - name: slurmdbd.conf (0600, slurm)
+      ansible.builtin.copy:
+        dest: /etc/slurm/slurmdbd.conf
+        owner: slurm
+        group: slurm
+        mode: "0600"
+        content: |
+          # Managed by Ansible (roles/slurm)
+          AuthType=auth/munge
+          DbdHost=localhost
+          SlurmUser=slurm
+          LogFile=/var/log/slurm/slurmdbd.log
+          PidFile=/run/slurmdbd.pid
+          StorageType=accounting_storage/mysql
+          StorageHost=localhost
+          StorageUser=slurm
+          StorageLoc=slurm_acct_db
+          StoragePass={{ sl_pw.content | b64decode | trim }}
+      no_log: true
+      notify: restart slurmdbd
+
+    - name: slurmdbd running and answering
+      ansible.builtin.systemd: {name: slurmdbd, state: started, enabled: true}
+
+    - name: Wait for slurmdbd
+      ansible.builtin.wait_for: {port: 6819, host: 127.0.0.1, timeout: 60}
+
+    - name: Cluster and accounts in the accounting database
+      ansible.builtin.shell: |
+        out=$(sacctmgr -i add cluster {{ slurm_cluster_name }} 2>&1; \
+              sacctmgr -i add account {{ slurm_account_of_group.values() | unique | join(',') }} Cluster={{ slurm_cluster_name }} 2>&1)
+        echo "$out"
+      register: sl_acct
+      changed_when: sl_acct.stdout is search('Adding')
+
+    - name: Every present cluster user is associated with its category's account (added if missing)
+      ansible.builtin.shell: |
+        acct='{{ slurm_account_of_group[(item.groups | intersect(slurm_account_of_group.keys()))[0]] }}'
+        if sacctmgr -n -P show assoc where user={{ item.name }} account="$acct" cluster={{ slurm_cluster_name }} format=User | grep -qx '{{ item.name }}'; then
+          echo present
+        else
+          sacctmgr -i add user {{ item.name }} Account="$acct" Cluster={{ slurm_cluster_name }}
+        fi
+      loop: "{{ cluster_users | rejectattr('state', 'defined') | list
+                + (cluster_users | selectattr('state', 'defined') | selectattr('state', 'equalto', 'present') | list) }}"
+      loop_control: {label: "{{ item.name }}"}
+      register: sl_user
+      changed_when: sl_user.stdout is search('Adding')
+
+    - name: slurmctld running
+      ansible.builtin.systemd: {name: slurmctld, state: started, enabled: true}
+
+- name: slurmd running (compute nodes)
+  ansible.builtin.systemd: {name: slurmd, state: started, enabled: true}
+  when: fleet_role != 'login'

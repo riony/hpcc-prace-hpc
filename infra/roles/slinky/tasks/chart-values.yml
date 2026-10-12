@@ -1,0 +1,10 @@
+---
+# Managed by Ansible (roles/slinky). The slurm chart's values as the chart write just rendered them
+# (the same template, rendered here in the role so its nested lookups resolve): --helm-settle
+# requires the deployed release to carry them (Session A's !73 check, H1). Included after each
+# chart write; nothing is written here.
+- name: The slurm chart values just written (from the same template)
+  ansible.builtin.set_fact:
+    slinky_chart_values: >-
+      {{ (lookup('ansible.builtin.template', 'prace-slinky-charts.yaml.j2') | from_yaml_all
+          | selectattr('metadata.name', 'equalto', 'slurm') | first).spec.valuesContent | from_yaml }}

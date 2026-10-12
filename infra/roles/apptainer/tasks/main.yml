@@ -1,0 +1,35 @@
+---
+# Managed by Ansible (roles/apptainer). Deferred (D42): fleet.yml runs it only with --tags apptainer,
+# after roles/fleet_repo's --tags extra_repo has put the pinned files in the repository.
+# A native worker (slurm_native_workers, T89): read-only checks only, first; the tree reaches it
+# through /apps. Login node: the tree, its site layer, the probe image, then the module, which /apps
+# offers to every worker: so it is written only when every native worker is in this run and passed
+# its checks (tasks/tree.yml). A pod worker gets nothing: its jobs see /apps through the pods' share.
+- name: Native worker checks (read-only), before the login node's part
+  ansible.builtin.import_tasks: native.yml
+
+- name: Apptainer in /apps (login node)
+  when: fleet_role == 'login'
+  block:
+    - name: /apps deferred or storage off - nothing written
+      ansible.builtin.debug:
+        msg: "/apps is deferred or not declared (storage_defer/storage_enable): nothing written"
+      when: not apptainer_enabled | bool
+
+    - name: /apps is mounted from its LV (never written into the underlying directory)
+      ansible.builtin.shell: |
+        set -euo pipefail
+        p={{ apptainer_root }} want='{{ apptainer_device }}'
+        # findmnt exits 1 both for "not mounted" (silent) and on an error (a message)
+        r=0; src=$(findmnt -no SOURCE --mountpoint "$p" 2>&1) || r=$?
+        [ $r = 0 ] || { echo "refusing: $p is not mounted${src:+ ($src)}" >&2; exit 3; }
+        [ -z "$want" ] || [ "$src" = "$want" ] || { echo "refusing: $p is mounted from $src, not $want" >&2; exit 3; }
+        echo "$src"
+      args: {executable: /bin/bash}
+      changed_when: false
+      check_mode: false          # read-only
+      when: apptainer_enabled | bool
+
+    - name: The tree, its site layer, the probe image and the module
+      ansible.builtin.import_tasks: tree.yml
+      when: apptainer_enabled | bool

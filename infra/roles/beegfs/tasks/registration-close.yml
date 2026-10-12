@@ -1,0 +1,34 @@
+---
+# The management's registration closed again after a first use that opened it (playbooks/beegfs.yml,
+# last play): registration-disable = true refuses new metadata/storage nodes and targets, clients
+# excluded (8.4.1 config.rs). Same configuration task as management.yml, so a failed earlier play
+# is closed by the next ordinary run as well.
+- name: This run passed its gates and holds the lease (a run started past them changes nothing)
+  ansible.builtin.assert:
+    that: bg_run_gated | bool and inventory_hostname == beegfs_mgmt_host
+    fail_msg: "{{ inventory_hostname }}: nothing done: the gates of playbooks/beegfs.yml did not pass in this run"
+    quiet: true
+
+- name: Registration of new servers and targets off
+  ansible.builtin.include_tasks: conf-set.yml
+  vars:
+    bg_conf_path: "{{ beegfs_conf_dir }}/beegfs-mgmtd.toml"
+    bg_conf_settings: {registration-disable: true}
+    bg_conf_format: toml
+
+- name: Management restarted with it
+  ansible.builtin.systemd:
+    name: beegfs-mgmtd
+    state: restarted
+  when: bg_conf_changed | bool and not ansible_check_mode
+
+- name: Management active, registration closed in its configuration
+  ansible.builtin.shell: |
+    set -euo pipefail
+    sleep {{ beegfs_service_settle_s }}
+    systemctl is-active beegfs-mgmtd
+    grep -E '^[[:space:]]*registration-disable[[:space:]]*=[[:space:]]*true[[:space:]]*$' {{ (beegfs_conf_dir ~ '/beegfs-mgmtd.toml') | quote }}
+  args: {executable: /bin/bash}
+  changed_when: false
+  check_mode: false
+  when: not ansible_check_mode

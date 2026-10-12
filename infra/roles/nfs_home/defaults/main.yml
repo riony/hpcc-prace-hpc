@@ -1,0 +1,9 @@
+---
+# Shares besides /home that are exported and mounted (not deferred); from storage.yml.
+nh_shares: >-
+  {{ (storage_lvs | default([])) | rejectattr('name', 'equalto', 'home')
+     | rejectattr('name', 'in', storage_defer | default([])) | list
+     if storage_enable | default(true) | bool else [] }}
+# Fallbacks for inventories without storage.yml (group_vars take precedence).
+storage_client_opts: "nosuid,nodev,hard,_netdev,vers=4.2"
+storage_defer: []

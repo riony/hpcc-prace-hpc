@@ -1,0 +1,167 @@
+---
+# D43, not security containment. Runs only for the explicit inventory targets.
+- name: D43 explicit ports inside an owned closed maintenance window
+  when: fleet_disabled_links | default([]) | length > 0
+  block:
+    - name: Window identity must be supplied
+      ansible.builtin.assert:
+        that:
+          - fleet_lease_id is defined and fleet_lease_id is match('^[0-9a-f]{16}$')
+          - ansible_facts.product_serial == chassis_serial
+        quiet: true
+    - name: Read the maintenance holder on the login node
+      ansible.builtin.command: cat /run/prace-cluster-lease/holder
+      delegate_to: "{{ groups['login'][0] }}"
+      register: disabled_holder
+      changed_when: false
+      check_mode: false
+    - name: The lease is actually held by maint with this exact identity
+      ansible.builtin.assert:
+        that: >-
+          disabled_holder.stdout is match('^holder=maint(?: label=\S+)? id=' ~ fleet_lease_id ~ ' since=\S+$')
+        quiet: true
+    - name: Read the window intent on the login node
+      ansible.builtin.slurp:
+        src: /run/prace-cluster-lease/fence-intent.json
+      delegate_to: "{{ groups['login'][0] }}"
+      register: disabled_window
+      check_mode: false
+    - name: Only a matching closed maintenance fence permits this change
+      ansible.builtin.assert:
+        that:
+          - disabled_intent.schema == 2
+          - disabled_intent.lease_id == fleet_lease_id
+          - disabled_intent.phase == 'closed'
+          - disabled_intent.fence_active | bool
+        quiet: true
+      vars:
+        disabled_intent: "{{ disabled_window.content | b64decode | from_json }}"
+    - name: Verify every physical target and protected address before writing anything
+      ansible.builtin.command:
+        argv: [python3, -c, "{{ lookup('ansible.builtin.file', role_path ~ '/files/prace-disabled-links.py') }}", preflight, --stdin-policy]
+        stdin: "{{ disabled_policy | to_json }}"
+      vars:
+        disabled_policy: {schema: 1, host: "{{ inventory_hostname }}", interfaces: "{{ fleet_disabled_links }}", protected: "{{ fleet_network_protected }}"}
+      register: disabled_preflight
+      changed_when: false
+      check_mode: false
+    - name: Local network policy directory
+      ansible.builtin.file: {path: /etc/prace-network, state: directory, owner: root, group: root, mode: '0755'}
+      register: disabled_policy_dir
+    - name: D43 policy with exact MAC and PCI pins
+      ansible.builtin.copy:
+        dest: /etc/prace-network/disabled-links.json
+        owner: root
+        group: root
+        mode: '0644'
+        content: "{{ {'schema': 1, 'host': inventory_hostname, 'interfaces': fleet_disabled_links, 'protected': fleet_network_protected} | to_nice_json }}\n"
+      when: not ansible_check_mode or not disabled_policy_dir.changed
+    - name: Preview the policy when its fresh parent directory is only simulated
+      ansible.builtin.debug:
+        msg: "Would install exact D43 policy: {{ fleet_disabled_links | to_json }}; protected {{ fleet_network_protected | to_json }}"
+      when: ansible_check_mode and disabled_policy_dir.changed
+    - name: Install the network helper
+      ansible.builtin.copy: {src: prace-disabled-links.py, dest: /usr/local/sbin/prace-disabled-links, owner: root, group: root, mode: '0755'}
+      register: disabled_helper
+    - name: Strictly unmanaged exact targets, preserving existing selectors
+      ansible.builtin.copy:
+        dest: /etc/NetworkManager/conf.d/90-prace-disabled-links.conf
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          # D43 managed by roles/fleet_net; physical unplug still required for hostile work.
+          [keyfile]
+          unmanaged-devices={{ (disabled_preflight.stdout | from_json).unmanaged | join(';') }}
+      register: disabled_nm
+    - name: Reload NetworkManager configuration only (never restart it)
+      ansible.builtin.command: nmcli general reload conf
+      when: disabled_nm.changed
+      changed_when: true
+    - name: Hold exact ports down before network-online at boot
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/prace-disabled-links.service
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=D43 hold unused fibre interfaces down
+          Wants=NetworkManager.service systemd-udev-settle.service
+          After=NetworkManager.service systemd-udev-settle.service
+          Before=NetworkManager-wait-online.service network-online.target
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/local/sbin/prace-disabled-links hold-down --boot
+          RemainAfterExit=yes
+          TimeoutStartSec=90
+          [Install]
+          RequiredBy=network-online.target
+      register: disabled_unit
+    - name: Read-only link observation on the private address
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/prace-disabled-links-observe.service
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=Read-only D43 link observation on the private network
+          Requires=prace-disabled-links.service
+          After=prace-disabled-links.service network-online.target
+          [Service]
+          ExecStart=/usr/local/sbin/prace-disabled-links serve --address {{ admin_ip }}
+          DynamicUser=yes
+          NoNewPrivileges=yes
+          ProtectSystem=strict
+          ProtectHome=yes
+          PrivateTmp=yes
+          RestrictAddressFamilies=AF_UNIX AF_INET AF_NETLINK
+          IPAddressDeny=any
+          IPAddressAllow={{ admin_network }}
+          CapabilityBoundingSet=
+          MemoryMax=64M
+          TasksMax=8
+          Restart=on-failure
+          RestartSec=5
+          [Install]
+          WantedBy=multi-user.target
+      register: disabled_observe_unit
+    - name: Hold ports down now with protected-address checks
+      ansible.builtin.command: /usr/local/sbin/prace-disabled-links hold-down
+      register: disabled_hold
+      changed_when: (disabled_hold.stdout | from_json).changed | bool
+      when: not ansible_check_mode
+    - name: Enable the boot guard
+      ansible.builtin.systemd_service:
+        name: prace-disabled-links.service
+        enabled: true
+        daemon_reload: "{{ disabled_unit.changed or disabled_observe_unit.changed }}"
+        state: started
+      when: not ansible_check_mode
+    - name: Enable the bounded read-only observation
+      ansible.builtin.systemd_service:
+        name: prace-disabled-links-observe.service
+        enabled: true
+        state: "{{ 'restarted' if disabled_observe_unit.changed or disabled_helper.changed else 'started' }}"
+      when: not ansible_check_mode
+    - name: Verify down, unmanaged, no carrier or address after apply
+      ansible.builtin.command: /usr/local/sbin/prace-disabled-links check
+      changed_when: false
+      when: not ansible_check_mode
+    - name: The unprivileged private observation endpoint really reads this host
+      ansible.builtin.uri:
+        url: "http://{{ admin_ip }}:9187/v1/disabled-links"
+        use_proxy: false
+        follow_redirects: none
+        return_content: true
+        timeout: 5
+      register: disabled_endpoint
+      until: >-
+        disabled_endpoint.status | default(0) == 200
+        and disabled_endpoint.json.host | default('') == inventory_hostname
+        and disabled_endpoint.json.disabled | default(false) | bool
+        and disabled_endpoint.json.errors | default(['missing']) == []
+      retries: 3
+      delay: 1
+      when: not ansible_check_mode

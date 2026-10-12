@@ -1,0 +1,56 @@
+---
+# Set keys in a configuration file the package ships, in place (as BeeGFS's own setup scripts do).
+#   bg_conf_path      the file
+#   bg_conf_settings  {key: native value}
+#   bg_conf_format    conf ("key = value"), kv ("key=value") or toml ("key = <TOML value>")
+# Every key must already be in the shipped file, set or commented out. A key name this draft could
+# not verify for 8.x therefore fails here, at qualification, instead of being ignored or rejected
+# at service start. Registers bg_conf_changed.
+- name: "{{ bg_conf_path }}: where each managed key is"
+  ansible.builtin.shell: |
+    set -euo pipefail
+    f={{ bg_conf_path | quote }}
+    [ -f "$f" ] || { echo "@absent"; exit 0; }
+    for k in {{ bg_conf_settings.keys() | map('quote') | join(' ') }}; do
+      if grep -qE "^[[:space:]]*${k}[[:space:]]*=" "$f"; then echo "$k set"
+      elif grep -qE "^[[:space:]]*#[[:space:]]*${k}[[:space:]]*=" "$f"; then echo "$k commented"
+      else echo "$k missing"; fi
+    done
+  args: {executable: /bin/bash}
+  register: bg_conf_where
+  changed_when: false
+  check_mode: false
+
+- name: "{{ bg_conf_path }}: every key exists in the shipped file"
+  ansible.builtin.assert:
+    that:
+      - bg_conf_settings.keys() | select('match', '^[A-Za-z][A-Za-z0-9-]*$') | list | length == bg_conf_settings | length
+      - "'@absent' not in bg_conf_where.stdout_lines or ansible_check_mode"
+      - bg_conf_where.stdout_lines | select('search', ' missing$') | list | length == 0
+    fail_msg: >-
+      {{ inventory_hostname }}: {{ bg_conf_path }} lacks {{ bg_conf_where.stdout_lines | select('search', ' missing$')
+      | map('split') | map('first') | list if '@absent' not in bg_conf_where.stdout_lines else 'the whole file' }}:
+      check these key names against the qualified release (UNVERIFIED in agents/handoffs/BEEGFS-ROLE-DRAFT-2026-10-02.md)
+    quiet: true
+
+- name: "{{ bg_conf_path }}: managed values"
+  ansible.builtin.lineinfile:
+    path: "{{ bg_conf_path }}"
+    # The pattern comes from a variable, not a Jinja string literal (literals decode backslashes).
+    regexp: "{{ '^' ~ ws ~ ('#' ~ ws if bg_conf_where_map[item.key] == 'commented' else '') ~ (item.key | regex_escape) ~ ws ~ '=' }}"
+    firstmatch: "{{ bg_conf_where_map[item.key] == 'commented' }}"
+    line: >-
+      {{ item.key ~ ('=' if bg_conf_format == 'kv' else ' = ')
+         ~ (item.value | to_json if bg_conf_format == 'toml'
+            else (item.value | string | lower if item.value is boolean else item.value | string)) }}
+  vars:
+    ws: '\s*'
+    bg_conf_where_map: "{{ dict(bg_conf_where.stdout_lines | reject('equalto', '@absent') | map('split') | list) }}"
+  loop: "{{ bg_conf_settings | dict2items }}"
+  loop_control: {label: "{{ item.key }}"}
+  register: bg_conf_lines
+  when: "'@absent' not in bg_conf_where.stdout_lines"
+
+- name: "{{ bg_conf_path }}: changed?"
+  ansible.builtin.set_fact:
+    bg_conf_changed: "{{ bg_conf_lines.results | default([]) | selectattr('changed', 'defined') | selectattr('changed') | list | length > 0 }}"

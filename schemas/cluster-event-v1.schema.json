@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://prace-hpc.invalid/schemas/cluster-event-v1.schema.json",
+  "title": "PRACE-HPC cluster event v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "event_type",
+    "run_id",
+    "sequence",
+    "timestamp",
+    "source",
+    "phase",
+    "scenario",
+    "correlated_action_sequence",
+    "target",
+    "snapshot"
+  ],
+  "properties": {
+    "schema": { "const": "prace.cluster-event.v1" },
+    "event_type": { "const": "cluster" },
+    "run_id": { "type": "string" },
+    "sequence": { "type": "integer", "minimum": 1 },
+    "timestamp": { "type": "string", "format": "date-time" },
+    "source": {
+      "type": "string",
+      "enum": ["cluster_tracer", "cluster_watcher"],
+      "description": "cluster_tracer is the cluster-side feed; cluster_watcher is interim cp2 corroboration only"
+    },
+    "phase": { "enum": ["record", "replay", "cleanup", "attack"] },
+    "scenario": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "version"],
+      "properties": {
+        "id": { "type": "string" },
+        "version": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "correlated_action_sequence": { "type": "integer", "minimum": 1 },
+    "target": { "type": "string" },
+    "snapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "code", "evidence_sha256", "detail"],
+      "properties": {
+        "status": { "enum": ["match", "mismatch", "error", "missing"] },
+        "code": { "type": "string" },
+        "evidence_sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "detail": { "type": "string", "maxLength": 300 }
+      }
+    }
+  }
+}

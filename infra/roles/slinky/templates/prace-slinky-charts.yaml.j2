@@ -1,0 +1,294 @@
+# Managed by Ansible (roles/slinky). K3s's Helm controller installs these; chart content is the
+# vendored, digest-checked .tgz from git. Every image is pinned by digest.
+{% macro chart(name) -%}
+{{ lookup('ansible.builtin.pipe', 'base64 -w0 ' ~ role_path ~ '/files/' ~ name ~ '-' ~ slinky_chart_version ~ '.tgz') }}
+{%- endmacro %}
+{% macro image(key) -%}
+{repository: {{ slinky_images[key].repository }}, tag: "{{ slinky_images[key].tag }}", digest: "{{ slinky_images[key].digest }}"}
+{%- endmacro %}
+{% macro mem_per_cpu(kind) -%}
+{# a NodeSet's job memory (MiB) per job CPU: the default memory of a job that gives no --mem #}
+{%- set r = slinky_nodeset_resources[kind] -%}
+{{ (r.memory[:-2] | int) * (1024 if r.memory.endswith('Gi') else 1) // (r.cpu | int) }}
+{%- endmacro %}
+{% macro share_json(kind) -%}
+{# a partition's node share: per CPU on cpu (default and maximum: more memory costs CPUs), per GPU
+   on gpu (slinky_gpu_share); the same for a NodeSet's partition and a native kind's #}
+{{ ({'DefMemPerCPU': mem_per_cpu(kind) | trim, 'MaxMemPerCPU': mem_per_cpu(kind) | trim} if kind == 'cpu'
+    else {'DefCpuPerGPU': slinky_gpu_share.cpus | string, 'DefMemPerGPU': slinky_gpu_share.mem_mib | string,
+          'TRESBillingWeights': slinky_tres_billing_weights}) | to_json }}
+{%- endmacro %}
+{% set on_login = '{nodeSelector: {prace.fleet/role: login}}' %}
+{# Inside a closed maintenance window the chart itself carries the closed admission state: every
+   partition INACTIVE and no login replica. Each chart apply is then fenced on its own, whatever the
+   maintenance overlay holds while a native topology changes (tasks/login.yml, the T89 bridge). #}
+{% set chart_fence = (slurm_window_intent | default({})).phase | default('') == 'closed' %}
+{% set closed = {'State': 'INACTIVE'} if chart_fence else {} %}
+{# a NodeSet runs slurmd pods for its kind's hosts that are not native workers (T89); a kind whose
+   hosts are all native has its NodeSet switched off and its lines written below. The bridge renders
+   the deployed list before a change (slinky_chart_native_workers) and, between the two, a changing
+   kind parked (slinky_chart_parked_workers): NodeSet off and no native lines, so the operator never
+   sees a pod partition and a native one for the same kind. #}
+{% set chart_native = slinky_chart_native_workers | default(slurm_native_workers | default([])) %}
+{% set chart_parked = slinky_chart_parked_workers | default([]) %}
+{% set ns = namespace(enabled=[], native=[]) %}
+{% for kind in slinky_nodesets %}
+{% set hosts = groups[kind] | default([]) %}
+{% if hosts | difference(chart_native) | difference(chart_parked) | length > 0 %}{% set ns.enabled = ns.enabled + [kind] %}{% elif hosts | length > 0 and hosts | intersect(chart_parked) | length == 0 %}{% set ns.native = ns.native + [kind] %}{% endif %}
+{% endfor %}
+apiVersion: helm.cattle.io/v1
+kind: HelmChart
+metadata:
+  name: slurm-operator-crds
+  namespace: kube-system
+spec:
+  targetNamespace: slinky
+  createNamespace: true
+  failurePolicy: abort       # a failed or interrupted upgrade waits for the operator; never uninstall-reinstall
+  chartContent: {{ chart('slurm-operator-crds') }}
+---
+apiVersion: helm.cattle.io/v1
+kind: HelmChart
+metadata:
+  name: slurm-operator
+  namespace: kube-system
+spec:
+  targetNamespace: slinky
+  createNamespace: true
+  failurePolicy: abort       # a failed or interrupted upgrade waits for the operator; never uninstall-reinstall
+  chartContent: {{ chart('slurm-operator') }}
+  valuesContent: |-
+    operator:
+      image: {{ image('operator') }}
+      nodeSelector: {prace.fleet/role: login}
+    webhook:
+      image: {{ image('webhook') }}
+      nodeSelector: {prace.fleet/role: login}
+    certManager:
+      enabled: false        # the chart generates the webhook certificate itself
+---
+apiVersion: helm.cattle.io/v1
+kind: HelmChart
+metadata:
+  name: slurm
+  namespace: kube-system
+spec:
+  targetNamespace: slurm
+  createNamespace: true
+  failurePolicy: abort       # a failed or interrupted upgrade waits for the operator; never uninstall-reinstall
+  chartContent: {{ chart('slurm') }}
+  valuesContent: |-
+    clusterName: {{ slinky_cluster_name }}
+    # Helm keeps the auth keys even through an uninstall, and the chart reuses an existing one (lookup):
+    # a reinstall on 1 Oct generated keys the running daemons did not have
+    slurmKey:
+      annotations: {helm.sh/resource-policy: keep}
+    jwtKey:
+      annotations: {helm.sh/resource-policy: keep}
+    configFiles:
+      cgroup.conf: |
+        CgroupPlugin=cgroup/v2
+        IgnoreSystemd=yes
+        ConstrainCores=yes
+        ConstrainRAMSpace=yes
+        ConstrainDevices=yes
+      # GPUs found through the NVIDIA driver (Slurm's gpu/nvidia plugin; the image has no NVML
+      # plugin). Nodes without GPUs detect none.
+      gres.conf: |
+        AutoDetect=nvidia
+{% for node, lines in slinky_gres_overrides | dictsort %}
+        # {{ node }}: explicit GPU-to-core affinity (see slinky_gres_overrides)
+        NodeName={{ node }} AutoDetect=off
+{% for line in lines %}
+        NodeName={{ node }} Name=gpu {{ line }}
+{% endfor %}
+{% endfor %}
+      # Submit filter (JobSubmitPlugins=lua): every job names its project with -A; a GPU node's CPUs
+      # and memory go with its GPUs (slinky_gpu_share); a queued job's size is fixed for users
+      job_submit.lua: |
+        {{ lookup('ansible.builtin.template', 'job_submit.lua.j2') | indent(8) }}
+    controller:
+      slurmctld: {image: {{ image('slurmctld') }}}
+      reconfigure: {image: {{ image('slurmctld') }}}
+      logfile: {image: {{ image('alpine') }}}
+      persistence: {enabled: true, storageClassName: local-path}
+      podSpec: {{ on_login }}
+      extraConfMap:
+        ProctrackType: proctrack/cgroup
+        TaskPlugin: task/cgroup,task/affinity
+        JobAcctGatherType: jobacct_gather/cgroup
+        LaunchParameters: enable_nss_slurm
+        PrologFlags: Contain
+        SelectType: select/cons_tres
+        SelectTypeParameters: CR_Core_Memory
+        # A node set DOWN for non-response returns by itself once it registers validly; nodes an
+        # administrator set DOWN/DRAIN, and invalid registrations, stay down (D38 review, 28 Sep).
+        ReturnToService: "1"
+        # GPUs as a consumable, confined (cgroup ConstrainDevices) and accounted resource (D39)
+        GresTypes: gpu
+        AccountingStorageTRES: gres/gpu
+        # The submitted batch script of each job is kept in accounting (sacct -B -j <id>): cluster-side
+        # evidence of what was submitted, not of everything that executed (owner request, 7 Oct). Job
+        # environments are not stored (job_env off). Covers jobs started after the change only.
+        AccountingStoreFlags: job_script
+        # Academic policy (slinky_scheduler_conf): enforced project associations, limits and QoS,
+        # submit-time rejection of impossible jobs, the -A filter, fairshare-led priority
+{% for key, value in slinky_scheduler_conf | dictsort %}
+        {{ key }}: {{ value | string | to_json }}
+{% endfor %}
+{% for kind in ns.native %}
+{% set pc = namespace(s='') %}
+{% for k, v in ({'Default': 'YES' if kind == 'cpu' else 'NO'} | combine(share_json(kind) | from_json) | combine(slinky_partition_policy[kind])).items() %}{% set pc.s = pc.s ~ ' ' ~ k ~ '=' ~ v %}{% endfor %}
+        # every {{ kind }} host runs a native slurmd (slurm_native_workers): the NodeSet (by feature,
+        # as the operator writes it) and the partition of the switched-off {{ kind }} NodeSet
+        NodeSet: {{ (kind ~ ' Feature=' ~ kind) | to_json }}
+        PartitionName: {{ (kind ~ ' Nodes=' ~ kind ~ pc.s ~ (' State=INACTIVE' if chart_fence else '')) | to_json }}
+{% endfor %}
+    restapi:
+      slurmrestd: {image: {{ image('slurmrestd') }}}
+      podSpec: {{ on_login }}
+    accounting:
+      enabled: true
+      slurmdbd: {image: {{ image('slurmdbd') }}}
+      storageConfig:
+        host: {{ admin_ip }}
+        port: 3306
+        database: slurm_acct_db
+        username: slurm
+        passwordKeyRef: {name: mariadb-password, key: password}
+      podSpec: {{ on_login }}
+    sssd:
+      conf: |
+        [sssd]
+        services = nss,pam
+        domains = prace
+
+        [nss]
+        filter_groups = root,slurm
+        filter_users = root,slurm
+
+        [pam]
+
+        [domain/prace]
+        id_provider = files
+        passwd_files = /etc/prace-identity/passwd
+        group_files = /etc/prace-identity/group
+        # The files provider has no access control of its own; without this pam_sss denies every
+        # account. Access is: listed in accounts.yml (absent users are not rendered) + a key.
+        access_provider = permit
+        # SSSD reports 'x' as the password field for files domains by default; pam_unix then looks
+        # for a shadow entry that does not exist and refuses the account. '*' = no password.
+        pwfield = *
+{# T87 (3 Oct): sshd and slurmd start only with nosuid, nodev and their mode on every share
+   (files/prace-share-check.sh, after the NRI mount guard); the image's entrypoint and slurmd's
+   arguments from the operator follow unchanged #}
+{% set share_check = (['/bin/sh', '-c', lookup('ansible.builtin.file', role_path ~ '/files/prace-share-check.sh'), 'prace-share-check']
+                      + slinky_share_modes + ['--', slinky_container_entrypoint]) if slinky_pod_shares else [] %}
+    loginsets:
+      prace:
+        enabled: true
+        replicas: {{ 0 if chart_fence else 1 }}
+        # SSSD's files provider does not notice ConfigMap updates (symlink swap), so a running
+        # login pod would keep a revoked user: any change to the account data rolls the pod.
+        metadata:
+          annotations:
+            prace.fleet/identity-sha256: "{{ ((cluster_users | to_json) ~ (cluster_groups | to_json) ~ slinky_default_shell) | hash('sha256') }}"
+        login:
+          image: {{ image('login') }}
+{% if share_check %}
+          command: {{ share_check | to_json }}
+{% endif %}
+          volumeMounts:
+            - {name: identity, mountPath: /etc/prace-identity, readOnly: true}
+            - {name: apps-profile, mountPath: /etc/profile.d/{{ slinky_apps_profile }}, subPath: {{ slinky_apps_profile }}, readOnly: true}
+{% for sh in slinky_pod_shares %}
+            - {name: share-{{ sh.name }}, mountPath: {{ sh.path }}{{ ', readOnly: true' if sh.export == 'ro' else '' }}}
+{% endfor %}
+        initconf: {image: {{ image('alpine') }}}
+        podSpec:
+          nodeSelector: {prace.fleet/role: login}
+          volumes:
+            - {name: identity, configMap: {name: prace-identity}}
+            - {name: apps-profile, configMap: {name: prace-apps-profile}}
+{% for sh in slinky_pod_shares %}
+            - {name: share-{{ sh.name }}, persistentVolumeClaim: {claimName: prace-{{ sh.name }}{{ ', readOnly: true' if sh.export == 'ro' else '' }}}}
+{% endfor %}
+        service:
+          spec: {type: NodePort}
+          nodePort: {{ slinky_login_node_port }}
+    # Workers resolve job users through nss_slurm (LaunchParameters=enable_nss_slurm). Slinky 1.2.2
+    # gives worker pods no sssd.conf unless NodeSet ssh is enabled, so their sssd stays down (benign).
+    nodesets:
+{% for kind in slinky_nodesets %}
+      {{ kind }}:
+        enabled: {{ (kind in ns.enabled) | lower }}
+        scalingMode: DaemonSet
+        slurmd:
+          image: {{ image('slurmd') }}
+{% if share_check %}
+          command: {{ share_check | to_json }}
+{% endif %}
+          resources:
+            requests: {cpu: "{{ slinky_nodeset_resources[kind].cpu }}", memory: {{ slinky_nodeset_resources[kind].memory }}}
+            limits: {cpu: "{{ slinky_nodeset_resources[kind].cpu }}", memory: {{ slinky_nodeset_resources[kind].memory }}}
+          volumeMounts:
+            # module use /apps/modulefiles in job shells (T88), as in the login pod
+            - {name: apps-profile, mountPath: /etc/profile.d/{{ slinky_apps_profile }}, subPath: {{ slinky_apps_profile }}, readOnly: true}
+{% for sh in slinky_pod_shares %}
+            - {name: share-{{ sh.name }}, mountPath: {{ sh.path }}{{ ', readOnly: true' if sh.export == 'ro' else '' }}}
+{% endfor %}
+{% if kind == 'gpu' %}
+            - {name: cuda, mountPath: {{ slinky_cuda_path }}, readOnly: true}
+          # The NVIDIA container runtime injects the driver libraries and nvidia-smi; Slurm's
+          # GRES/cgroups then give each job only the GPUs it was allocated.
+          env:
+            - {name: NVIDIA_VISIBLE_DEVICES, value: all}
+            - {name: NVIDIA_DRIVER_CAPABILITIES, value: "compute,utility"}
+        extraConfMap:
+          Gres: ["gpu:{{ slinky_gpus_per_node }}"]
+{% endif %}
+        logfile: {image: {{ image('alpine') }}}
+        partition:
+          enabled: true
+          # time limits (slinky_partition_policy) and this NodeSet's share: per CPU on cpu (default
+          # and maximum: more memory costs CPUs), per GPU on gpu (slinky_gpu_share)
+          configMap: {{ ({'Default': 'YES' if kind == 'cpu' else 'NO'} | combine(share_json(kind) | from_json) | combine(slinky_partition_policy[kind]) | combine(closed)) | to_json }}
+        podSpec:
+          nodeSelector: {prace.fleet/role: {{ kind }}}
+          tolerations:
+            - {key: slinky.slurm.net/slurm, operator: Exists, effect: NoExecute}
+          volumes:
+            - {name: apps-profile, configMap: {name: prace-apps-profile}}
+{% for sh in slinky_pod_shares %}
+            - {name: share-{{ sh.name }}, persistentVolumeClaim: {claimName: prace-{{ sh.name }}{{ ', readOnly: true' if sh.export == 'ro' else '' }}}}
+{% endfor %}
+{% if kind == 'gpu' %}
+            # the host's CUDA 12.9 (roles/nvidia_gpu), read-only; module cuda/12.9 (T88) points here
+            - {name: cuda, hostPath: {path: {{ slinky_cuda_path }}, type: Directory}}
+          runtimeClassName: nvidia
+{% endif %}
+{% endfor %}
+{% if ns.enabled or ns.native %}
+{% set dm = namespace(mib=none) %}
+{% for kind in ns.enabled + ns.native %}
+{% set m = mem_per_cpu(kind) | trim | int %}{% if dm.mib is none or m < dm.mib %}{% set dm.mib = m %}{% endif %}
+{% endfor %}
+    # Short jobs on every worker: a partition over the existing NodeSets (the same slurmd pods), with
+    # the smallest NodeSet share as default memory and the debug QoS limits (slinky_debug_partition).
+    # The QoS only once the database has it (slinky_known_qos): slurmctld refuses an unknown one.
+    partitions:
+      debug:
+        enabled: true
+        nodesets: [ALL]   # every worker, pod or native: no partition names a NodeSet the T89 bridge adds or removes
+{% set debug_conf = slinky_debug_partition if slinky_known_qos is none or slinky_debug_partition.QOS | default('') in slinky_known_qos
+                    else slinky_debug_partition | dict2items | rejectattr('key', 'equalto', 'QOS') | items2dict %}
+        configMap: {{ ({'DefMemPerCPU': dm.mib | string, 'TRESBillingWeights': slinky_tres_billing_weights} | combine(debug_conf) | combine(closed)) | to_json }}
+      # Pay per use (slinky_payg, simulated): every worker, the free queues' node shares (the submit
+      # filter), credits charged at slinky_tres_billing_weights to the project's payg QoS
+      {{ slinky_payg.partition }}:
+        enabled: true
+        nodesets: [ALL]
+        configMap: {{ ({'DefMemPerCPU': dm.mib | string, 'DefCpuPerGPU': slinky_gpu_share.cpus | string,
+                        'TRESBillingWeights': slinky_tres_billing_weights} | combine(slinky_payg | dict2items
+                       | selectattr('key', 'in', ['DefaultTime', 'MaxTime', 'PriorityJobFactor']) | items2dict) | combine(closed)) | to_json }}
+{% endif %}

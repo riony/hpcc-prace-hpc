@@ -1,0 +1,128 @@
+---
+# gitlab_runner: GitLab Runner on mgmt-git01 using ROOTLESS Podman as the "docker"
+# executor. Jobs run in containers owned by the unprivileged gitlab-runner user, so a
+# job cannot read GitLab's files or the host's credentials. The runner holds no lab keys.
+# Requires roles/gitlab (GitLab running, gitlab_fqdn) first.
+
+- name: GitLab Runner package repository (official definition, signed)
+  ansible.builtin.yum_repository:
+    name: runner_gitlab-runner
+    description: runner_gitlab-runner
+    baseurl: https://packages.gitlab.com/runner/gitlab-runner/el/9/$basearch
+    gpgcheck: true
+    repo_gpgcheck: true
+    gpgkey:
+      - https://packages.gitlab.com/gpgkey/gpg.key
+      - https://packages.gitlab.com/gpgkey/runner/49F16C5CC3A0F81F.pub.gpg
+      - https://packages.gitlab.com/gpgkey/runner/4C80FB51394521E9.pub.gpg
+    sslverify: true
+    sslcacert: /etc/pki/tls/certs/ca-bundle.crt
+    metadata_expire: "300"
+
+- name: Import GitLab Runner package signing keys
+  ansible.builtin.rpm_key:
+    key: "{{ item }}"
+    state: present
+  loop:
+    - https://packages.gitlab.com/gpgkey/gpg.key
+    - https://packages.gitlab.com/gpgkey/runner/49F16C5CC3A0F81F.pub.gpg
+    - https://packages.gitlab.com/gpgkey/runner/4C80FB51394521E9.pub.gpg
+
+- name: Accept the repository metadata signing keys
+  ansible.builtin.command: dnf -y -q makecache --repo runner_gitlab-runner
+  changed_when: false
+
+- name: Install the pinned GitLab Runner version
+  ansible.builtin.dnf:
+    name: "gitlab-runner-{{ gitlab_runner_version }}"
+    state: present
+
+- name: Read the runner account
+  ansible.builtin.getent:
+    database: passwd
+    key: "{{ gitlab_runner_user }}"
+
+- name: Runner account facts
+  ansible.builtin.set_fact:
+    glr_uid: "{{ ansible_facts.getent_passwd[gitlab_runner_user][1] }}"
+
+- name: Read subordinate ID ranges (rootless containers need them)
+  ansible.builtin.command: grep -c "^{{ gitlab_runner_user }}:" /etc/subuid /etc/subgid
+  register: glr_subids
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Allocate subordinate IDs if the package's useradd did not
+  ansible.builtin.shell: |
+    set -euo pipefail
+    start=$(awk -F: '{e=$2+$3} e>m{m=e} END{print (m>100000?m:100000)}' /etc/subuid /etc/subgid)
+    usermod --add-subuids "${start}-$((start+65535))" --add-subgids "${start}-$((start+65535))" {{ gitlab_runner_user }}
+  when: "':0' in glr_subids.stdout"
+
+- name: Keep the runner user's systemd instance running without a login (linger)
+  ansible.builtin.command: loginctl enable-linger {{ gitlab_runner_user }}
+  args:
+    creates: "/var/lib/systemd/linger/{{ gitlab_runner_user }}"
+
+- name: Wait for the runner user's runtime directory
+  ansible.builtin.wait_for:
+    path: "/run/user/{{ glr_uid }}/bus"
+    timeout: 30
+  when: not ansible_check_mode
+
+- name: Enable the runner user's rootless Podman API socket
+  ansible.builtin.command:
+    argv: [runuser, -u, "{{ gitlab_runner_user }}", --, env, "XDG_RUNTIME_DIR=/run/user/{{ glr_uid }}",
+           "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{{ glr_uid }}/bus",
+           systemctl, --user, enable, --now, podman.socket]
+  args:
+    creates: "/run/user/{{ glr_uid }}/podman/podman.sock"
+
+- name: Registration script (token never printed; see the script header)
+  ansible.builtin.template:
+    src: gitlab-runner-register-ci.j2
+    dest: /usr/local/sbin/gitlab-runner-register-ci
+    owner: root
+    group: root
+    mode: "0700"
+
+- name: Register the runner once
+  ansible.builtin.command: /usr/local/sbin/gitlab-runner-register-ci
+  register: glr_register
+  changed_when: "glr_register.stdout == 'registered'"
+  when: not ansible_check_mode
+
+- name: Fixed SELinux level for all job containers (see gitlab_runner_selinux_level)
+  ansible.builtin.lineinfile:
+    path: /etc/gitlab-runner/config.toml
+    regexp: '^\s*security_opt\s*='
+    insertafter: '^\s*\[runners\.docker\]'
+    line: '    security_opt = ["label=level:{{ gitlab_runner_selinux_level }}"]'
+  notify: restart gitlab-runner
+  when: not ansible_check_mode
+
+# No restart: the runner re-reads config.toml by itself within seconds, and "concurrent" takes
+# effect without interrupting running jobs (GitLab Runner advanced configuration).
+- name: Concurrent job limit
+  ansible.builtin.lineinfile:
+    path: /etc/gitlab-runner/config.toml
+    regexp: '^concurrent\s*='
+    line: "concurrent = {{ gitlab_runner_concurrent }}"
+  when: not ansible_check_mode
+
+- name: Runner service enabled and running
+  ansible.builtin.systemd:
+    name: gitlab-runner
+    enabled: true
+    state: started
+
+- name: Apply a pending restart now
+  ansible.builtin.meta: flush_handlers
+
+- name: Verify the runner can talk to GitLab
+  ansible.builtin.command: gitlab-runner verify --name {{ gitlab_runner_name }}
+  register: glr_verify
+  changed_when: false
+  failed_when: "'is valid' not in (glr_verify.stdout + glr_verify.stderr)"
+  when: not ansible_check_mode

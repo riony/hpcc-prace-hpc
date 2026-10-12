@@ -1,0 +1,2 @@
+# Tested controller: Python 3.11.15; direct dependency pin, not a transitive lock.
+ansible-core==2.19.13

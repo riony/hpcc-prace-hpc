@@ -1,0 +1,64 @@
+---
+# BeeGFS /scratch (Session A plan A4: docs/plan/SESSION-A-STORAGE-RECOVERY-FABRIC-2026-09-30.md).
+# DEFERRED until after the first scenario (D42). Data for roles/beegfs and playbooks/beegfs.yml
+# only: fleet.yml does not run BeeGFS, and nothing here has been deployed. Draft notes and every
+# unverified 8.x assumption: agents/handoffs/BEEGFS-ROLE-DRAFT-2026-10-02.md.
+
+# --- release (NOT qualified). The exact files are pinned in roles/fleet_repo defaults
+# (fleet_repo_beegfs_packages: NEVRA, upstream path, sha256; fleet_repo_beegfs_key: fingerprint),
+# candidates for 8.4.1 read from signed metadata on 5 Oct. Every run refuses until both values
+# below come from the live qualification (docs/runbooks/BEEGFS-QUALIFICATION-PLAN.md): the
+# client must first build and load on each deployed and next-boot kernel, with SELinux
+# enforcing. beegfs_qualified_release must equal the version of every pinned BeeGFS package.
+beegfs_qualified_release: null       # e.g. 8.4.1, only from the qualification record
+beegfs_qualification_record: null    # evidence/<date>/<dir>/ path of that record (append-only)
+
+# --- stable identities. Never change an ID once its service has started: BeeGFS keys its data by
+# it (doc.beegfs.io/8.4.0 advanced_topics/setting_ids.html). IDs are 1..65535 and unique within
+# their class (metadata nodes; storage nodes; storage targets). Storage targets are bound to the
+# NVMe serial (host_vars nvme_serials), never to /dev/nvmeXn1.
+beegfs_mgmt_host: lab-dl380        # management service (DL380); everyone uses its admin_ip
+beegfs_mgmt_id: 1                    # recorded for checks only: 8.x has one management service (no ID setting in beegfs-mgmtd.toml 8.4.1)
+beegfs_meta_nodes:                   # one unmirrored metadata service per GPU host, ext4 on a RAID1-backed LV
+  - {host: lab-g003, id: 3}
+  - {host: lab-g004, id: 4}
+  - {host: lab-g005, id: 5}
+beegfs_storage_nodes:                # one storage service per GPU host; one XFS target per NVMe
+  - host: lab-g003
+    id: 3
+    targets:
+      - {serial: EXNVME00000031, id: 301}
+      - {serial: EXNVME00000032, id: 302}
+  - host: lab-g004
+    id: 4
+    targets:
+      - {serial: EXNVME00000041, id: 401}
+      - {serial: EXNVME00000042, id: 402}
+  - host: lab-g005
+    id: 5
+    targets:
+      - {serial: EXNVME00000051, id: 501}
+      - {serial: EXNVME00000052, id: 502}
+
+# --- metadata space: a dedicated LV in the GPU host's OS volume group (<gNNN>_vg on the P408i-a
+# RAID1). Created only by the armed first use; never resized or shrunk. The reserve is free space
+# the role refuses to go below when it creates the LV. Plan guidance: metadata about 0.3-0.5 % of
+# storage (~9.6 TB raw -> 29-48 GB in total over three hosts); 64 GiB each leaves headroom.
+beegfs_meta_lv_size_g: 64
+beegfs_meta_vg_reserve_g: 64
+
+# --- resource envelope per GPU host (plan A4): engineering estimates for SIZING, not measured
+# demand and NOT caps. The role sets no CPU or memory limit on any BeeGFS service. Session B owns
+# the Slurm budget that reserves them (and its requalification); D42 keeps today's budgets.
+beegfs_resource_envelope:
+  gpu_host:
+    storage_two_targets: {cores: 2, ram_gib: 8}
+    metadata: {cores: 1, ram_gib: 4}
+    client: {cores: 1, ram_gib: 4}
+  login_management: {cores: 1, ram_gib: 2}   # within the DL380's shared control/rehearsal budget
+
+# --- licensing (8.3+). No licence is applied by the role: acquiring one (plan: community licence)
+# is an owner action through `beegfs license` on the initialised management. Unlicensed 8.4
+# accepts five client mounts: the five physical hosts. Pods use host bind mounts of /scratch, not
+# mounts of their own; any rehearsal or test mount counts against the five.
+beegfs_unlicensed_client_limit: 5

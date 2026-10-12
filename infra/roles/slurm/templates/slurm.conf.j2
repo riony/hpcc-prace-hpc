@@ -1,0 +1,30 @@
+# Managed by Ansible (roles/slurm). Identical on every node.
+ClusterName={{ slurm_cluster_name }}
+SlurmctldHost={{ groups['login'][0] }}({{ hostvars[groups['login'][0]].admin_ip }})
+SlurmUser=slurm
+AuthType=auth/munge
+CredType=cred/munge
+MpiDefault=none
+ProctrackType=proctrack/cgroup
+TaskPlugin=task/cgroup,task/affinity
+SelectType=select/cons_tres
+SelectTypeParameters=CR_Core_Memory
+StateSaveLocation=/var/spool/slurmctld
+SlurmdSpoolDir=/var/spool/slurmd
+SlurmctldLogFile=/var/log/slurm/slurmctld.log
+SlurmdLogFile=/var/log/slurm/slurmd.log
+ReturnToService=2
+AccountingStorageType=accounting_storage/slurmdbd
+AccountingStorageHost={{ groups['login'][0] }}
+AccountingStorageEnforce=associations,limits
+JobAcctGatherType=jobacct_gather/cgroup
+
+{% for h in slurm_compute_nodes %}
+NodeName={{ h }} NodeAddr={{ hostvars[h].admin_ip }} {{ hostvars[h].slurm_node }} State=UNKNOWN
+{% endfor %}
+{% for part in ['cpu', 'gpu'] %}
+{% set members = slurm_compute_nodes | select('in', groups.get(part, [])) | list %}
+{% if members %}
+PartitionName={{ part }} Nodes={{ members | join(',') }} Default={{ 'YES' if part == 'cpu' else 'NO' }} MaxTime=INFINITE State=UP
+{% endif %}
+{% endfor %}

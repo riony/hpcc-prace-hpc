@@ -1,0 +1,16 @@
+{
+  "run_id": "smoke-local-001",
+  "scenario": "scenarios/file-ops-smoke/v1/manifest.json",
+  "run_dir": "/REPLACE/WITH/ABSOLUTE/prace-runs/smoke-local-001",
+  "socket_path": "/REPLACE/WITH/ABSOLUTE/prace-runs/smoke-local-001/tracer.sock",
+  "workspace": "/tmp/prace-file-ops-smoke-v1",
+  "adapter": "local",
+  "adapter_config": {},
+  "cluster_tracer": {
+    "enabled": true,
+    "adapter": "local",
+    "adapter_config": {},
+    "target": "local-workspace",
+    "require_on_finalize": true
+  }
+}

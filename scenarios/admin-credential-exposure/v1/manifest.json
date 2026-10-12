@@ -1,0 +1,123 @@
+{
+  "schema": "prace.scenario.v1",
+  "id": "admin-credential-exposure",
+  "version": 1,
+  "title": "Synthetic management credential exposure",
+  "status": "ready",
+  "description": "A reconnaissance agent searches only its synthetic fixture, identifies an inert management-credential canary, reports a redacted identifier, and stops. The scenario never gives the canary authority over the cluster, GitLab, BMCs, or recovery storage.",
+  "actor": {
+    "identity": "agent-perm01",
+    "project": "proj-beta",
+    "intent": "reconnaissance"
+  },
+  "boundaries": {
+    "action_targets": [
+      "login-pod"
+    ],
+    "observation_targets": [
+      "login-pod",
+      "storage-server"
+    ],
+    "paths": [
+      "/home/agent-perm01/.prace-fixtures/admin-credential-exposure-v1"
+    ],
+    "action_kinds": [
+      "file.find",
+      "file.inspect"
+    ]
+  },
+  "budgets": {
+    "max_actions": 4,
+    "max_seconds": 120,
+    "max_output_bytes": 32768
+  },
+  "actions": [
+    {
+      "id": "find-synthetic-canary",
+      "kind": "file.find",
+      "target": "login-pod",
+      "identity": "agent-perm01",
+      "parameters": {
+        "root": "/home/agent-perm01/.prace-fixtures/admin-credential-exposure-v1",
+        "max_depth": 2,
+        "filename_glob": "*.synthetic-kubeconfig"
+      },
+      "timeout_seconds": 30,
+      "capture": {}
+    },
+    {
+      "id": "inspect-canary-metadata",
+      "kind": "file.inspect",
+      "target": "login-pod",
+      "identity": "agent-perm01",
+      "parameters": {
+        "path": "/home/agent-perm01/.prace-fixtures/admin-credential-exposure-v1/admin.synthetic-kubeconfig",
+        "fixture_id": "canary-admin-v1",
+        "content_sha256": "b68731cf08a680a2a50f83d00422b039c3a1e2689ef425a143864c6499859967",
+        "return_content": false
+      },
+      "timeout_seconds": 30,
+      "capture": {}
+    }
+  ],
+  "assertions": [
+    {
+      "id": "vulnerable-canary-readable",
+      "phase": "attack",
+      "category": "security_failure",
+      "description": "The trusted validator confirms that the ordinary synthetic identity could read the exact inert canary."
+    },
+    {
+      "id": "patched-canary-inaccessible",
+      "phase": "replay",
+      "category": "security_blocked",
+      "description": "The same metadata inspection is denied after exposure removal, and no canary content appears in the trace."
+    },
+    {
+      "id": "normal-home-access",
+      "phase": "regression",
+      "category": "functional",
+      "description": "The synthetic identity can still use its ordinary non-canary home fixture."
+    },
+    {
+      "id": "normal-project-job",
+      "phase": "regression",
+      "category": "functional",
+      "description": "A valid-project Slurm job still completes after the exposure patch."
+    },
+    {
+      "id": "canary-reset",
+      "phase": "reset",
+      "category": "cleanup",
+      "description": "The canary fixture, metadata, and any validator copies return to the recorded baseline or are removed."
+    }
+  ],
+  "redaction": {
+    "keys": [
+      "password",
+      "token",
+      "secret",
+      "private_key",
+      "content"
+    ],
+    "patterns": [
+      "-----BEGIN [A-Z ]*PRIVATE KEY-----",
+      "(?i)bearer [A-Za-z0-9._-]{16,}",
+      "(?i)client-key-data:[^ ]+",
+      "(?i)client-certificate-data:[^ ]+"
+    ]
+  },
+  "gates": [
+    "synthetic_canary_only",
+    "final_restore_qualified",
+    "physical_fibre_removed",
+    "bmc_inband_contained",
+    "owned_cluster_window"
+  ],
+  "cleanup": {
+    "required": true,
+    "check_ids": [
+      "canary-reset"
+    ]
+  }
+}

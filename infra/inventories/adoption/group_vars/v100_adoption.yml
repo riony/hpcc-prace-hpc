@@ -1,0 +1,10 @@
+---
+ansible_user: admin
+ansible_ssh_common_args: '-o ProxyJump=admin@192.0.2.205 -o StrictHostKeyChecking=yes'
+ansible_python_interpreter: /usr/bin/python3
+private_prefix: 24
+private_zone: public
+host_base_offline: true
+timezone: Asia/Singapore
+chrony_servers: [10.88.0.1]
+chrony_server_opts: 'minpoll 4 maxpoll 6'

@@ -1,0 +1,123 @@
+{
+  "schema": "prace.scenario.v1",
+  "id": "file-ops-smoke-remote",
+  "version": 1,
+  "title": "Ordinary file-ops smoke over bounded SSH",
+  "status": "smoke",
+  "description": "Non-security rehearsal over SSH: mkdir, write two files, delete one. Uses the same /tmp smoke workspace on the remote host. No security claim.",
+  "actor": {
+    "identity": "smoke-operator",
+    "project": "proj-ops",
+    "intent": "benign"
+  },
+  "boundaries": {
+    "action_targets": [
+      "login-pod"
+    ],
+    "observation_targets": [
+      "login-pod"
+    ],
+    "paths": [
+      "/tmp/prace-file-ops-smoke-v1"
+    ],
+    "action_kinds": [
+      "file.mkdir",
+      "file.write",
+      "file.delete"
+    ]
+  },
+  "budgets": {
+    "max_actions": 8,
+    "max_seconds": 120,
+    "max_output_bytes": 4096
+  },
+  "actions": [
+    {
+      "id": "mkdir-demo-dir",
+      "kind": "file.mkdir",
+      "target": "login-pod",
+      "identity": "smoke-operator",
+      "parameters": {
+        "path": "/tmp/prace-file-ops-smoke-v1/demo-dir",
+        "parents": true
+      },
+      "timeout_seconds": 10,
+      "capture": {}
+    },
+    {
+      "id": "write-test-file-1",
+      "kind": "file.write",
+      "target": "login-pod",
+      "identity": "smoke-operator",
+      "parameters": {
+        "path": "/tmp/prace-file-ops-smoke-v1/demo-dir/test-file-1.txt",
+        "content": "smoke-file-1\n"
+      },
+      "timeout_seconds": 10,
+      "capture": {}
+    },
+    {
+      "id": "write-test-file-2",
+      "kind": "file.write",
+      "target": "login-pod",
+      "identity": "smoke-operator",
+      "parameters": {
+        "path": "/tmp/prace-file-ops-smoke-v1/demo-dir/test-file-2.txt",
+        "content": "smoke-file-2\n"
+      },
+      "timeout_seconds": 10,
+      "capture": {}
+    },
+    {
+      "id": "delete-test-file-1",
+      "kind": "file.delete",
+      "target": "login-pod",
+      "identity": "smoke-operator",
+      "parameters": {
+        "path": "/tmp/prace-file-ops-smoke-v1/demo-dir/test-file-1.txt"
+      },
+      "timeout_seconds": 10,
+      "capture": {}
+    }
+  ],
+  "assertions": [
+    {
+      "id": "record-layout-ok",
+      "phase": "record",
+      "category": "functional",
+      "description": "After the recorded run, demo-dir exists with only test-file-2.txt."
+    },
+    {
+      "id": "replay-layout-ok",
+      "phase": "replay",
+      "category": "functional",
+      "description": "After deterministic replay from a clean workspace, the same final layout exists."
+    },
+    {
+      "id": "workspace-reset",
+      "phase": "cleanup",
+      "category": "cleanup",
+      "description": "The smoke workspace is emptied after reports are written."
+    }
+  ],
+  "redaction": {
+    "keys": [
+      "password",
+      "token",
+      "secret",
+      "private_key"
+    ],
+    "patterns": [
+      "-----BEGIN [A-Z ]*PRIVATE KEY-----",
+      "(?i)bearer [A-Za-z0-9._-]{16,}",
+      "(?i)kubeconfig:[^ ]+"
+    ]
+  },
+  "gates": [],
+  "cleanup": {
+    "required": true,
+    "check_ids": [
+      "workspace-reset"
+    ]
+  }
+}

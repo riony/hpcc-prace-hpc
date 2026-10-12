@@ -1,0 +1,47 @@
+# Lenovo lab-lenovo :  host-specific variables
+# Sources: kickstart build params + live verification 2026-09-24
+# (evidence/2026-09-23/lenovo-post-install-verification.md). Values marked
+# PENDING are not yet established and must not be guessed.
+
+# Private address persistent since 2026-09-24 (NM profile private-eno2); reached only
+# through the .205 bastion. admin's sudo needs a password (NOT NOPASSWD): add
+# --ask-become-pass, or -e ansible_user=root (root key login works).
+ansible_host: 10.88.0.2            # private segment; DL380 .1, g005 .3
+ansible_user: admin                # wheel; key installed by kickstart %post
+ansible_ssh_common_args: '-o ProxyJump=admin@192.0.2.205'
+# ansible_ssh_private_key_file: ~/.ssh/id_ed25519   # controller default is fine
+
+hardware:
+  serial: ""                       # PENDING :  chassis serial not captured
+  raid:
+    controller: "M5210"
+    logical_volume_wwn: "600605b0000000000000000000000002"
+    # by-id aliases on this hardware (all resolve to /dev/sda):
+    #   scsi-3600605b0000000000000000000000002
+    #   scsi-SIBM_ServeRAID_M5210_00000000000000000000000000000002
+    #   wwn-0x600605b0000000000000000000000002
+    size: 278.5G
+
+network:
+  private_ip: 10.88.0.2
+  private_prefix: 24
+  private_iface: eno2              # MAC 02:00:00:00:00:05; identified 2026-09-24 by carrier + ARP from .205 eno4
+  # Do NOT reuse the campus .206. Private profiles carry NO default gateway.
+  nics:
+    - {name: eno1,  mac: "02:00:00:00:00:17", speed: 1G, note: "linked to the CAMPUS 192.0.2.x L2 (same as .205 eno1); no address; answers ARP for 10.88.0.2 (arp_ignore=0)"}
+    - {name: eno2,  mac: "02:00:00:00:00:05", speed: 1G, note: "private switch; 10.88.0.2/24"}
+    - {name: eno3,  speed: 1G,  note: "onboard"}
+    - {name: eno4,  speed: 1G,  note: "onboard"}
+    - {name: ens1f0, speed: 10G, note: "10GbE"}
+    - {name: ens1f1, speed: 10G, note: "10GbE"}
+    - {name: ens5f0, speed: 10G, note: "10GbE"}
+    - {name: ens5f1, speed: 10G, note: "10GbE"}
+
+storage:
+  vg: lenovo_vg
+  root_lv: 81920m                  # 80 GiB, matches kickstart
+  swap_lv: 8192m                   # 8 GiB
+  images_lv: 102400m               # 100 GiB /var/lib/libvirt/images
+  vg_free_reserved: true           # 87.88 GiB left free deliberately
+
+timezone: Asia/Singapore

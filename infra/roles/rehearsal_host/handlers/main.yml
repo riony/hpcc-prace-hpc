@@ -1,0 +1,6 @@
+---
+- name: reload rehearsal egress rules
+  ansible.builtin.systemd:
+    name: prace-rehearsal-egress
+    state: restarted
+    daemon_reload: true

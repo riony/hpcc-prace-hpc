@@ -1,0 +1,17 @@
+{
+ "schema": 1,
+ "comment": "Contract C4. Fixed mapping for everything served from mgmt-git01. Account names are not here: the role renders them from the inventory into dash.json (scrub.accounts), so they stay out of exported code. Pattern rules (addresses, MAC, PCI, UUID, 32-hex point ids, 16-hex lease ids, pod-name hashes, the tailnet name, /home and /projects paths) are in prace_dash_common.py.",
+ "hosts": {
+  "lab-dl380": "login-node",
+  "lab-lenovo": "cpu-worker-1",
+  "lab-g003": "gpu-worker-1",
+  "lab-g004": "gpu-worker-2",
+  "lab-g005": "gpu-worker-3"
+ },
+ "aliases": {
+  "g003": "gpu-worker-1",
+  "g004": "gpu-worker-2",
+  "g005": "gpu-worker-3",
+  "mgmt-git01": "mgmt-vm"
+ }
+}

@@ -1,0 +1,7 @@
+---
+# Read-only observation keys (roles/fleet_observer on the login node). Both were generated on
+# mgmt-git01 by roles/fleet_monitor on 28 Sep; the private keys never left that VM.
+# Each key may run only /usr/local/sbin/prace-fleet-observe, and only from mgmt-git01.
+fleet_observer_keys:
+  - "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAORUfrgwkmkrvEE37qxb4AaqAsbOiUflTW2tmgO7hLv prace-monitor@mgmt-git01"   # off-node monitor
+  - "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIF47EWwDclB4OyNYpaK7EXyf5PIlFO72CXydJuIoEoFP fleet-audit@mgmt-git01"     # CI drift audit (labdeploy)

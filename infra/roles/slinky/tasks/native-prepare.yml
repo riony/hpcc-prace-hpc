@@ -1,0 +1,78 @@
+---
+# Managed by Ansible (roles/slinky). A native worker (slurm_native_workers, T89; D39 item 2),
+# BEFORE tasks/login.yml changes the chart: the OpenHPC packages of the images' Slurm version,
+# the images' SlurmUser uid, then the key, the controller address, the drop-in and the transition
+# marker (native-config.yml). Nothing starts here: login.yml switches this kind's NodeSet off only
+# when every joining host is prepared (slinky_native_prepared), and tasks/native.yml starts the
+# daemon after the chart. In --check this previews without installing or starting anything.
+# Bench proof: evidence/2026-09-30/native-lenovo-bench/.
+- name: A native worker is a Slurm worker kind
+  ansible.builtin.assert:
+    that: fleet_role in slinky_nodesets
+    fail_msg: "{{ inventory_hostname }} is listed in slurm_native_workers but its fleet_role is {{ fleet_role }}"
+    quiet: true
+
+- name: The Slinky images' SlurmUser uid (this host's slurm user must have it)
+  ansible.builtin.command: "{{ slinky_kubectl }} -n slurm exec slurm-controller-0 -c slurmctld -- id -u slurm"
+  delegate_to: "{{ groups['login'][0] }}"
+  register: slinky_ctl_uid
+  changed_when: false
+  check_mode: false          # read-only
+
+- name: The controller's SlurmUser uid is the configured one
+  ansible.builtin.assert:
+    that: slinky_ctl_uid.stdout | trim == slinky_slurm_uid | string
+    fail_msg: "the controller runs as uid {{ slinky_ctl_uid.stdout | trim }}, slinky_slurm_uid is {{ slinky_slurm_uid }}"
+    quiet: true
+
+- name: slurm group and user with the controller's ids
+  block:
+    - ansible.builtin.group: {name: slurm, gid: "{{ slinky_slurm_gid }}", system: true}
+    - ansible.builtin.user:
+        name: slurm
+        uid: "{{ slinky_slurm_uid }}"
+        group: slurm
+        system: true
+        shell: /sbin/nologin
+        home: /var/lib/slurm
+        create_home: false
+
+- name: OpenHPC slurmd of the images' Slurm version (from the fleet repository)
+  ansible.builtin.dnf:
+    name: "{{ slinky_native_packages }}"
+    state: present
+
+# Session A review R4: the job environment of the slurmd image, so the shared modulefiles work here
+# (the repository may have just gained them: fresh metadata)
+- name: The images' job environment packages, at the images' builds (from the fleet repository)
+  ansible.builtin.dnf:
+    name: "{{ slurm_native_runtime_packages }}"
+    state: present
+    update_cache: true
+
+- name: The job environment is the images' (versions, paths, the module command)
+  ansible.builtin.include_tasks: native-runtime.yml
+
+- name: munge (a package dependency) stays off; the cluster uses auth/slurm
+  ansible.builtin.systemd_service:
+    name: munge
+    enabled: false
+    state: stopped
+  register: slinky_munge
+  failed_when: slinky_munge is failed and 'Could not find' not in (slinky_munge.msg | default(''))
+
+# numeric ids: a first --check preview has not created the slurm user yet
+- name: Slurm directories
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: "{{ item.owner }}"
+    group: "{{ item.owner }}"
+    mode: "0755"
+  loop:
+    - {path: /etc/slurm, owner: 0}
+    - {path: /var/spool/slurmd, owner: 0}
+    - {path: /var/log/slurm, owner: "{{ slinky_slurm_uid }}"}
+
+- name: The native slurmd's key, controller address, drop-in and transition marker
+  ansible.builtin.include_tasks: native-config.yml

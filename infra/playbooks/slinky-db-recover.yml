@@ -1,0 +1,20 @@
+---
+# An explicit recovery path, not a full converge. Same selected file repairs forward or rollback.
+- name: Repair accounting credentials without depending on a working accounting connection
+  hosts: "{{ 'login' if fleet_armed | default(false) | bool else 'fleet_not_armed_no_hosts' }}"
+  gather_facts: false
+  tasks:
+    - name: Verify the owned closed quiet window before any recovery mutation
+      ansible.builtin.command:
+        argv: ["{{ ansible_playbook_python }}", "{{ playbook_dir }}/../tools/require-closed-window.py"]
+        stdin: "{{ {'lease_id': fleet_lease_id | default(''), 'intent': slurm_window_intent | default(none)} | to_json }}"
+      environment:
+        PRACE_LOGIN: "{{ ansible_host | default(admin_ip) }}"
+      delegate_to: localhost
+      become: false
+      changed_when: false
+      check_mode: false
+    - name: Explicit repair after window verification
+      ansible.builtin.include_role:
+        name: slinky
+        tasks_from: db-recover.yml

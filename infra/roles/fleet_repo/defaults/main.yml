@@ -1,0 +1,177 @@
+---
+# Package repository for the private network (T65). The login node (campus access) enables
+# EPEL and OpenHPC 3, downloads a pinned package closure and serves it on its private address
+# only; compute nodes use nothing else. Signatures stay checked end to end (gpgcheck=1 with
+# the Rocky, EPEL and OpenHPC keys).
+fleet_repo_dir: /srv/fleet-repo
+fleet_repo_url: "http://{{ hostvars[groups['login'][0]].admin_ip }}/fleet-repo"
+# OpenHPC 3 release package over HTTPS, pinned by hash (it carries OpenHPC's signing key).
+fleet_ohpc_release_url: https://repos.openhpc.community/OpenHPC/3/EL_9/x86_64/ohpc-release-3-1.el9.x86_64.rpm
+fleet_ohpc_release_sha256: da01857e2868ca52e34771a124db32b164ad807d4b490bb0e54044149ea378c1
+# Signing-key fingerprints (checked on every import; the published values for these keys).
+fleet_repo_keys:
+  - {file: RPM-GPG-KEY-Rocky-9, fingerprint: 21CB256AE16FC54C6E652949702D426D350D275D}
+  - {file: RPM-GPG-KEY-EPEL-9, fingerprint: FF8AD1344597106ECE813B918A3872BF3228467C}
+  - {file: RPM-GPG-KEY-OpenHPC-3, fingerprint: 6E19BE11D9A082C00A7DB41A7AC05F0940A90CC8}
+# Pinned where the version matters to the cluster (Slurm and its PMIx); the rest follows the
+# Rocky 9.8 / EPEL 9 snapshot of the day the repository is built (recorded in the manifest).
+fleet_repo_packages:
+  - slurm-ohpc-25.11.8
+  - slurm-slurmctld-ohpc-25.11.8
+  - slurm-slurmd-ohpc-25.11.8
+  - slurm-slurmdbd-ohpc-25.11.8
+  - slurm-contribs-ohpc-25.11.8
+  - slurm-example-configs-ohpc-25.11.8
+  - pmix-ohpc-4.2.9
+  - munge
+  - munge-libs
+  - mariadb-server
+  - nfs-utils
+  - sssd-nfs-idmap              # installed sssd-common requires it once libnfsidmap is present
+  - git
+  - python3-libselinux
+  - python3-libsemanage          # ansible.posix.seboolean
+  - python3-firewall
+  - tmux
+  - ethtool
+  - chrony
+  - tar                        # host_base / metadata-preserving worker-home archives
+  - gzip                       # GNU tar --gzip during capture and extraction
+  - container-selinux            # roles/k3s (Kubernetes for Slinky)
+
+# The job environment's C++ compiler (T88, roles/apps_env): exact files, unpacked into /apps on the
+# login node and never installed anywhere. Downloaded by its own step (tag apps_repo), without their
+# dependencies (the images have them); roles/apps_env checks each file against its pinned sha256.
+fleet_repo_apps_packages:
+  - gcc-11.5.0-14.el9.x86_64
+  - gcc-c++-11.5.0-14.el9.x86_64
+  - cpp-11.5.0-14.el9.x86_64
+  - libstdc++-11.5.0-14.el9.x86_64
+  - libstdc++-devel-11.5.0-14.el9.x86_64
+
+# BeeGFS /scratch (roles/beegfs; DEFERRED until after the first scenario, D42). A repository of its
+# own, beside the fleet repository and never inside it: createrepo_c over fleet_repo_dir walks
+# subdirectories, every compute converge runs "dnf upgrade" against the fleet repository, and A's
+# native capture runs rpm -K over its packages/. This one holds exactly the files below (a stray
+# file fails the step), each fetched from its upstream location and kept only if its sha256 matches,
+# then signature-checked. Hosts enable it only inside BeeGFS transactions (--disablerepo='*'
+# --enablerepo=prace-beegfs), so nothing else can enter one. Its own step: only --tags beegfs_repo (or the
+# role's own tag, repo), never in a full converge.
+# Candidates read from signed repository metadata on 5 Oct (evidence/2026-10-05/beegfs-pins):
+# NOT qualified. roles/beegfs refuses to install until beegfs_qualified_release (group_vars all
+# beegfs.yml) names the release the qualification accepted. Every BeeGFS package carries epoch 20,
+# and the release differs per package (el9 or 1): pins and locks are full NEVRAs, never one string.
+fleet_repo_beegfs_dir: /srv/fleet-repo-beegfs
+fleet_repo_beegfs_url: "http://{{ hostvars[groups['login'][0]].admin_ip }}/fleet-repo-beegfs"
+fleet_repo_beegfs_sources:
+  beegfs: https://www.beegfs.io/release/beegfs_8.4/dists/rhel9
+  rocky-baseos: https://dl.rockylinux.org/pub/rocky/9.8/BaseOS/x86_64/os
+fleet_repo_beegfs_key:   # the same key signs 8.0-8.4 (sha256 00d3e83f... at every release's gpg/)
+  file: GPG-KEY-beegfs
+  url: https://www.beegfs.io/release/beegfs_8.4/gpg/GPG-KEY-beegfs
+  fingerprint: 0683AF2B9AC5BC7D59B2D62340CE4E243CD50804
+  sha256: 00d3e83fe0c76927052a46b3f8e6bac15df4de271edf508564527c64ed5a6b25
+fleet_repo_beegfs_packages:
+  # BeeGFS 8.4.1 (no libbeegfs-ib: TCP only, D43). beegfs-client is noarch source built on each host.
+  - {nevra: beegfs-mgmtd-20:8.4.1-1.x86_64, source: beegfs, path: x86_64/beegfs-mgmtd-8.4.1-1.x86_64.rpm, sha256: 9bfbe5fb929cd933f096f4ca8fd6ea12ff9cf4924b3949324ceff8a447de4d7d}
+  - {nevra: libbeegfs-license-20:8.4.1-1.x86_64, source: beegfs, path: x86_64/libbeegfs-license-8.4.1-linux.amd64.rpm, sha256: 112798a32e138dc4ad911e3304c89c11a462e7147925cd7d7a4d029006daad79}
+  - {nevra: beegfs-tools-20:8.4.1-1.x86_64, source: beegfs, path: x86_64/beegfs-tools-8.4.1-linux.amd64.rpm, sha256: 354f8c7af341964419e48ca7c52649afbed942a190981619dbb40c268c6c1114}
+  - {nevra: beegfs-utils-20:8.4.1-el9.x86_64, source: beegfs, path: x86_64/beegfs-utils-8.4.1-el9.x86_64.rpm, sha256: 2849b85bfaab9167fb6110191fbed2f71008d06ae74836174b9cf883665054fc}
+  - {nevra: beegfs-meta-20:8.4.1-el9.x86_64, source: beegfs, path: x86_64/beegfs-meta-8.4.1-el9.x86_64.rpm, sha256: 7f25e1abcc5a521ebdc969684adbbed10d3c79f9af45c62a7315e3e919a408c8}
+  - {nevra: beegfs-storage-20:8.4.1-el9.x86_64, source: beegfs, path: x86_64/beegfs-storage-8.4.1-el9.x86_64.rpm, sha256: 3779ff68158edba4cf87b5ce827386256c1cd4be6fcb01954d2268924a546dbf}
+  - {nevra: beegfs-client-20:8.4.1-el9.noarch, source: beegfs, path: noarch/beegfs-client-8.4.1-el9.noarch.rpm, sha256: 52e065c94dd25e5417bd5aea02a6d2f2e3c6c625e51198e506a1ddbf6bbb7078}
+  # Host tools the role installs (Rocky 9.8 BaseOS; their other requirements are in compute-baseline.txt).
+  # nvme-cli/smartmontools: read-only NVMe health before first use. The version-lock plugin needs
+  # python3-dnf-plugins-core of its own version; both core packages are here in case a host is older.
+  - {nevra: nvme-cli-0:2.16-1.el9.x86_64, source: rocky-baseos, path: Packages/n/nvme-cli-2.16-1.el9.x86_64.rpm, sha256: 627b69a18fa44614c3d6200afa6d7aa43661cc3a08847aee48f3cd093a240931}
+  - {nevra: smartmontools-1:7.2-10.el9.x86_64, source: rocky-baseos, path: Packages/s/smartmontools-7.2-10.el9.x86_64.rpm, sha256: 9c9383c9715c0b0e8c4c99860ec9939979b66b8abb2d5cbc8fd6f3f40558896e}
+  - {nevra: python3-dnf-plugin-versionlock-0:4.3.0-26.el9.noarch, source: rocky-baseos, path: Packages/p/python3-dnf-plugin-versionlock-4.3.0-26.el9.noarch.rpm, sha256: 1ce2572dde488964d050503cebb3408ce9fcdd77a72a668a69b2919b7a44d0b3}
+  - {nevra: python3-dnf-plugins-core-0:4.3.0-26.el9.noarch, source: rocky-baseos, path: Packages/p/python3-dnf-plugins-core-4.3.0-26.el9.noarch.rpm, sha256: 3ceeed90f5f3bd5dadcebff42ef3efbe6cdb8242de0a8345ab71f887ca7239cd}
+  - {nevra: dnf-plugins-core-0:4.3.0-26.el9.noarch, source: rocky-baseos, path: Packages/d/dnf-plugins-core-4.3.0-26.el9.noarch.rpm, sha256: 2af0175e6746ff40fc87e3caa9d8decf6abd205ad3d3e6afe6ac4c1ad34c7209}
+  # The client module's build chain on hosts that lack it (the login node; the Lenovo has gcc from
+  # native_repo, lacks make, kernel-devel and elfutils-libelf-devel) is pinned at qualification from
+  # each host's resolved closure: until then a BeeGFS transaction there fails on a missing file.
+
+# NVIDIA stack for the V100 GPU nodes (D39, 28 Sep): driver branch R580 is the last to support
+# Volta, its proprietary kernel module is required (the open modules need Turing or newer), and
+# CUDA 13 dropped Volta, so the toolkit is 12.9. NVIDIA's repository also carries 590-615
+# drivers without Volta support; every NVIDIA package is therefore named with its exact version,
+# and the GPU nodes version-lock them (roles/nvidia_gpu). Downloaded by its own step
+# (tag gpu_repo) so it never refreshes the rest of the snapshot.
+fleet_repo_nvidia_repos:
+  - {name: nvidia-cuda, baseurl: "https://developer.download.nvidia.com/compute/cuda/repos/rhel9/x86_64/",
+     key: RPM-GPG-KEY-NVIDIA-CUDA, key_url: "https://developer.download.nvidia.com/compute/cuda/repos/rhel9/x86_64/D42D0685.pub",
+     fingerprint: 610C7B14E068A878070DA4E99CD0A493D42D0685}
+  - {name: nvidia-container-toolkit, baseurl: "https://nvidia.github.io/libnvidia-container/stable/rpm/x86_64/",
+     key: RPM-GPG-KEY-NVIDIA-CONTAINER, key_url: "https://nvidia.github.io/libnvidia-container/gpgkey",
+     fingerprint: C95B321B61E88C1809C4F759DDCAE044F796ECB0}
+nvidia_driver_version: "580.173.02-1.el9"
+nvidia_dcgm_version: "4.7.0-1"
+nvidia_ctk_version: "1.20.1-1"
+nvidia_cuda_version: "12.9.2-1"        # cuda-toolkit-12-9
+nvidia_nccl_version: "2.32.3-1+cuda12.9"
+nvidia_gpu_packages:                    # exact versions only (roles/nvidia_gpu installs and locks these)
+  - "kmod-nvidia-latest-dkms-{{ nvidia_driver_version }}"
+  - "nvidia-kmod-common-{{ nvidia_driver_version }}"
+  - "nvidia-driver-{{ nvidia_driver_version }}"
+  - "nvidia-driver-libs-{{ nvidia_driver_version }}"
+  - "nvidia-driver-cuda-{{ nvidia_driver_version }}"
+  - "nvidia-driver-cuda-libs-{{ nvidia_driver_version }}"
+  - "libnvidia-ml-{{ nvidia_driver_version }}"
+  - "libnvidia-cfg-{{ nvidia_driver_version }}"
+  - "libnvidia-gpucomp-{{ nvidia_driver_version }}"
+  - "nvidia-persistenced-{{ nvidia_driver_version }}"
+  - "nvidia-modprobe-{{ nvidia_driver_version }}"
+  - "datacenter-gpu-manager-4-cuda12-{{ nvidia_dcgm_version }}"
+  - "datacenter-gpu-manager-4-core-{{ nvidia_dcgm_version }}"
+  - "nvidia-container-toolkit-{{ nvidia_ctk_version }}"
+  - "nvidia-container-toolkit-base-{{ nvidia_ctk_version }}"
+  - "libnvidia-container-tools-{{ nvidia_ctk_version }}"
+  - "libnvidia-container1-{{ nvidia_ctk_version }}"
+  - "cuda-toolkit-12-9-{{ nvidia_cuda_version }}"
+  - cuda-demo-suite-12-9
+  - "libnccl-{{ nvidia_nccl_version }}"
+  - "libnccl-devel-{{ nvidia_nccl_version }}"
+# Built on the node: DKMS and the toolchain, against the kernel the GPU nodes BOOT. The 27 Sep
+# snapshot installed kernel 687.52.1 as the boot default on the compute nodes (they still ran the
+# install kernel 687.10.1 until their next reboot); the driver is built for that kernel and the
+# role reboots into it.
+nvidia_build_packages: [dkms, gcc, make, elfutils-libelf-devel, python3-dnf-plugin-versionlock]
+nvidia_kernel: "5.14.0-687.52.1.el9_8.x86_64"
+
+# Deferred until after the first scenario (D42), but carried in the repository so that no later
+# step needs the internet: Apptainer for the extended applications, infiniband-diags (with
+# libibumad) for the read-only InfiniBand peer map (each ring port's neighbour by a directed-route
+# query, which needs no subnet manager), and OpenSM with the verbs tools for the ring fabric
+# (roles/ib_fabric). roles/apptainer unpacks apptainer, fuse3-libs,
+# shadow-utils-subid, lzo and protobuf-c into /apps (never installed; the slurmd image lacks the
+# four libraries); no role installs any of them. Exact files with the sha256 of the upstream
+# repository metadata (Rocky 9.8 BaseOS/AppStream, EPEL 9: the first five and the two InfiniBand
+# files read on 2 Oct, lzo and protobuf-c on 5 Oct; evidence/2026-10-05/apptainer and
+# evidence/2026-10-02/repo-pins), downloaded without dependency resolution by their own step, which
+# runs only with --tags extra_repo (or the role's tag repo), so it never refreshes the rest of the
+# snapshot. lzo and protobuf-c are also in compute-baseline.txt, whose snapshot takes the newest
+# build; these pins keep the exact files the unpack checks.
+# Not apptainer-suid: unprivileged user namespaces are enough, and untrusted code will run here.
+# fakeroot and fakeroot-libs are carried for a later decision only (the unpack leaves them out).
+# EPEL keeps only its newest build and Rocky moves superseded files to its vault: if a file is
+# gone, the download fails, and the pin is renewed from the metadata, never loosened.
+fleet_repo_extra_packages:
+  - {nevra: apptainer-1.5.4-1.el9.x86_64, sha256: 474c7c71c804e80eb1ed3e30781fe0cca6e169875a48efb37b280d58c5e5377d}             # EPEL
+  - {nevra: fakeroot-1.37-1.el9.x86_64, sha256: 97d11f4daafe41265ac8706e6f9ce527636f1a9c8b63d8a4cd06770469a3a2b9}                # EPEL
+  - {nevra: fakeroot-libs-1.37-1.el9.x86_64, sha256: 4f44c32c542381c0aa7630e900a1ce9cfb8a2610d1045639ec56863cbc7ff97f}           # EPEL
+  - {nevra: fuse3-libs-3.10.2-9.el9.x86_64, sha256: 53288648d76449d1bef5e7cbf93d008f1ed77fba45f51a3ea33c61952c589aa9}            # AppStream
+  - {nevra: shadow-utils-subid-4.9-16.el9.x86_64, sha256: 9ccb728e83910880e031544751fd8ef043766c1a0655784e0ff8375eddc13504}      # BaseOS
+  - {nevra: lzo-2.10-7.el9.x86_64, sha256: e204370ce22c35f18d784ad404c2892e2ffe946d5e0378c8d1044f6554fbe860}                     # BaseOS
+  - {nevra: protobuf-c-1.3.3-13.el9.x86_64, sha256: 084e207869fa9bfd0c4c94e4be1249aa909087fe90229141149b95e517ab74cf}            # BaseOS
+  - {nevra: infiniband-diags-61.0-2.el9.x86_64, sha256: 7a8390c6288c43b9ff8e91d40ceac5a5be4d9ac79a65b6701f026c1bd0394548}        # AppStream
+  - {nevra: libibumad-61.0-2.el9.x86_64, sha256: b14a521377a1560f83e771e4e95e476b6e050b4abc5ac9d2da43cc4fc3f36c0d}               # BaseOS; = the GPU nodes' rdma-core 61.0-2
+  # The InfiniBand ring fabric (roles/ib_fabric; deferred, D42/D43), read 7 Oct (evidence/2026-10-07/ib-fabric-pins):
+  # OpenSM for the subnet-manager nodes; the verbs libraries and tools (ibv_devinfo, ibv_rc_pingpong,
+  # ib_write_bw) for qualification. All from the rdma-core 61.0-2 build the nodes run, or need only it.
+  - {nevra: opensm-3.3.24-2.el9.x86_64, sha256: d11413b2dcd4f6e9c9fba38ca13b62ccb68ad6417cfbc3734279d3d848737b69}                # BaseOS
+  - {nevra: opensm-libs-3.3.24-2.el9.x86_64, sha256: 8a26e5b1d1a8538ebd854754ae9cce0c4d548c250ce3b43dae4a68895e470dc6}           # BaseOS
+  - {nevra: libibverbs-61.0-2.el9.x86_64, sha256: 3cb1c1947df28590e1291e897f4121a72ed1f3ba0bcb90b0b77d574ecfede7e9}              # BaseOS
+  - {nevra: libibverbs-utils-61.0-2.el9.x86_64, sha256: fba3dd740cb4cffd2fea431eb7f5b1c611569a57ffb556d392bceeea3b58b101}        # BaseOS
+  - {nevra: librdmacm-61.0-2.el9.x86_64, sha256: e0ea75b7e6ba35874ea11f2eb2de9874d5901ac68cc222482e515e98219a4c17}               # BaseOS
+  - {nevra: perftest-25.10.0.0.128-3.el9.x86_64, sha256: e51ad8004e9b2516b15fb434f10ede10b1487e9f161dea1cdfe7e966acc7b580}       # BaseOS

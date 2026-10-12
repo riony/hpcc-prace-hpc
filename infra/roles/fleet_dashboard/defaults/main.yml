@@ -1,0 +1,50 @@
+---
+# fleet_dashboard: the read-only fleet dashboard on mgmt-git01 (design option A, docs/design/dashboard).
+# Three standard-library collectors under an unprivileged user read only what is already on this VM
+# (the off-node monitor's files, this VM's own GitLab API, evidence folders shipped from the deploy
+# commit) and write a scrubbed static site. GitLab's bundled nginx serves it at /prace-dash/
+# (roles/gitlab, gitlab_prace_dash). Nothing here touches a cluster node; the dashboard has no key,
+# port or credential on the fleet.
+fleet_dashboard_state: present                 # absent: timers stopped, units, code and site removed (rollback)
+fleet_dashboard_enable: true                   # false: files only, no systemd calls (the role test container)
+fleet_dashboard_user: prace-dash
+fleet_dashboard_home: /var/lib/prace-dash       # state/ (GitLab cache), src/ (evidence at the deploy commit)
+fleet_dashboard_www: "{{ gitlab_prace_dash_root | default('/var/lib/prace-dash/www') }}"   # served; data/ is written by the collectors
+fleet_dashboard_lib: /usr/local/lib/prace-dash
+fleet_dashboard_etc: /etc/prace-dash
+# The owner creates the dashboard's own GitLab token (read_api; a project access token with Reporter
+# role and an expiry) and places it here by hand, 0600. It never passes through git or Ansible
+# variables; the role only checks that the file exists and is not empty, then sets owner and mode.
+fleet_dashboard_token_file: /etc/prace-dash/gitlab-token
+# Optional, owner-set: {"state": "frozen"|"open", "note": "...", "set_at": "<ISO>"}. Absent = "unknown".
+# The repository has no machine-readable freeze; the role never writes this file.
+fleet_dashboard_freeze_file: /etc/prace-dash/freeze.json
+fleet_dashboard_observe_s: 60
+fleet_dashboard_gitlab_s: 300
+fleet_dashboard_evidence_calendar: hourly
+fleet_dashboard_gitlab_connect: 127.0.0.1      # TCP to this VM's own nginx; TLS is verified for gitlab_fqdn (no DNS needed)
+fleet_dashboard_project: "{{ fleet_monitor_project | default('hpcc/prace-hackathon') }}"
+fleet_dashboard_reservation_labels: [lease]    # VERIFY against the live reservation issues (#8, #12) before deploy
+fleet_dashboard_monitor_labels: [fleet-monitor]   # the monitor labels its issues alert,fleet-monitor
+fleet_dashboard_drift_job: lab-drift-check
+fleet_dashboard_monitor_token_expires: "{{ fleet_monitor_token_expires | default('') }}"
+fleet_dashboard_monitor_home: "{{ fleet_monitor_home | default('/var/lib/prace-monitor') }}"
+fleet_dashboard_monitor_lib: "{{ fleet_monitor_lib | default('/usr/local/lib/prace-monitor') }}"
+# The controller's checkout (the operator's pinned execution checkout): evidence folders, account
+# names (scrub map) and pinned versions are read from it at its HEAD; a dirty evidence/ tree is refused.
+fleet_dashboard_repo: "{{ playbook_dir }}/../.."
+fleet_dashboard_accounts_file: "{{ playbook_dir }}/../inventories/fleet/group_vars/all/accounts.yml"
+# Static inventory shown on the host cards and labelled "static". Never observed. Sources:
+# docs/overview/hardware-network.md (models, GPUs), inventories/fleet host_vars bmc.type (ilo5, imm2).
+fleet_dashboard_inventory:
+  lab-dl380: {model: HPE DL380 Gen10, bmc: iLO 5, os: Rocky Linux 9.8}
+  lab-lenovo: {model: Lenovo x3650 M5, bmc: IMM2, os: Rocky Linux 9.8}
+  lab-g003: {model: HPE XL270d Gen10, bmc: iLO 5, os: Rocky Linux 9.8, gpus: 8 x Tesla V100-SXM2-32GB}
+  lab-g004: {model: HPE XL270d Gen10, bmc: iLO 5, os: Rocky Linux 9.8, gpus: 8 x Tesla V100-SXM2-32GB}
+  lab-g005: {model: HPE XL270d Gen10, bmc: iLO 5, os: Rocky Linux 9.8, gpus: 8 x Tesla V100-SXM2-32GB}
+# Static policy text (roles/slinky computes the GPU share; its comment states the result).
+fleet_dashboard_policy:
+  GPU share: 4 CPUs and 90 GiB per GPU (roles/slinky slinky_gpu_share, submit filter)
+  Pay per use: credit QoS per project on the payg partition (roles/slinky)
+# internal: true only in a check-mode preview before the account exists (ownership then omitted)
+fd_preview_only: "{{ ansible_check_mode and (fd_getent.rc | default(0)) != 0 }}"

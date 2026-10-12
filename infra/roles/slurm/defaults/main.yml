@@ -1,0 +1,8 @@
+---
+# Slurm from OpenHPC 3 (maintained; EPEL's 22.05 is end-of-life), pinned.
+slurm_version: 25.11.8
+slurm_cluster_name: prace
+slurm_uid: 202                     # same UID/GID on every node (created before the packages)
+slurm_db_password_file: /root/slurmdbd-db.pw   # generated on the login node; never leaves it
+# Slurm account per workload category (the category group from cluster_accounts).
+slurm_account_of_group: {team: team, synthetic: synthetic, agents: agents}

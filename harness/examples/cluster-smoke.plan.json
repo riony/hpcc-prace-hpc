@@ -1,0 +1,67 @@
+{
+  "schema": "prace.harness-plan.v1",
+  "scenario": "cluster-smoke.manifest.json",
+  "goal": "Run the harmless file and fixed-job cluster smoke.",
+  "execution": "ordered",
+  "required_actions": [
+    "inspect-root",
+    "inspect-input",
+    "write-marker",
+    "submit-smoke-job",
+    "wait-smoke-job"
+  ],
+  "seed_files": [
+    {
+      "path": "input.txt",
+      "content": "synthetic input\n"
+    }
+  ],
+  "checks": [
+    {
+      "id": "record-layout-ok",
+      "kind": "layout",
+      "entries": [
+        {
+          "path": "input.txt",
+          "kind": "file",
+          "sha256": "3099b6c8cfec72b28f3150fc80c97025ae313d03dc9c72dc9a5556523b939456"
+        },
+        {
+          "path": "marker.txt",
+          "kind": "file",
+          "sha256": "1dd3b35e5b607bb07b3cbe399fae687f432e7172bd91f15eb13bbf712069f67f"
+        }
+      ]
+    },
+    {
+      "id": "replay-layout-ok",
+      "kind": "layout",
+      "entries": [
+        {
+          "path": "input.txt",
+          "kind": "file",
+          "sha256": "3099b6c8cfec72b28f3150fc80c97025ae313d03dc9c72dc9a5556523b939456"
+        },
+        {
+          "path": "marker.txt",
+          "kind": "file",
+          "sha256": "1dd3b35e5b607bb07b3cbe399fae687f432e7172bd91f15eb13bbf712069f67f"
+        }
+      ]
+    },
+    {
+      "id": "workspace-reset",
+      "kind": "workspace-empty"
+    },
+    {
+      "id": "record-job-ok",
+      "kind": "job-completed",
+      "submit_action": "submit-smoke-job"
+    },
+    {
+      "id": "replay-job-ok",
+      "kind": "job-completed",
+      "submit_action": "submit-smoke-job"
+    }
+  ]
+}

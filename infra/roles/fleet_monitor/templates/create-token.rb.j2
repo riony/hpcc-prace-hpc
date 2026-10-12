@@ -1,0 +1,14 @@
+# Managed by Ansible (roles/fleet_monitor). Runs as the git user (gitlab-rails runner drops
+# privileges). Creates the monitor's project access token and writes it straight into a private
+# file; the token is never printed.
+path = "{{ fm_token_tmp }}/token"     # moved into place by root afterwards
+abort("token file exists") if File.exist?(path)
+project = Project.find_by_full_path("{{ fleet_monitor_project }}")
+owner = User.find_by_username("{{ fleet_monitor_owner }}")
+res = ResourceAccessTokens::CreateService.new(owner, project, {
+  name: "fleet-monitor", scopes: [:api], access_level: Gitlab::Access::REPORTER,
+  expires_at: Date.parse("{{ fleet_monitor_token_expires }}") }).execute
+abort("token creation failed: #{res.message}") unless res.success?
+File.open(path, File::WRONLY | File::CREAT | File::EXCL, 0o600) { |f| f.write(res.payload[:access_token].token) }
+bot = res.payload[:access_token].user
+puts "fleet-monitor token created for bot user #{bot.username}, expires #{res.payload[:access_token].expires_at}"

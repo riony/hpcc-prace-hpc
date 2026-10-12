@@ -1,0 +1,52 @@
+# Managed by Ansible (roles/beegfs, tasks/netguard.yml). Loaded by {{ beegfs_netguard_unit }}.service;
+# touches only its own table (firewalld, K3s and prace_rehearsal keep theirs). A drop in any table is
+# final, whatever another table accepts: the trusted zone still admits the pod networks (roles/k3s),
+# and this table removes the BeeGFS ports from what they reach.
+#
+# Why: BeeMsg authenticates a connection with one fixed 64-bit value derived from the shared secret,
+# sent in clear (8.4.1 AuthenticateChannelMsg, HashTk::authHash), and the services parse what any
+# peer that reaches the ports sends. Only the hosts' own BeeGFS services, the kernel client and root's
+# CLI may talk to these ports; a job (pod or native) reaches /scratch only through the kernel client.
+#   - input: pods (local delivery keeps the pod source address), other networks and IPv6 never
+#     reach a BeeGFS port;
+#   - forward: a pod's packet to another host still carries its pod source here (flannel masquerades
+#     it later, in postrouting), so it is dropped on the pod's own host;
+#   - output: only root's sockets open BeeGFS connections. Packets without a socket (the kernel
+#     client's own sockets, VXLAN encapsulation) cannot match a skuid test and pass: never write
+#     this as an accept selector (28 Sep, evidence/2026-09-28/rehearsal-egress-incident).
+table inet prace_beegfs
+delete table inet prace_beegfs
+table inet prace_beegfs {
+  set tcp_ports {
+    type inet_service
+    elements = { {{ bg_netguard_tcp | join(', ') }} }
+  }
+  set udp_ports {
+    type inet_service
+    elements = { {{ bg_netguard_udp | join(', ') }} }
+  }
+  set pods {
+    type ipv4_addr
+    flags interval
+    elements = { {{ beegfs_pod_networks | join(', ') }} }
+  }
+  chain input {
+    type filter hook input priority filter - 10; policy accept;
+    ip saddr @pods tcp dport @tcp_ports counter drop
+    ip saddr @pods udp dport @udp_ports counter drop
+    ip saddr != {{ admin_network }} tcp dport @tcp_ports counter drop
+    ip saddr != {{ admin_network }} udp dport @udp_ports counter drop
+    meta nfproto ipv6 tcp dport @tcp_ports counter drop
+    meta nfproto ipv6 udp dport @udp_ports counter drop
+  }
+  chain forward {
+    type filter hook forward priority filter - 10; policy accept;
+    ip saddr @pods tcp dport @tcp_ports counter drop
+    ip saddr @pods udp dport @udp_ports counter drop
+  }
+  chain output {
+    type filter hook output priority filter - 10; policy accept;
+    tcp dport @tcp_ports meta skuid != 0 counter drop
+    udp dport @udp_ports meta skuid != 0 counter drop
+  }
+}

@@ -1,0 +1,182 @@
+---
+# host_base: packages, time sync (approved NTP), timezone, firewall policy, SELinux enforcing.
+# Network qualification (192.0.2.205 trials) is NOT in this role; it is an
+# interactive, evidence-gathering step recorded before it is codified.
+#
+# Optional host/group vars:
+#   host_base_offline   true on gateway-less private nodes: no repository is
+#                       reachable, so the package task only VERIFIES presence
+#                       (all repos disabled) and fails if anything is missing.
+#                       Stage missing RPMs first (see docs/history/LENOVO-POSTINSTALL-PREP.md).
+#   chrony_servers      explicit NTP servers (rendered as `server`), e.g. the
+#                       .205 bastion 10.88.0.1 for private nodes. When unset,
+#                       ntp_servers (rendered as `pool`, default sg.pool.ntp.org).
+#   chrony_server_opts  extra options appended to each `server` line.
+#   chrony_allow        CIDRs this host serves NTP to (rendered as `allow`).
+#   chrony_allow_zone   firewalld zone in which the ntp service is opened for them.
+#   host_base_fw_zone   admin zone whose service list is pinned (default public).
+#   host_base_fw_services exact service list for that zone (default [ssh]); e.g. the
+#                       GitLab VM uses [ssh, https]. Anything else is removed/asserted absent.
+- name: Install baseline packages (before services that need them)
+  ansible.builtin.dnf:
+    name:
+      - openssh-server
+      - chrony
+      - firewalld
+      - python3-firewall        # firewalld module dependency
+      - python3-libselinux      # selinux module dependency
+      - ethtool
+      - tmux
+      - git
+      - python3
+      - tar                    # GNU metadata-capable recovery archives
+      - gzip                   # required by tar --gzip for capture and extraction
+    state: present
+    disablerepo: "{{ '*' if host_base_offline | default(false) else omit }}"
+  tags: packages
+
+# A gateway-less node cannot refresh repo metadata; the stock timer then logs
+# "Failed to start dnf makecache" every few hours and buries real errors.
+- name: Disable dnf-makecache on offline nodes (no repository is reachable)
+  ansible.builtin.systemd:
+    name: dnf-makecache.timer
+    state: stopped
+    enabled: false
+  when: host_base_offline | default(false)
+
+- name: Set timezone
+  ansible.builtin.command: timedatectl set-timezone {{ timezone | default('Asia/Singapore') }}
+  changed_when: false
+
+- name: Configure chrony (approved lab time sources; falls back to public SG pool)
+  ansible.builtin.copy:
+    dest: /etc/chrony.conf
+    mode: "0644"
+    content: |
+      # Managed by Ansible host_base. Institutional NTP pending (T37).
+      {% if chrony_servers is defined %}
+      {% for s in chrony_servers %}
+      server {{ s }} iburst{{ (' ' ~ chrony_server_opts) if chrony_server_opts is defined else '' }}
+      {% endfor %}
+      {% else %}
+      {% for s in ntp_servers | default(['sg.pool.ntp.org']) %}
+      pool {{ s }} iburst
+      {% endfor %}
+      {% endif %}
+      {% for n in chrony_allow | default([]) %}
+      allow {{ n }}
+      {% endfor %}
+      driftfile /var/lib/chrony/drift
+      makestep 1.0 3
+      rtcsync
+  notify: restart chronyd
+
+- name: Enable and start chronyd
+  ansible.builtin.systemd:
+    name: chronyd
+    state: started
+    enabled: true
+
+- name: Open NTP only in the zone facing the clients this host serves
+  ansible.posix.firewalld:
+    zone: "{{ chrony_allow_zone }}"
+    service: ntp
+    permanent: true
+    immediate: true
+    state: enabled
+  when: chrony_allow | default([]) | length > 0
+
+- name: Enable and start sshd
+  ansible.builtin.systemd:
+    name: sshd
+    state: started
+    enabled: true
+
+# sshd includes the drop-ins before the main file's own settings and keeps the FIRST value it
+# reads, so this file decides. The whole configuration is validated before sshd is reloaded;
+# on any failure the file is removed again (reloading then applies the unchanged old policy).
+- name: Host SSH limited to administrators and service accounts
+  block:
+    - name: Write the host SSH access policy
+      ansible.builtin.copy:
+        dest: /etc/ssh/sshd_config.d/00-prace-host-access.conf
+        owner: root
+        group: root
+        mode: "0600"
+        content: |
+          # Managed by Ansible (roles/host_base). Cluster users log in to the Slinky login pod.
+          AllowUsers {{ host_ssh_allow_users | join(' ') }}
+      notify: reload sshd
+
+    - name: Validate the complete sshd configuration
+      ansible.builtin.command: /usr/sbin/sshd -t
+      changed_when: false
+      check_mode: false
+
+    - name: Read the effective AllowUsers list
+      ansible.builtin.command: /usr/sbin/sshd -T -C user=root,host=probe,addr=192.0.2.1
+      register: hb_sshd_eff
+      changed_when: false
+      check_mode: false
+
+    - name: Assert exactly the allowed accounts
+      ansible.builtin.assert:
+        that:
+          - >-
+            (hb_sshd_eff.stdout_lines | select('match', '^allowusers ') | map('regex_replace', '^allowusers ', '')
+            | list | sort) == (host_ssh_allow_users | sort)
+        fail_msg: "effective sshd AllowUsers differs from {{ host_ssh_allow_users }}"
+        quiet: true
+      when: not ansible_check_mode
+  rescue:
+    - name: Remove the host SSH access policy again
+      ansible.builtin.file:
+        path: /etc/ssh/sshd_config.d/00-prace-host-access.conf
+        state: absent
+
+    - name: Stop (the running sshd policy is unchanged)
+      ansible.builtin.fail:
+        msg: "host SSH access policy failed validation; the file was removed"
+
+- name: Remove default cockpit/dhcpv6-client from the admin zone
+  ansible.posix.firewalld:
+    zone: "{{ host_base_fw_zone | default('public') }}"
+    service: "{{ item }}"
+    permanent: true
+    immediate: true
+    state: disabled
+  loop:
+    - cockpit
+    - dhcpv6-client
+
+- name: Permit the admin zone's services
+  ansible.posix.firewalld:
+    zone: "{{ host_base_fw_zone | default('public') }}"
+    service: "{{ item }}"
+    permanent: true
+    immediate: true
+    state: enabled
+  loop: "{{ host_base_fw_services | default(['ssh']) }}"
+
+- name: Read the admin zone's effective services (runtime and permanent)
+  ansible.builtin.command: >-
+    firewall-cmd {{ item }} --zone={{ host_base_fw_zone | default('public') }} --list-services
+  loop: ["", "--permanent"]
+  register: hb_fw_services
+  changed_when: false
+  check_mode: false
+
+- name: Verify the admin zone allows exactly the listed services (runtime and permanent)
+  ansible.builtin.assert:
+    that: (item.stdout | trim).split() | sort == (host_base_fw_services | default(['ssh'])) | sort
+    fail_msg: "zone {{ host_base_fw_zone | default('public') }} {{ item.item or 'runtime' }} services are '{{ item.stdout }}', expected exactly {{ host_base_fw_services | default(['ssh']) | sort | join(' ') }}"
+    quiet: true
+  loop: "{{ hb_fw_services.results }}"
+  loop_control:
+    label: "{{ item.item or 'runtime' }}"
+  when: not ansible_check_mode
+
+- name: SELinux enforcing
+  ansible.builtin.selinux:
+    policy: targeted
+    state: enforcing

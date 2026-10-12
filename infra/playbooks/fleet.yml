@@ -1,0 +1,75 @@
+---
+# Fleet configuration for the final event cluster (docs/reference/FLEET-REBUILD-2026-09-28.md).
+# Roles are added here as T62-T67 land; each is proven in the virtual rehearsal first.
+#   infra/tools/run-ansible.sh -i inventories/fleet playbooks/fleet.yml -e fleet_armed=true --check
+#
+# Arming (no real host before Monday 28 Sep, user decision) is enforced three ways, so no
+# --limit/--tags/--skip-tags/--start-at-task combination can contact a host while disarmed:
+#  1. the fleet play's HOST PATTERN is empty unless -e fleet_armed=true (only extra vars can
+#     arm it; the inventory cannot);
+#  2. inside that play, facts are not gathered automatically: an always-tagged assertion
+#     runs first, then facts are gathered explicitly;
+#  3. a controller-side play gives the clear "Not armed" failure on ordinary runs.
+#
+# Slurm backend (D36/D37): Slinky on Kubernetes is the default: the shared baseline, then K3s
+# on every node and Slinky on the login node. The native munge/slurm roles are the fallback and
+# run only with -e fleet_slurm_backend=native (the virtual rehearsal uses it). Baseline only:
+# --tags net,repo,base,storage,accounts,quota,nfs. The job environment in /apps: --limit lab-dl380 --tags apps.
+- name: Arming gate (clear message)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: "Refuse unless explicitly armed"
+      ansible.builtin.assert:
+        that: fleet_armed | default(false) | bool
+        fail_msg: "Not armed: pass -e fleet_armed=true"
+        quiet: true
+      tags: [always]
+    - name: Known Slurm backend (a typo must not silently skip or deploy the native roles)
+      ansible.builtin.assert:
+        that: fleet_slurm_backend | default('slinky') in ['slinky', 'native']
+        fail_msg: "fleet_slurm_backend must be slinky (default) or native"
+        quiet: true
+      tags: [always]
+
+- name: Fleet baseline
+  hosts: "{{ 'fleet' if (fleet_armed | default(false) | bool) else 'fleet_not_armed_no_hosts' }}"
+  gather_facts: false
+  pre_tasks:
+    - name: Armed (checked again before any connection)
+      ansible.builtin.assert:
+        that: fleet_armed | default(false) | bool
+        fail_msg: "Not armed: pass -e fleet_armed=true"
+        quiet: true
+      tags: [always]
+    - name: Gather facts (only after the armed check)
+      ansible.builtin.setup:
+      tags: [always]
+    - name: Cluster lease (backup maintenance windows and acceptance runs)
+      ansible.builtin.include_tasks: tasks/cluster-lease-check.yml
+      tags: [always]
+    - name: Scheduler preflight before identity changes (roles/slinky; D40 revocation)
+      ansible.builtin.include_role:
+        name: slinky
+        tasks_from: preflight.yml
+        apply: {tags: [accounts, slinky]}
+      when: fleet_slurm_backend | default('slinky') == 'slinky'
+      tags: [accounts, slinky]
+  roles:
+    - {role: fleet_net, tags: [net]}
+    - {role: fleet_repo, tags: [repo]}           # login serves; the others use only it
+    - {role: host_base, tags: [base]}
+    - {role: login_storage, tags: [storage], when: "fleet_role == 'login' and storage_enable | default(true) | bool"}   # LVs for /home /projects /apps, quotas at mount, local admin homes (D39 storage)
+    - {role: cluster_accounts, tags: [accounts]}
+    - {role: storage_policy, tags: [quota], when: "fleet_role == 'login' and storage_enable | default(true) | bool"}   # project dirs, XFS project IDs, quotas
+    - {role: nfs_home, tags: [nfs]}
+    - {role: apps_env, tags: [apps], when: "fleet_role == 'login' or inventory_hostname in (slurm_native_workers | default([]))"}   # T88: GCC C++ tree, modulefiles, examples in /apps; a native worker's profile snippet
+    - {role: harness_helper, tags: [harness_helper, never], when: "fleet_role == 'login'"}   # explicit owned delivery of revision-pinned PRACE helpers in persistent /apps
+    - {role: apptainer, tags: [apptainer, never], when: "fleet_role == 'login' or inventory_hostname in (slurm_native_workers | default([]))"}   # deferred (D42): only with --tags apptainer, after --tags extra_repo and a running cluster (the probe's alpine archive): unprivileged Apptainer tree, module and probe image in /apps; a native worker's read-only checks
+    - {role: munge, tags: [munge], when: "fleet_slurm_backend | default('slinky') == 'native'"}
+    - {role: slurm, tags: [slurm], when: "fleet_slurm_backend | default('slinky') == 'native'"}
+    - {role: nvidia_gpu, tags: [gpu], when: "fleet_role == 'gpu'"}   # V100 driver R580 (proprietary DKMS), DCGM, container toolkit, CUDA 12.9 (D39)
+    - {role: k3s, tags: [k3s], when: "fleet_slurm_backend | default('slinky') == 'slinky'"}
+    - {role: slinky, tags: [slinky], when: "fleet_slurm_backend | default('slinky') == 'slinky'"}   # images on every node; the rest on the login node
+    - {role: fleet_observer, tags: [observer], when: "(fleet_role == 'login' or inventory_hostname in groups['compute']) and fleet_slurm_backend | default('slinky') == 'slinky'"}   # read-only observation for the off-node monitor/audit; a native worker's own (T89)

@@ -1,0 +1,30 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "permission": {
+    "*": "ask",
+    "bash": "deny",
+    "edit": "deny",
+    "write": "deny",
+    "task": "deny",
+    "prace_action": "allow",
+    "read": {
+      "*": "allow",
+      "*.env": "deny",
+      "*.pem": "deny",
+      "*id_rsa*": "deny",
+      "*id_ed25519*": "deny"
+    }
+  },
+  "agent": {
+    "prace-smoke": {
+      "mode": "primary",
+      "permission": {
+        "bash": "deny",
+        "edit": "deny",
+        "write": "deny",
+        "task": "deny",
+        "prace_action": "allow"
+      }
+    }
+  }
+}

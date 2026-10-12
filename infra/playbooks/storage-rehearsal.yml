@@ -1,0 +1,9 @@
+---
+# The fleet playbook against the storage rehearsal VMs only (tools/storage-rehearsal.sh): the
+# guard refuses any target that is not one of those VMs before fleet.yml contacts anything.
+#   tools/run-ansible.sh -i inventories/storage-rehearsal playbooks/storage-rehearsal.yml -e fleet_armed=true --tags ...
+- name: Refuse anything but the storage rehearsal VMs
+  ansible.builtin.import_playbook: storage-rehearsal-guard.yml
+
+- name: The fleet playbook, unchanged
+  ansible.builtin.import_playbook: fleet.yml

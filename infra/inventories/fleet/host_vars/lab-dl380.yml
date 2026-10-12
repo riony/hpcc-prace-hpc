@@ -1,0 +1,15 @@
+---
+# Login node: DL380 Gen10. Facts from evidence/2026-09-26/fleet-discovery (read-only, 26 Sep).
+ansible_host: 192.0.2.205        # campus address; the login node is the jump host itself
+ansible_ssh_common_args: '-o StrictHostKeyChecking=yes'
+fleet_role: login
+chassis_serial: EXSERIAL01
+bmc: {name: example-i009, address: 198.18.1.9, type: ilo5, tunnel_port: 18451, user: hpadmin, password_file: ~/.config/prace-lab/dl380-ilo-hpadmin.pw}
+os_disk: {kind: nvme, serial: EXNVME00000001, eui: eui.eeee0000000000000000000000000001}   # single disk, no RAID
+admin_ip: 10.90.10.1
+admin_mac: 02:00:00:00:00:01       # eno4 (331i port 4), today 10.88.0.1
+campus: {mac: 02:00:00:00:00:02, address: 192.0.2.205/24, gateway: 192.0.2.254}   # eno1
+fleet_network_protected: {eno1: 192.0.2.205/24, eno4: 10.90.10.1/25}
+fleet_disabled_links:
+  - {name: eno5, mac: '02:00:00:00:00:03', pci: '0000:5d:00.0'}
+  - {name: eno6, mac: '02:00:00:00:00:04', pci: '0000:5d:00.1'}

@@ -1,0 +1,151 @@
+---
+# Managed by Ansible (roles/apps_env). Login node: the GCC tree, the modulefiles and the examples in
+# /apps (T88). A native worker (slurm_native_workers, T89): only the profile snippet, since the pods'
+# ConfigMap does not reach the host. Nothing on any other node.
+- name: Shared software in /apps (login node)
+  when: fleet_role == 'login'
+  block:
+    - name: /apps deferred or storage off - nothing written
+      ansible.builtin.debug:
+        msg: "/apps is deferred or not declared (storage_defer/storage_enable): nothing written"
+      when: not apps_env_enabled | bool
+
+    - name: /apps is mounted from its LV (never written into the underlying directory)
+      ansible.builtin.shell: |
+        set -euo pipefail
+        p={{ apps_env_root }} want='{{ apps_env_device }}'
+        # findmnt exits 1 both for "not mounted" (silent) and on an error (a message)
+        r=0; src=$(findmnt -no SOURCE --mountpoint "$p" 2>&1) || r=$?
+        [ $r = 0 ] || { echo "refusing: $p is not mounted${src:+ ($src)}" >&2; exit 3; }
+        [ -z "$want" ] || [ "$src" = "$want" ] || { echo "refusing: $p is mounted from $src, not $want" >&2; exit 3; }
+        echo "$src"
+      args: {executable: /bin/bash}
+      changed_when: false
+      check_mode: false          # read-only
+      when: apps_env_enabled | bool
+
+    - name: The directories above the examples (read-only)
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop: ["{{ apps_env_root }}", "{{ apps_env_examples }}"]
+      register: apps_env_example_parents
+      when: apps_env_enabled | bool
+
+    - name: No group- or world-writable directory above the examples (reported, never changed here)
+      ansible.builtin.assert:
+        that: [item.stat.isdir, not item.stat.wgrp, not item.stat.woth]
+        fail_msg: >-
+          {{ item.item }} is mode {{ item.stat.mode | default('missing') }}: a group- or world-writable directory
+          above the examples lets others replace them. Correct it deliberately; this role does not change it.
+        quiet: true
+      loop: "{{ apps_env_example_parents.results }}"
+      loop_control: {label: "{{ item.item }}"}
+      # a first preview (--check) has no examples directory yet: Layout creates it 0755 when applied
+      when: apps_env_enabled | bool and item.stat.exists
+
+    - name: The directories above the examples are root's (reported, never changed here)
+      ansible.builtin.assert:
+        that: [item.stat.uid == 0]
+        fail_msg: "{{ item.item }} is owned by {{ item.stat.pw_name }}, not root: its owner could replace the examples."
+        quiet: true
+      loop: "{{ apps_env_example_parents.results }}"
+      loop_control: {label: "{{ item.item }}"}
+      when: apps_env_enabled | bool and item.stat.exists
+
+    - name: Layout (root-owned; the fleet mounts /apps read-only)
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+      loop:
+        - "{{ apps_env_sw }}"
+        - "{{ apps_env_sw }}/gcc"
+        - "{{ apps_env_sw }}/python/{{ apps_env_python.module }}/bin"
+        - "{{ apps_env_modulefiles }}/gcc"
+        - "{{ apps_env_modulefiles }}/cuda"
+        - "{{ apps_env_modulefiles }}/openmpi"
+        - "{{ apps_env_modulefiles }}/python"
+        - "{{ apps_env_examples }}"
+        - /var/lib/prace-apps
+      when: apps_env_enabled | bool
+
+    - name: The pinned GCC set (checksum manifest, on the login node's own disk)
+      ansible.builtin.copy:
+        dest: "/var/lib/prace-apps/gcc-{{ apps_env_gcc.version }}.sha256"
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          {% for r in apps_env_gcc.rpms %}
+          {{ r.sha256 }}  {{ r.file }}
+          {% endfor %}
+      when: apps_env_enabled | bool
+
+    # fails closed before writing anything: a missing or mismatched RPM, or an existing tree made from
+    # another set (files/prace-apps-unpack.sh)
+    - name: GCC {{ apps_env_gcc.version }} unpacked from the fleet repository (idempotent; never installed)
+      ansible.builtin.command:
+        argv: [bash, -s, --, "{{ apps_env_sw }}/gcc/{{ apps_env_gcc.version }}", "{{ apps_env_packages_dir }}",
+               "/var/lib/prace-apps/gcc-{{ apps_env_gcc.version }}.sha256"]
+        stdin: "{{ lookup('ansible.builtin.file', 'prace-apps-unpack.sh') }}"
+      register: apps_env_unpack
+      changed_when: "'unpacked' in apps_env_unpack.stdout_lines"
+      when: apps_env_enabled | bool and not ansible_check_mode
+
+    - name: python and python3 for module python/{{ apps_env_python.module }} (the image's own interpreter)
+      ansible.builtin.file:
+        path: "{{ apps_env_sw }}/python/{{ apps_env_python.module }}/bin/{{ item }}"
+        src: "{{ apps_env_python.bin }}"
+        state: link
+        force: true              # the image's interpreter, which this host need not have
+        owner: root
+        group: root
+      loop: [python, python3]
+      when: apps_env_enabled | bool
+
+    - name: Modulefiles (Lmod)
+      ansible.builtin.template:
+        src: "modulefiles/{{ item.name }}.lua.j2"
+        dest: "{{ apps_env_modulefiles }}/{{ item.name }}/{{ item.module }}.lua"
+        owner: root
+        group: root
+        mode: "0644"
+      loop:
+        - {name: gcc, module: "{{ apps_env_gcc.module }}"}
+        - {name: cuda, module: "{{ apps_env_cuda.module }}"}
+        - {name: openmpi, module: "{{ apps_env_openmpi.module }}"}
+        - {name: python, module: "{{ apps_env_python.module }}"}
+      loop_control: {label: "{{ item.name }}/{{ item.module }}"}
+      when: apps_env_enabled | bool
+
+    - name: Examples (each with its reviewed mode, never the checkout's)
+      ansible.builtin.copy:
+        src: "examples/{{ item.key }}"
+        dest: "{{ apps_env_examples }}/{{ item.key }}"
+        owner: root
+        group: root
+        mode: "{{ item.value }}"
+      loop: "{{ apps_env_example_files | dict2items }}"
+      loop_control: {label: "{{ item.key }} {{ item.value }}"}
+      when: apps_env_enabled | bool
+
+
+    - name: The two-node MPI example (TCP on the pod network)
+      ansible.builtin.template:
+        src: examples/mpi.sh.j2
+        dest: "{{ apps_env_examples }}/mpi.sh"
+        owner: root
+        group: root
+        mode: "0755"
+      when: apps_env_enabled | bool
+
+- name: Native worker - the profile snippet on the host (T89; the pods get it from the chart)
+  ansible.builtin.copy:
+    src: prace-apps-profile.sh
+    dest: "{{ apps_env_profile }}"
+    owner: root
+    group: root
+    mode: "0644"
+  when: inventory_hostname in (slurm_native_workers | default([]))

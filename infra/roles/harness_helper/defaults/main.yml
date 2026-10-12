@@ -1,0 +1,15 @@
+---
+# Explicit --tags harness_helper only. Shared /apps persists across LoginSet recreation.
+harness_helper_revision: ""
+harness_helper_apps: /apps
+harness_helper_device: "/dev/mapper/{{ storage_vg | default('hpe_vg') }}-apps"
+harness_helper_projects: /projects
+harness_helper_projects_device: "/dev/mapper/{{ storage_vg | default('hpe_vg') }}-projects"
+harness_helper_runs: "{{ harness_helper_projects }}/proj-ops/.prace-smoke/runs"
+harness_helper_owner: root
+harness_helper_group: root
+harness_helper_run_group: proj-ops
+harness_helper_files: [prace_file_ops_helper.py, file_discovery.py, slurm_smoke.py, researcher_workflow.py]
+# Separate bounded permission RPC; installing it does not prepare any fixture.
+harness_helper_permission_enabled: false
+harness_helper_permission_repair_enabled: false

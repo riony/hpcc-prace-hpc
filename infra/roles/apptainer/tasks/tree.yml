@@ -1,0 +1,155 @@
+---
+# Managed by Ansible (roles/apptainer). The login node's part after the mount check (tasks/main.yml):
+# the tree, its site layer, the probe image and the module, in that order.
+- name: Layout (root-owned; the fleet mounts /apps read-only)
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ apptainer_owner }}"
+    group: "{{ apptainer_group }}"
+    mode: "0755"
+  loop:
+    - "{{ apptainer_root }}/sw/apptainer"
+    - "{{ apptainer_modulefiles }}/apptainer"
+    - "{{ apptainer_images }}"
+    - "{{ apptainer_state_dir }}"
+
+- name: The pinned Apptainer set (checksum manifest, on the login node's own disk)
+  ansible.builtin.copy:
+    dest: "{{ apptainer_state_dir }}/apptainer-{{ apptainer_version }}.sha256"
+    owner: "{{ apptainer_owner }}"
+    group: "{{ apptainer_group }}"
+    mode: "0644"
+    content: |
+      {% for r in apptainer_rpms %}
+      {{ r.sha256 }}  {{ r.file }}
+      {% endfor %}
+
+# roles/apps_env's helper (T88): fails closed before writing anything on a missing or mismatched
+# RPM; a tree made from another set is refused, never replaced
+- name: Apptainer {{ apptainer_version }} unpacked from the fleet repository (idempotent; never installed)
+  ansible.builtin.command:
+    argv: [bash, -s, --, "{{ apptainer_tree }}", "{{ apptainer_packages_dir }}",
+           "{{ apptainer_state_dir }}/apptainer-{{ apptainer_version }}.sha256"]
+    stdin: "{{ lookup('ansible.builtin.file', role_path ~ '/../apps_env/files/prace-apps-unpack.sh') }}"
+  register: apptainer_unpack
+  changed_when: "'unpacked' in apptainer_unpack.stdout_lines"
+  when: not ansible_check_mode
+
+- name: The unpacked tree
+  ansible.builtin.stat:
+    path: "{{ apptainer_tree }}/usr/bin/apptainer"
+  register: apptainer_bin
+
+- name: Preview - the site layer, probe and module follow the unpack
+  ansible.builtin.debug:
+    msg: "preview: {{ apptainer_tree }} is not unpacked yet; its configuration, wrapper, probe image and module come after the unpack"
+  when: not apptainer_bin.stat.exists
+
+- name: Site layer directories (relocated configuration, session directory, wrapper)
+  ansible.builtin.file:
+    path: "{{ apptainer_tree }}/{{ item }}"
+    state: directory
+    owner: "{{ apptainer_owner }}"
+    group: "{{ apptainer_group }}"
+    mode: "0755"
+  loop: [prace/bin, usr/etc/apptainer, usr/etc/apptainer/seccomp-profiles, usr/var/lib/apptainer/mnt/session]
+  when: apptainer_bin.stat.exists
+
+- name: The helpers' wrapper (the tree's libraries for each program Apptainer starts)
+  ansible.builtin.template:
+    src: apptainer-libexec-wrapper.sh.j2
+    dest: "{{ apptainer_tree }}/usr/libexec/apptainer/bin/.wrapper"
+    owner: "{{ apptainer_owner }}"
+    group: "{{ apptainer_group }}"
+    mode: "0755"
+  when: apptainer_bin.stat.exists
+
+# idempotent and resumable; refuses on anything it does not recognise (files/prace-apptainer-layout.sh)
+- name: Each helper behind the wrapper (the program moves to usr/libexec/apptainer/libexec)
+  ansible.builtin.command:
+    argv: [bash, -s, --, "{{ apptainer_tree }}"]
+    stdin: "{{ lookup('ansible.builtin.file', 'prace-apptainer-layout.sh') }}"
+  register: apptainer_layout
+  changed_when: "'changed' in apptainer_layout.stdout_lines"
+  when: apptainer_bin.stat.exists and not ansible_check_mode
+
+- name: The RPM's configuration files, where the relocated Apptainer reads them
+  ansible.builtin.copy:
+    src: "{{ apptainer_tree }}/etc/apptainer/{{ item }}"
+    dest: "{{ apptainer_tree }}/usr/etc/apptainer/{{ item }}"
+    remote_src: true
+    owner: "{{ apptainer_owner }}"
+    group: "{{ apptainer_group }}"
+    mode: "0644"
+  loop: "{{ apptainer_conf_files }}"
+  when: apptainer_bin.stat.exists
+
+- name: The hardened apptainer.conf (safe defaults, not a boundary; templates/apptainer.conf.j2)
+  ansible.builtin.template:
+    src: apptainer.conf.j2
+    dest: "{{ apptainer_tree }}/usr/etc/apptainer/apptainer.conf"
+    owner: "{{ apptainer_owner }}"
+    group: "{{ apptainer_group }}"
+    mode: "0644"
+  when: apptainer_bin.stat.exists
+
+- name: The command, prace/bin/apptainer (the tree's libraries for Apptainer itself, not the user's shell)
+  ansible.builtin.template:
+    src: apptainer-wrapper.sh.j2
+    dest: "{{ apptainer_tree }}/prace/bin/apptainer"
+    owner: "{{ apptainer_owner }}"
+    group: "{{ apptainer_group }}"
+    mode: "0755"
+  when: apptainer_bin.stat.exists
+
+# job scripts and workflow engines that still call `singularity` (upstream's installer makes the same link)
+- name: singularity, the same command
+  ansible.builtin.file:
+    path: "{{ apptainer_tree }}/prace/bin/singularity"
+    src: apptainer
+    state: link
+    owner: "{{ apptainer_owner }}"
+    group: "{{ apptainer_group }}"
+  when: apptainer_bin.stat.exists
+
+- name: The acceptance probe image (once, from the pinned alpine archive; refused if it changed)
+  ansible.builtin.command:
+    argv: [bash, -s, --, "{{ apptainer_tree }}/prace/bin/apptainer", "{{ apptainer_probe_archive }}",
+           "{{ apptainer_probe_digest }}", "{{ apptainer_probe_image }}"]
+    stdin: "{{ lookup('ansible.builtin.file', 'prace-apptainer-probe.sh') }}"
+  register: apptainer_probe
+  changed_when: "'built' in apptainer_probe.stdout_lines"
+  when: apptainer_bin.stat.exists and not ansible_check_mode
+
+- name: No setuid or setgid file in the tree as offered (read-only; /apps is nosuid as well)
+  ansible.builtin.command:
+    argv: [find, "{{ apptainer_tree }}", -xdev, -perm, /6000, -print]
+  register: apptainer_suid
+  changed_when: false
+  check_mode: false
+  failed_when: apptainer_suid.rc != 0 or apptainer_suid.stdout | length > 0
+  when: apptainer_bin.stat.exists
+
+# /apps offers the module to every worker, native ones included: only after each native worker passed
+# its read-only checks in this same run (tasks/main.yml runs them first; a failed host leaves the play)
+- name: Every native worker is in this run and passed its checks
+  ansible.builtin.assert:
+    # each native worker's own result in this run: absent (not in --limit) or failed is not 0
+    that: >-
+      slurm_native_workers | default([]) | map('extract', hostvars, 'apptainer_native')
+      | selectattr('rc', 'defined') | selectattr('rc', 'equalto', 0) | list | length == slurm_native_workers | default([]) | length
+    fail_msg: >-
+      not offering apptainer/{{ apptainer_module }}: run with every native worker
+      ({{ slurm_native_workers | default([]) | join(', ') }}) in --limit, and fix what its check refused
+    quiet: true
+  when: apptainer_bin.stat.exists
+
+- name: Module apptainer/{{ apptainer_module }} (last, so it is offered only once everything above is in place)
+  ansible.builtin.template:
+    src: apptainer.lua.j2
+    dest: "{{ apptainer_modulefiles }}/apptainer/{{ apptainer_module }}.lua"
+    owner: "{{ apptainer_owner }}"
+    group: "{{ apptainer_group }}"
+    mode: "0644"
+  when: apptainer_bin.stat.exists

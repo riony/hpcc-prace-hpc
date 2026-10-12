@@ -1,0 +1,105 @@
+---
+# IPoIB on this node's ring ports of the stage: one NetworkManager connection per port, matched by
+# the port's PCI function, with the link's /30 address, in the ring's own firewalld zone.
+- name: Gated
+  ansible.builtin.include_tasks: gated.yml
+
+- name: IPoIB (a run started past the gates skips everything here)
+  when: ibf_gate_ok | bool
+  block:
+    - name: The ring's firewalld zone (DROP; ICMP only)
+      ansible.builtin.template:
+        src: prace-ring.xml.j2
+        dest: "{{ ib_fabric_root }}etc/firewalld/zones/{{ ib_fabric_zone }}.xml"
+        mode: "0644"
+      register: ibf_zone
+
+    - name: firewalld reads the zone (the nftables backend reloads only its own table)
+      ansible.builtin.command: firewall-cmd --reload
+      when: ibf_zone is changed and not ansible_check_mode
+
+    - name: Report (the IPoIB devices exist once ib_ipoib is loaded)
+      ansible.builtin.include_tasks: report.yml
+
+    - name: Each port's IPoIB device is proved to be that port (hardware address ends with its GUID)
+      ansible.builtin.assert:
+        that: >-
+          ibf_now.ports | selectattr('guid', 'equalto', item.guid) | selectattr('netdev_guid_ok', 'equalto', true)
+                        | list | length == 1
+        fail_msg: "{{ inventory_hostname }} {{ item.link }}: no IPoIB device proved for {{ item.guid }} ({{ ibf_now.ports | selectattr('guid', 'equalto', item.guid) | list }})"
+        quiet: true
+      loop: "{{ ibf_host.ports }}"
+      loop_control: {label: "{{ item.link }}"}
+      when: not ansible_check_mode
+
+    - name: NetworkManager manages each of them (D43's guard unmanages only its own fibre ports)
+      ansible.builtin.command:
+        argv: [nmcli, -g, GENERAL.STATE, device, show, "{{ (ibf_now.ports | selectattr('guid', 'equalto', item.guid) | first).netdev }}"]
+      register: ibf_nm_state
+      changed_when: false
+      failed_when: ibf_nm_state.rc != 0 or 'unmanaged' in ibf_nm_state.stdout
+      loop: "{{ ibf_host.ports }}"
+      loop_control: {label: "{{ item.link }}"}
+      when: not ansible_check_mode
+
+    - name: Each port's connection (keyfile, root only)
+      ansible.builtin.template:
+        src: prace-ring.nmconnection.j2
+        dest: "{{ ib_fabric_root }}etc/NetworkManager/system-connections/prace-ring-{{ item.link }}.nmconnection"
+        mode: "0600"
+      loop: "{{ ibf_host.ports }}"
+      loop_control: {label: "{{ item.link }}"}
+      register: ibf_nm
+
+    - name: NetworkManager reads each changed connection
+      ansible.builtin.command:
+        argv: [nmcli, connection, load, "{{ item.dest }}"]
+      loop: "{{ ibf_nm.results | selectattr('changed') | list }}"
+      loop_control: {label: "{{ item.item.link }}"}
+      when: not ansible_check_mode
+
+    - name: Wait until this node's ports of the stage are ACTIVE (their subnet managers have swept them)
+      ansible.builtin.script:
+        cmd: prace-ib-ports.py
+        executable: "{{ ib_fabric_helper_python }}"
+      register: ibf_wait
+      changed_when: false
+      until: >-
+        (ibf_wait.stdout | from_json).ports | selectattr('guid', 'in', ibf_host.ports | map(attribute='guid') | list)
+          | selectattr('state', 'equalto', 4) | list | length == ibf_host.ports | length
+      retries: "{{ ib_fabric_active_retries }}"
+      delay: "{{ ib_fabric_active_delay }}"
+      when: not ansible_check_mode
+
+    - name: Each connection up, unless it already holds exactly its address and did not change
+      ansible.builtin.command:
+        argv: [nmcli, connection, up, id, "prace-ring-{{ item.link }}"]
+      loop: "{{ ibf_host.ports }}"
+      loop_control: {label: "{{ item.link }}"}
+      when: >-
+        not ansible_check_mode and (
+          (ibf_nm.results | selectattr('item.link', 'equalto', item.link) | selectattr('changed') | list | length > 0)
+          or ((ibf_wait.stdout | from_json).ports | selectattr('guid', 'equalto', item.guid) | first).ipv4
+             != [item.ip ~ '/' ~ item.prefixlen])
+
+    - name: Report after
+      ansible.builtin.include_tasks: report.yml
+      when: not ansible_check_mode
+
+    - name: Each device holds its address, in the ring zone, with the planned mode and MTU
+      ansible.builtin.assert:
+        that:
+          - ibf_port.ipv4 == [item.ip ~ '/' ~ item.prefixlen]
+          - ibf_port.zone == ib_fabric_zone
+          - ibf_port.mode == ibf_plan.ipoib.mode
+          - ibf_port.mtu == ibf_plan.ipoib.mtu
+        fail_msg: >-
+          {{ inventory_hostname }} {{ item.link }}: {{ ibf_port.netdev }} holds {{ ibf_port.ipv4 }} in zone {{ ibf_port.zone }},
+          {{ ibf_port.mode }} MTU {{ ibf_port.mtu }}; planned {{ item.ip }}/{{ item.prefixlen }} in {{ ib_fabric_zone }},
+          {{ ibf_plan.ipoib.mode }} MTU {{ ibf_plan.ipoib.mtu }}
+        quiet: true
+      vars:
+        ibf_port: "{{ ibf_now.ports | selectattr('guid', 'equalto', item.guid) | first }}"
+      loop: "{{ ibf_host.ports }}"
+      loop_control: {label: "{{ item.link }}"}
+      when: not ansible_check_mode

@@ -1,0 +1,24 @@
+---
+# GPU node: XL270d Gen10, 8x V100 SXM2 32 GB. Facts from evidence/2026-09-26/fleet-discovery (read-only, 26 Sep).
+ansible_host: 10.90.10.13
+fleet_role: gpu
+chassis_serial: EXSERIAL03
+bmc: {name: lab-gpu-bmc, address: 198.18.0.126, type: ilo5, tunnel_port: 18449, user: hpadmin, password_file: ~/.config/prace-lab/g005-ilo-hpadmin.pw}   # fleet credential
+os_disk: {kind: scsi_wwn, wwn: 60050000b0c10242afbfcad3f5cafb3d}   # P408i-a RAID1, 447 GB
+nvme_serials: [EXNVME00000031, EXNVME00000032]             # 2x 1.6 TB -> BeeGFS /scratch targets
+nvme_euis: [eui.eeee0000000000000000000000000031, eui.eeee0000000000000000000000000032]   # same order; lsblk WWN, node facts 28 Sep (playbooks/beegfs-disk-wipe.yml)
+admin_ip: 10.90.10.13
+fleet_network_protected: {eno2: 10.90.10.13/25}
+fleet_disabled_links:
+  - {name: ens10f0np0, mac: '02:00:00:00:00:06', pci: '0000:88:00.0'}
+  - {name: ens10f1np1, mac: '02:00:00:00:00:07', pci: '0000:88:00.1'}
+admin_mac: ''   # not yet known: which port is cabled to the private switch (BMC has no link state)
+admin_mac_candidates: ['02:00:00:00:00:08', '02:00:00:00:00:09', '02:00:00:00:00:0a', '02:00:00:00:00:0b']   # 331i ports 1-4 from the BMC (26 Sep); installer picks the one where the login node answers
+# InfiniBand: slot 11 card OK; slot 12 ConnectX-5 in FLASH RECOVERY (15b3:020d) - excluded from the first milestone
+slurm_node: "CPUs=36 Boards=1 SocketsPerBoard=2 CoresPerSocket=18 ThreadsPerCore=1 RealMemory=768000"   # ASSUMED equal to g005; slurmd -C check verifies on Monday
+# InfiniBand ring ports, read 2 Oct (evidence/2026-10-02/ib-port-map): LinkUp/INIT at 100 Gb EDR,
+# no subnet manager. Keyed by port GUID and PCI address (mlx5_N names follow enumeration order).
+# Which node each port reaches is not yet proved: that read needs infiniband-diags (network.yml).
+ib_ring_ports:
+  - {guid: 'b883:03ff:ff6f:21a8', pci: '0000:39:00.0'}
+  - {guid: 'b883:03ff:ff6f:21a9', pci: '0000:39:00.1'}

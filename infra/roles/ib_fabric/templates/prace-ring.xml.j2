@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Managed by Ansible (roles/ib_fabric) -->
+<zone target="DROP">
+  <short>{{ ib_fabric_zone }}</short>
+  <description>InfiniBand ring IPoIB devices (roles/ib_fabric): ICMP only. RDMA traffic does not pass netfilter; RDMA tests exchange their connection data over the admin network.</description>
+  <protocol value="icmp"/>
+</zone>

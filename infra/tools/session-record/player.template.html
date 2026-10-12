@@ -1,0 +1,269 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PRACE Session Replay</title>
+<style>
+/* Layout: one reading column; the terminal is the stage (always dark, like a real terminal); the record of
+   what happened sits beside it as two plain lists, the user's own (T3) and Slurm's (T1). */
+:root{
+  --bg:#F6F7F9; --surface:#FFFFFF; --ink:#16181D; --muted:#5A6170; --hair:#DDE1E8; --accent:#0F6E5A;
+  --t3:#B4472F; --t1:#1F6F43; --chip:#EEF1F5;
+  --term-bg:#0E1116; --term-ink:#D8DEE9; --term-dim:#8A93A6; --term-bar:#171B22; --term-hair:#262C36;
+  --sans:"IBM Plex Sans",system-ui,-apple-system,"Segoe UI",Arial,sans-serif;
+  --mono:"JetBrains Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --bg:#0B0D11; --surface:#12151B; --ink:#E6E9EF; --muted:#9AA3B5; --hair:#252A34; --accent:#4CC2A3;
+    --t3:#F08A6E; --t1:#6BD49A; --chip:#1A1F28; color-scheme:dark;
+  }
+}
+:root[data-theme="dark"]{
+  --bg:#0B0D11; --surface:#12151B; --ink:#E6E9EF; --muted:#9AA3B5; --hair:#252A34; --accent:#4CC2A3;
+  --t3:#F08A6E; --t1:#6BD49A; --chip:#1A1F28; color-scheme:dark;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--sans);font-size:15px;line-height:1.55}
+.wrap{max-width:1180px;margin:0 auto;padding-inline:16px;padding-block:28px 48px}
+h1{font-size:28px;line-height:1.2;margin:0 0 8px;text-wrap:balance}
+h2{font-size:18px;margin:32px 0 10px;text-wrap:balance}
+.lede{max-width:72ch;color:var(--muted);margin:0}
+.facts{display:flex;flex-wrap:wrap;gap:8px;margin:16px 0 0;padding:0;list-style:none}
+.facts li{background:var(--chip);border:1px solid var(--hair);border-radius:6px;padding:4px 10px;font-size:13px}
+.facts b{font-weight:600}
+code,.mono{font-family:var(--mono);font-size:.88em}
+
+.stage{margin-top:24px;background:var(--term-bg);border:1px solid var(--term-hair);border-radius:10px;overflow:hidden}
+.tabs{display:flex;gap:2px;background:var(--term-bar);border-bottom:1px solid var(--term-hair);padding:6px 6px 0;flex-wrap:wrap}
+.tab{font:600 13px var(--sans);color:var(--term-dim);background:transparent;border:0;border-radius:6px 6px 0 0;padding:8px 14px;cursor:pointer}
+.tab[aria-selected="true"]{color:var(--term-ink);background:var(--term-bg)}
+.tab:focus-visible,.ctl:focus-visible,.cmd:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.screen{overflow-x:auto;padding:12px 14px}
+#term{width:max-content}
+.bar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:10px 14px;background:var(--term-bar);border-top:1px solid var(--term-hair);color:var(--term-ink);font-size:13px}
+.ctl{font:600 13px var(--sans);color:var(--term-ink);background:#232935;border:1px solid #333B48;border-radius:6px;padding:6px 12px;cursor:pointer}
+.ctl[aria-pressed="true"]{background:#2D5E52;border-color:#3E7C6C}
+#seek{flex:1 1 220px;min-width:160px;accent-color:#4CC2A3}
+.time{font-family:var(--mono);color:var(--term-dim);font-variant-numeric:tabular-nums;min-width:11ch;text-align:right}
+
+.grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:20px;margin-top:8px}
+@media (max-width:860px){.grid{grid-template-columns:1fr}}
+.panel{background:var(--surface);border:1px solid var(--hair);border-radius:10px;padding:14px 16px;min-width:0}
+.panel h3{margin:0 0 4px;font-size:15px}
+.trust{display:inline-block;font-size:11.5px;font-weight:600;letter-spacing:.02em;border-radius:999px;padding:1px 8px;margin-left:6px;vertical-align:1px}
+.trust.t3{color:var(--t3);border:1.5px dotted var(--t3)}
+.trust.t1{color:var(--t1);border:1.5px solid var(--t1)}
+.note{color:var(--muted);font-size:13px;margin:0 0 10px}
+.cmds{list-style:none;margin:0;padding:0;display:grid;gap:2px}
+.cmd{display:grid;grid-template-columns:5.5ch minmax(0,1fr);gap:10px;width:100%;text-align:left;background:none;border:0;border-radius:6px;padding:4px 6px;cursor:pointer;color:var(--ink);font:13px var(--mono)}
+.cmd:hover{background:var(--chip)}
+.cmd.on{background:var(--chip);box-shadow:inset 0 0 0 1px var(--accent)}
+.cmd .t{color:var(--muted);text-align:right;font-variant-numeric:tabular-nums}
+.cmd .c{overflow-wrap:anywhere}
+.tbl{overflow-x:auto}
+table{border-collapse:collapse;width:100%;font-size:13px;font-variant-numeric:tabular-nums}
+th{text-align:left;font-weight:600;color:var(--muted);font-size:12px;padding:6px 8px;border-bottom:1px solid var(--hair);white-space:nowrap}
+td{padding:6px 8px;border-bottom:1px solid var(--hair);white-space:nowrap}
+tr.pair td{border-bottom:2px solid var(--hair)}
+.ok{color:var(--t1);font-weight:600}
+.verdict{margin:12px 0 0;padding:10px 12px;border-radius:8px;background:var(--chip);border:1px solid var(--hair);font-size:14px}
+.how{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px;margin:0;padding:0;list-style:none}
+@media (max-width:860px){.how{grid-template-columns:1fr}}
+.how li{background:var(--surface);border:1px solid var(--hair);border-radius:10px;padding:12px 14px;font-size:14px;min-width:0}
+.how b{display:block;margin-bottom:2px}
+footer{margin-top:36px;color:var(--muted);font-size:12.5px;border-top:1px solid var(--hair);padding-top:12px}
+footer p{margin:4px 0;max-width:110ch}
+/* xterm.js 5.5 essentials (its stylesheet cannot load here) */
+.xterm{cursor:default;position:relative;user-select:none;-webkit-user-select:none}
+.xterm.focus,.xterm:focus{outline:none}
+.xterm .xterm-helpers{position:absolute;top:0;z-index:5}
+.xterm .xterm-helper-textarea{padding:0;border:0;margin:0;position:absolute;opacity:0;left:-9999em;top:0;width:0;height:0;z-index:-5;white-space:nowrap;overflow:hidden;resize:none}
+.xterm .composition-view{display:none;position:absolute;white-space:nowrap;z-index:1}
+.xterm .xterm-viewport{background-color:var(--term-bg);overflow-y:hidden;cursor:default;position:absolute;right:0;left:0;top:0;bottom:0}
+.xterm .xterm-screen{position:relative}
+.xterm .xterm-screen canvas{position:absolute;left:0;top:0}
+.xterm .xterm-scroll-area{visibility:hidden}
+.xterm-char-measure-element{display:inline-block;visibility:hidden;position:absolute;top:0;left:-9999em;line-height:normal}
+.xterm .xterm-accessibility:not(.debug),.xterm .xterm-message{position:absolute;left:0;top:0;bottom:0;right:0;z-index:10;color:transparent;pointer-events:none}
+.xterm .live-region{position:absolute;left:-9999px;width:1px;height:1px;overflow:hidden}
+.xterm-underline-1{text-decoration:underline}
+.xterm-strikethrough{text-decoration:line-through}
+.xterm-screen .xterm-decoration-container .xterm-decoration{z-index:6;position:absolute}
+@media (prefers-reduced-motion:reduce){*{scroll-behavior:auto!important}}
+</style>
+
+<div class="wrap">
+  <h1>A researcher's session on the PRACE twin, first person</h1>
+  <p class="lede">A synthetic researcher logs in from outside over Tailscale, builds and runs the CPU and GPU examples, then reads and shares the results. Everything on the screen was recorded on the user's side. The same commands were then rebuilt from the recording's keystrokes and replayed on the cluster as the same user. Slurm's own accounting of every job was read separately, where no user has a session.</p>
+  <ul class="facts">
+    <li><b>User</b> __ACTOR__ (synthetic researcher)</li>
+    <li><b>Recorded</b> __DATE__, __ORIG_SPAN__</li>
+    <li><b>Jobs</b> CPU node and GPU node (V100)</li>
+    <li><b>Replay</b> __VERDICT__</li>
+    <li><b>Not</b> a security scenario</li>
+  </ul>
+
+  <p class="note">These controls play recorded terminal output only. They do not connect to the cluster or submit jobs. The second tab records a separate execution against the existing environment; it is not a restore.</p>
+  <section class="stage" aria-label="Terminal replay">
+    <div class="tabs" role="tablist">
+      <button class="tab" role="tab" id="tab-original" aria-selected="true" data-k="original">Original recording</button>
+      <button class="tab" role="tab" id="tab-replay" aria-selected="false" data-k="replay">Cluster rerun recording</button>
+    </div>
+    <div class="screen"><div id="term" role="img" aria-label="The terminal as the user saw it"></div></div>
+    <div class="bar">
+      <button class="ctl" id="play">Play</button>
+      <button class="ctl" id="speed" title="Playback speed">1×</button>
+      <button class="ctl" id="idle" aria-pressed="true" title="Shorten pauses longer than 1.5 s">Skip idle</button>
+      <input id="seek" type="range" min="0" max="1000" value="0" aria-label="Position in the session">
+      <span class="time" id="time">0.0 / 0.0 s</span>
+    </div>
+  </section>
+
+  <div class="grid">
+    <div class="panel">
+      <h3>What the user typed <span class="trust t3">T3 actor-written</span></h3>
+      <p class="note" id="cmd-note">Rebuilt from the keystrokes of this recording. Select a line to jump there.</p>
+      <ul class="cmds" id="cmds"></ul>
+    </div>
+    <div class="panel">
+      <h3>What Slurm recorded <span class="trust t1">T1 independent</span></h3>
+      <p class="note">sacct in the controller pod, by job ID. Times in Singapore time.</p>
+      <div class="tbl"><table>
+        <thead><tr><th>Run</th><th>Job</th><th>Name</th><th>Partition</th><th>Node</th><th>CPUs/GPU</th><th>Submit</th><th>End</th><th>State</th><th>Exit</th></tr></thead>
+        <tbody id="acct"></tbody>
+      </table></div>
+      <p class="verdict" id="verdict"></p>
+    </div>
+  </div>
+
+  <h2>How this was captured</h2>
+  <ul class="how">
+    <li><b>On the user's side</b><code>script(1)</code> records the terminal: the output, the keystrokes and their timing. It is the user's own account (T3), shown here and on the dashboard as context.</li>
+    <li><b>Replay on the cluster</b>The typed commands are rebuilt from the keystrokes and typed again in a fresh login as the same user. Job IDs map in submission order (__MAP__).</li>
+    <li><b>Independent of the user</b>Slurm's accounting is read in the controller pod, where no user has a shell. Here a finding stands on T1, and the user's recording is the context around it. The dashboard's Scenarios tab shows the same run after its reviewed evidence is merged and deployed.</li>
+  </ul>
+
+  <footer>
+    <p>Evidence: <code>__EVIDENCE__</code>: the two recordings as asciicast, the typed commands, the accounting rows, the dashboard events and SHA256SUMS. The raw recordings stay private, because their headers carry the full ssh command.</p>
+    <p>Hostnames, accounts and the login pod's name are shown as recorded. The hosted dashboard shows the same run scrubbed.</p>
+  </footer>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xterm/5.5.0/xterm.js"></script>
+<script>
+const CASTS = __CASTS__;
+const ACCT = __ACCT__;
+const PAIRS = __PAIRS__;
+const COMPARISON = __COMPARISON__;
+(function () {
+  const IDLE = 1.5;
+  let key = 'original', term, data, playing = false, t = 0, pos = 0, speed = 1, skip = true, last = 0, raf = 0;
+  const $ = (id) => document.getElementById(id);
+
+  function prep(k) {                      // real times -> display times (pauses capped when skipping idle)
+    const c = CASTS[k], ev = c.events, adj = [];
+    let prev = 0, acc = 0;
+    for (const e of ev) { acc += skip ? Math.min(e[0] - prev, IDLE) : e[0] - prev; prev = e[0]; adj.push(acc); }
+    const toAdj = (real) => { let i = 0; while (i < ev.length && ev[i][0] < real) i++; return i < ev.length ? adj[i] : acc; };
+    return { ev, adj, dur: acc, toAdj, cmds: c.commands };
+  }
+  function fmt(s) { return s.toFixed(1); }
+  function show() {
+    $('time').textContent = fmt(t) + ' / ' + fmt(data.dur) + ' s';
+    $('seek').value = data.dur ? Math.round(1000 * t / data.dur) : 0;
+    let on = -1;
+    data.cmds.forEach((c, i) => { if (data.toAdj(c[0]) <= t + 0.05) on = i; });
+    document.querySelectorAll('.cmd').forEach((b, i) => b.classList.toggle('on', i === on));
+  }
+  function seek(target) {
+    t = Math.max(0, Math.min(target, data.dur));
+    term.reset();
+    let s = '';
+    pos = 0;
+    while (pos < data.ev.length && data.adj[pos] <= t) { s += data.ev[pos][2]; pos++; }
+    term.write(s);
+    show();
+  }
+  function frame(now) {
+    if (!playing) return;
+    t += (now - last) / 1000 * speed; last = now;
+    let s = '';
+    while (pos < data.ev.length && data.adj[pos] <= t) { s += data.ev[pos][2]; pos++; }
+    if (s) term.write(s);
+    if (t >= data.dur) { t = data.dur; setPlay(false); }
+    show();
+    if (playing) raf = requestAnimationFrame(frame);
+  }
+  function setPlay(on) {
+    if (on && t >= data.dur) seek(0);
+    playing = on;
+    $('play').textContent = on ? 'Pause' : 'Play';
+    if (on) { last = performance.now(); raf = requestAnimationFrame(frame); } else cancelAnimationFrame(raf);
+  }
+  function load(k) {
+    key = k; setPlay(false);
+    document.querySelectorAll('.tab').forEach((b) => b.setAttribute('aria-selected', String(b.dataset.k === k)));
+    data = prep(k);
+    const ul = $('cmds'); ul.textContent = '';
+    data.cmds.forEach((c) => {
+      const li = document.createElement('li'), b = document.createElement('button');
+      b.className = 'cmd'; b.type = 'button';
+      const tt = document.createElement('span'); tt.className = 't'; tt.textContent = fmt(c[0]);
+      const cc = document.createElement('span'); cc.className = 'c'; cc.textContent = c[1];
+      b.append(tt, cc);
+      b.addEventListener('click', () => { seek(data.toAdj(c[0]) + 0.01); });
+      li.append(b); ul.append(li);
+    });
+    $('cmd-note').textContent = k === 'original'
+      ? 'Rebuilt from the keystrokes of this recording. Select a line to jump there.'
+      : 'The same commands, typed again in a fresh login; job IDs mapped (' + PAIRS.map((p) => p[0] + ' → ' + p[1]).join(', ') + ').';
+    seek(0);
+  }
+
+  function rows() {
+    const tb = $('acct'), sgt = (s) => s ? new Date(s + 'Z').toLocaleTimeString('en-SG', { timeZone: 'Asia/Singapore', hour12: false }) : ': ';
+    const run = new Set(PAIRS.map((p) => p[1]));
+    ACCT.forEach((r, i) => {
+      const tr = document.createElement('tr');
+      if (i === PAIRS.length - 1 || i === ACCT.length - 1) tr.className = 'pair';
+      const gpu = /gres\/gpu=(\d+)/.exec(r.AllocTRES || '');
+      [run.has(r.JobID) ? 'replay' : 'recorded', r.JobID, r.JobName, r.Partition, r.NodeList,
+       r.AllocCPUS + (gpu ? ' / ' + gpu[1] : ''), sgt(r.Submit), sgt(r.End), r.State, r.ExitCode].forEach((v, j) => {
+        const td = document.createElement('td'); td.textContent = v;
+        if (j === 8 && v === 'COMPLETED') td.className = 'ok';
+        tr.append(td);
+      });
+      tb.append(tr);
+    });
+    $('verdict').textContent = COMPARISON.detail;
+
+  }
+
+  function start() {
+    term = new Terminal({ cols: 120, rows: 32, disableStdin: true, cursorBlink: false, convertEol: false, scrollback: 0,
+      fontFamily: '"JetBrains Mono", ui-monospace, Menlo, Consolas, monospace', fontSize: 12.5, lineHeight: 1.12,
+      theme: { background: '#0E1116', foreground: '#D8DEE9', cursor: '#D8DEE9', selectionBackground: '#2D5E52' } });
+    term.open($('term'));
+    $('play').addEventListener('click', () => setPlay(!playing));
+    $('speed').addEventListener('click', () => { speed = speed === 1 ? 2 : speed === 2 ? 4 : 1; $('speed').textContent = speed + '×'; });
+    $('idle').addEventListener('click', () => { skip = !skip; $('idle').setAttribute('aria-pressed', String(skip)); const r = t; const real = data.ev[Math.max(0, pos - 1)] ? data.ev[Math.max(0, pos - 1)][0] : 0; data = prep(key); seek(data.toAdj(real)); });
+    $('seek').addEventListener('input', (e) => { seek(data.dur * e.target.value / 1000); });
+    document.querySelectorAll('.tab').forEach((b) => b.addEventListener('click', () => load(b.dataset.k)));
+    rows();
+    load('original');
+  }
+  if (typeof Terminal === 'undefined') {
+    document.getElementById('term').textContent = 'The terminal emulator (xterm.js) did not load; the typed commands and the accounting below are complete.';
+    rows();
+    for (const id of ['play', 'speed', 'idle', 'seek']) $(id).disabled = true;
+    const ul = $('cmds');
+    CASTS.original.commands.forEach((c) => {
+      const li = document.createElement('li'); li.textContent = c[0].toFixed(1) + ' s  ' + c[1]; ul.append(li);
+    });
+  } else if (document.fonts && document.fonts.load) {
+    document.fonts.load('12.5px "JetBrains Mono"').then(start, start);
+  } else start();
+})();
+</script>
+</html>

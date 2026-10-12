@@ -1,0 +1,22 @@
+---
+# Included by tasks/nvme-wipe.yml before the first change and again before the whole-disk steps:
+# the plan's device names still belong to the confirmed NVMes (serial AND EUI). A rename since
+# the inspection fails the run inside its rescue (the node stays cordoned).
+- name: Serial and EUI of the plan's whole disks now
+  ansible.builtin.command:
+    argv: "{{ ['lsblk', '-J', '-d', '-o', 'PATH,SERIAL,WWN'] + nw_plan.whole_disks }}"
+  register: nw_ident
+  changed_when: false
+
+- name: Identity unchanged since the inspection
+  ansible.builtin.assert:
+    that:
+      - nw_now | map(attribute='serial') | map('trim') | list == [item.0.serial]
+      - nw_now | map(attribute='wwn') | map('lower') | list == [item.0.eui]
+    fail_msg: "{{ item.1 }} is no longer {{ item.0.serial }} ({{ item.0.eui }}): {{ nw_now | to_json }}"
+    quiet: true
+  loop: "{{ nw_plan.host_disks | zip(nw_plan.whole_disks) | list }}"
+  loop_control:
+    label: "{{ item.1 }} {{ item.0.serial }}"
+  vars:
+    nw_now: "{{ (nw_ident.stdout | from_json).blockdevices | selectattr('path', 'equalto', item.1) | list }}"

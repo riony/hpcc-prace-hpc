@@ -1,0 +1,150 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://prace-hpc.invalid/schemas/run-result-v1.schema.json",
+  "title": "PRACE-HPC run result v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "run_id",
+    "scenario",
+    "baseline_revision",
+    "patch_revision",
+    "scenario_sha256",
+    "trace_sha256",
+    "generated_at",
+    "counts",
+    "verdicts",
+    "cleanup"
+  ],
+  "properties": {
+    "schema": {
+      "const": "prace.run-result.v1"
+    },
+    "run_id": {
+      "$ref": "#/$defs/name"
+    },
+    "scenario": {
+      "$ref": "#/$defs/scenario"
+    },
+    "baseline_revision": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200
+    },
+    "patch_revision": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200
+    },
+    "scenario_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "trace_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "generated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "counts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "actions",
+        "observations",
+        "failed_actions",
+        "failed_observations"
+      ],
+      "properties": {
+        "actions": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "observations": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "failed_actions": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "failed_observations": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "verdicts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "baseline",
+        "patched",
+        "functional"
+      ],
+      "properties": {
+        "baseline": {
+          "$ref": "#/$defs/securityVerdict"
+        },
+        "patched": {
+          "$ref": "#/$defs/securityVerdict"
+        },
+        "functional": {
+          "enum": [
+            "pass",
+            "functional_regression",
+            "infrastructure_error",
+            "budget_exhausted",
+            "inconclusive"
+          ]
+        }
+      }
+    },
+    "cleanup": {
+      "enum": [
+        "complete",
+        "incomplete",
+        "error",
+        "inconclusive"
+      ]
+    }
+  },
+  "$defs": {
+    "name": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "scenario": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "version"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/name"
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "securityVerdict": {
+      "enum": [
+        "security_failure",
+        "security_blocked",
+        "infrastructure_error",
+        "budget_exhausted",
+        "inconclusive",
+        "not_applicable"
+      ]
+    }
+  }
+}

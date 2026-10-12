@@ -1,0 +1,5 @@
+---
+# Private-subnet traffic (cluster services: NFS, Slurm, NTP, package repository) is accepted
+# through the trusted zone by SOURCE, so no interface zone changes and nothing is reactivated.
+# The login node's campus port stays in public (ssh only, pinned by host_base).
+fleet_trusted_sources: ["{{ admin_network }}"]

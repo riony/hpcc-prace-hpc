@@ -1,0 +1,25 @@
+# Managed by Ansible (roles/ib_fabric). IPoIB on InfiniBand ring link {{ item.link }}: port {{ item.guid }}
+# at PCI {{ item.pci }}, peer {{ item.peer_host }} at {{ item.peer_ip }}. No gateway, no DNS, no IPv6.
+[connection]
+id=prace-ring-{{ item.link }}
+uuid={{ ('prace-ring-' ~ item.link ~ '-' ~ inventory_hostname) | to_uuid }}
+type=infiniband
+autoconnect=true
+zone={{ ib_fabric_zone }}
+
+[match]
+path=pci-{{ item.pci }}
+
+[infiniband]
+transport-mode={{ ibf_plan.ipoib.mode }}
+mtu={{ ibf_plan.ipoib.mtu }}
+
+[ipv4]
+method=manual
+address1={{ item.ip }}/{{ item.prefixlen }}
+never-default=true
+ignore-auto-dns=true
+may-fail=false
+
+[ipv6]
+method=disabled

@@ -1,0 +1,8 @@
+---
+# nvidia_gpu: the V100 GPU nodes' NVIDIA stack from the fleet repository (pinned versions in
+# roles/fleet_repo defaults: nvidia_gpu_packages, nvidia_build_packages, nvidia_kernel).
+nvidia_expected_gpus: 8
+nvidia_reboot_timeout: 1800
+# Never install these alternatives the resolver may offer: precompiled kernel modules built for
+# another kernel, CUDA forward-compatibility packages, NVIDIA's dnf plugin.
+nvidia_exclude: ["kmod-nvidia-5*", "cuda-compat*", "dnf-plugin-nvidia"]

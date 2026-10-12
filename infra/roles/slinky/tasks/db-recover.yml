@@ -1,0 +1,7 @@
+---
+- name: Restore database, persisted Secret and consumer consistency
+  ansible.builtin.command:
+    argv: [python3, '-c', "{{ lookup('ansible.builtin.file', role_path ~ '/files/prace-db-recover.py') }}"]
+    stdin: "{{ {'password_file': slinky_db_password_file, 'manifest': slinky_manifest_dir ~ '/prace-slinky-base.yaml', 'client_host': slinky_db_client_host} | to_json }}"
+  no_log: true
+  when: not ansible_check_mode

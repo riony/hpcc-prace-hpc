@@ -1,0 +1,43 @@
+name: Public validation
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  checks:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -r requirements-dev.txt
+      - run: python3 tools/bootstrap-tools.py
+      - run: echo "$HOME/.local/state/hpcc-prace-hpc-public/tools" >> "$GITHUB_PATH"
+      - run: bash tools/check.sh
+      - run: gitleaks git . --log-opts='--all --full-history' --redact=100 --no-banner
+  cpu-integration:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python3 tools/bootstrap-tools.py
+      - run: echo "$HOME/.local/state/hpcc-prace-hpc-public/tools" >> "$GITHUB_PATH"
+      - run: python3 demo/cluster.py up
+      - run: python3 demo/cluster.py test
+      - if: always()
+        run: |
+          if test -f "$HOME/.local/state/hpcc-prace-hpc-public/demo/owner.json"; then
+            python3 demo/cluster.py down
+          fi

@@ -1,0 +1,495 @@
+---
+# Managed by Ansible (roles/slinky). Login node part; runs after roles/k3s and tasks/images.yml.
+- name: Vendored charts match their pinned digests
+  ansible.builtin.assert:
+    that: lookup('ansible.builtin.pipe', 'sha256sum ' ~ role_path ~ '/files/' ~ item.name ~ '-' ~ slinky_chart_version ~ '.tgz').split()[0] == item.sha256
+    fail_msg: "files/{{ item.name }}-{{ slinky_chart_version }}.tgz does not match its pinned digest"
+    quiet: true
+  loop: "{{ slinky_charts }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: The maintenance overlay helper
+  ansible.builtin.include_tasks: maintenance-helper.yml
+
+- name: Persistent maintenance intent before any login-side change
+  ansible.builtin.include_tasks: maintenance.yml
+
+# --- accounting database: MariaDB on the login node, reached from the pod network only
+- name: MariaDB server
+  ansible.builtin.dnf:
+    name: mariadb-server
+    state: present
+
+- name: MariaDB listens on the private address only
+  ansible.builtin.copy:
+    dest: /etc/my.cnf.d/prace-slinky.cnf
+    mode: "0644"
+    content: |
+      # Managed by Ansible (roles/slinky): slurmdbd runs in a pod and connects over the pod network.
+      [mysqld]
+      bind-address={{ admin_ip }}
+  register: slinky_mycnf
+
+- name: MariaDB running
+  ansible.builtin.systemd:
+    name: mariadb
+    state: "{{ 'restarted' if slinky_mycnf.changed else 'started' }}"
+    enabled: true
+
+- name: Database password generated on this node (never printed or copied off it)
+  ansible.builtin.shell: umask 077; openssl rand -hex 24 > {{ slinky_db_password_file }}
+  args:
+    creates: "{{ slinky_db_password_file }}"
+
+- name: Read it into memory
+  ansible.builtin.slurp:
+    src: "{{ slinky_db_password_file }}"
+  register: slinky_pw
+  no_log: true
+
+# 3 Oct (window step 3): slurmdbd keeps the credential it started with. Changing the database user
+# first made every later sacctmgr fail until slurmdbd restarted (runbook DB-05). So: is this run
+# changing it? Then the accounting work that needs slurmdbd runs before the change, never after it.
+- name: Does this run change the accounting credential? (hashes of the file and of slurmdbd's Secret; none printed)
+  ansible.builtin.command:
+    argv: [bash, "-s", "--", "{{ slinky_db_password_file }}"]
+    stdin: "{{ lookup('ansible.builtin.file', role_path ~ '/files/prace-db-credential-change.sh') }}"
+  register: slinky_db_change
+  changed_when: false
+  check_mode: false          # read-only
+
+# --- native workers (slurm_native_workers, T89): a kind is all native or all pods (a NodeSet
+# DaemonSet would otherwise put a pod beside a native slurmd), and at most one kind is native
+# (the chart writes its NodeSet and partition lines as single keys)
+- name: Native workers are whole worker kinds
+  ansible.builtin.assert:
+    that:
+      - slurm_native_workers | default([]) | difference(groups['compute'] | default([])) | length == 0
+      - item_hosts | intersect(slurm_native_workers | default([])) | length in [0, item_hosts | length]
+    fail_msg: "{{ item }}: native {{ item_hosts | intersect(slurm_native_workers | default([])) }} of {{ item_hosts }}; list every host of a kind or none"
+    quiet: true
+  vars:
+    item_hosts: "{{ groups[item] | default([]) }}"
+  loop: "{{ slinky_nodesets }}"
+
+- name: At most one native worker kind
+  ansible.builtin.assert:
+    that: >-
+      slinky_nodesets | select('in', groups) | map('extract', groups)
+      | map('intersect', slurm_native_workers | default([])) | select | list | length <= 1
+    fail_msg: "native workers span several kinds; the chart writes one native NodeSet"
+    quiet: true
+
+# A worker entering or leaving slurm_native_workers changes its kind's NodeSet: every such worker
+# must be in this run and have finished its own side first (tasks/native-transition.yml).
+- name: Native transition guard (before the native list and the chart change)
+  ansible.builtin.include_tasks: native-transition.yml
+
+- name: Native workers and their addresses, for the worker check
+  block:
+    - ansible.builtin.file: {path: "{{ slinky_native_file | dirname }}", state: directory, mode: "0755"}
+    - ansible.builtin.copy:
+        dest: "{{ slinky_native_file }}"
+        mode: "0644"
+        content: |
+          # Managed by Ansible (roles/slinky): workers with a native slurmd, "name address"
+          {% for h in slurm_native_workers | default([]) %}
+          {{ h }} {{ hostvars[h].admin_ip }}
+          {% endfor %}
+
+# --- accounting policy first, on a running controller: the QoS and accounts that the new
+# configuration names (partition QoS, enforced associations, the -A filter) exist before it
+# applies. A fresh bootstrap has no controller yet and gets them after it starts (below).
+- name: Controller already running (none on a fresh bootstrap)
+  ansible.builtin.command: /usr/local/bin/k3s kubectl -n slurm exec statefulset/slurm-controller -c slurmctld -- scontrol ping
+  register: slinky_ping_before
+  changed_when: false
+  failed_when: false
+  check_mode: false          # read-only
+
+# A prior interrupted rotation can leave Secret/file/database/process credentials different.
+# Ping proves only the controller, not slurmdbd authentication. Never attempt policy mutation then.
+- name: Accounting connection is usable before any policy reconciliation
+  ansible.builtin.command: timeout 30 /usr/local/bin/k3s kubectl -n slurm exec slurm-controller-0 -c slurmctld -- sacctmgr -n list cluster
+  register: slinky_accounting_before
+  failed_when: false
+  changed_when: false
+  check_mode: false
+  when: slinky_ping_before.rc == 0 and 'UP' in slinky_ping_before.stdout
+
+- name: Refuse a pending credential recovery before changing accounting policy
+  ansible.builtin.assert:
+    that: slinky_accounting_before.rc == 0
+    fail_msg: "STOP: accounting is unavailable; retain the fence and both credentials. For an interrupted rotation use playbooks/slinky-db-recover.yml with the same owned closed intent, then DB-04/DB-05. Do not retry full convergence to repair credentials."
+  when: slinky_ping_before.rc == 0 and 'UP' in slinky_ping_before.stdout
+
+- name: Accounting policy before the new configuration
+  ansible.builtin.include_tasks: slurm-accounts.yml
+  when: slinky_ping_before.rc == 0 and 'UP' in slinky_ping_before.stdout
+
+# slurmctld refuses to start when a partition names a QoS the database lacks ("fatal: Partition
+# debug has an invalid qos", slurm bench 29 Sep). So a partition names its QoS only once the QoS
+# exists: on a fresh bootstrap (no controller, no QoS) the first manifest leaves it out, and the
+# manifest is written again after the accounting policy has created it (below).
+- name: QoS already in the accounting database
+  ansible.builtin.command: /usr/local/bin/k3s kubectl -n slurm exec slurm-controller-0 -c slurmctld -- sacctmgr -nP show qos format=Name
+  register: slinky_qos_before
+  changed_when: false
+  check_mode: false          # read-only
+  when: slinky_ping_before.rc == 0 and 'UP' in slinky_ping_before.stdout
+
+- name: Partitions name only existing QoS (a --check preview shows the final manifest)
+  ansible.builtin.set_fact:
+    slinky_known_qos: "{{ none if ansible_check_mode else (slinky_qos_before.stdout_lines if slinky_qos_before.stdout_lines is defined else []) }}"
+
+# The credential changes only now: the accounting work above used slurmdbd's current one. A fresh
+# bootstrap creates the user here, still before the Secret and the charts that start slurmdbd.
+- name: Accounting database and user for the pod network (SQL on stdin, not argv)
+  ansible.builtin.command: mysql
+  args:
+    stdin: |
+      CREATE DATABASE IF NOT EXISTS slurm_acct_db;
+      CREATE USER IF NOT EXISTS 'slurm'@'{{ slinky_db_client_host }}' IDENTIFIED BY '{{ slinky_pw.content | b64decode | trim }}';
+      ALTER USER 'slurm'@'{{ slinky_db_client_host }}' IDENTIFIED BY '{{ slinky_pw.content | b64decode | trim }}';
+      GRANT ALL ON slurm_acct_db.* TO 'slurm'@'{{ slinky_db_client_host }}';
+  changed_when: false
+  no_log: true
+
+- name: A credential change on a running cluster defers the accounting checks after it
+  ansible.builtin.set_fact:
+    slinky_db_rotating: "{{ slinky_db_change.stdout == 'changed' and slinky_ping_before.rc == 0 and 'UP' in slinky_ping_before.stdout }}"
+
+# --- manifests applied by K3s (namespaces, secret, identities, the three charts)
+- name: Namespaces, database secret and user identities (0600; the secret is not printed)
+  ansible.builtin.template:
+    src: prace-slinky-base.yaml.j2
+    dest: "{{ slinky_manifest_dir }}/prace-slinky-base.yaml"
+    owner: root
+    group: root
+    mode: "0600"
+  no_log: true
+
+- name: Home must be a required read-write static share
+  ansible.builtin.assert:
+    that:
+      - slinky_pod_shares | selectattr('name', 'equalto', 'home') | list | length == 1
+      - (slinky_pod_shares | selectattr('name', 'equalto', 'home') | first).path == '/home'
+      - (slinky_pod_shares | selectattr('name', 'equalto', 'home') | first).export == 'rw'
+      - "['nosuid', 'nodev', 'hard'] | difference(slinky_pod_mount_options) | length == 0"
+    quiet: true
+
+# --- shared storage in the pods (T87). The required shares are storage.yml's LVs that are not
+# in storage_defer. Before anything changes: each is exported to the fleet network, and only to
+# it, with its mode (files/prace-share-exports.sh); a failed query, a missing export or a wrong
+# rule stops the role here, so the pods keep their mounts. Then, before any login or slurmd pod
+# uses them, a probe pod on every node mounts the claims as those pods will
+# (files/prace-share-probe.sh). To converge before the storage cutover, list the shares in
+# storage_defer.
+- name: Required shares are exported to the fleet network only, with their mode (else stop here)
+  ansible.builtin.command:
+    argv: "{{ ['bash', '-s', '--', admin_network] + slinky_share_modes }}"
+    stdin: "{{ lookup('ansible.builtin.file', role_path ~ '/files/prace-share-exports.sh') }}"
+  changed_when: false
+  check_mode: false          # read-only
+  when: slinky_pod_shares | length > 0
+
+- name: The shares as static NFS volumes and claims (the hosts' mount options)
+  ansible.builtin.template:
+    src: prace-slinky-shares.yaml.j2
+    dest: "{{ slinky_manifest_dir }}/prace-slinky-shares.yaml"
+    owner: root
+    group: root
+    mode: "0600"
+
+- name: Every node mounts the shares as its pods will (a probe pod per node) before any pod uses them
+  ansible.builtin.command:
+    argv: "{{ ['bash', '-s', '--', admin_ip, slinky_images.alpine.repository ~ '@' ~ slinky_images.alpine.digest] + slinky_share_probe_specs }}"
+    stdin: "{{ lookup('ansible.builtin.file', role_path ~ '/files/prace-share-probe.sh') }}"
+  environment:
+    # the containers' own share check: each probe pod runs it, and a control pod must be refused by it
+    PRACE_SHARE_CHECK: "{{ lookup('ansible.builtin.file', role_path ~ '/files/prace-share-check.sh') }}"
+  changed_when: false
+  when: slinky_pod_shares | length > 0 and not ansible_check_mode
+
+# --- T89 bridge: a native topology change (slinky_native_changing, against the deployed chart) never
+# lets Helm or the operator see a chart and an overlay that disagree about a kind (a pod NodeSet
+# partition beside a native partition line is a duplicate cpu partition; a native line without a
+# state is open). Inside the window the chart itself carries the closed state
+# (templates/prace-slinky-charts.yaml.j2), and each chart step waits until the API holds it and K3s's
+# Helm controller has read it with the current overlay (charts-applied.yml):
+#   1. the deployed chart again (slinky_native_deployed), now fenced by the window;
+#   2. the overlay without a native line for any changing kind;
+#   3a. the changing kind parked: NodeSet off and no native lines; wait until Slurm has no partition
+#       of that kind and its NodeSet object is gone (one Helm upgrade never both deletes a NodeSet and
+#       adds the native lines, or the reverse);
+#   3b. the new chart (fenced), then
+#   4. the overlay for the new list (before the final chart pass, below).
+# Every chart/overlay pair Helm can render on the way has one partition per name, all INACTIVE, and no
+# login replica (test-slinky-render.py, the bridge test). Without a change 1, 3a and the waits are
+# skipped and 2 is the ordinary revalidation. A rerun after an interruption starts from the chart
+# actually deployed, wherever it stopped.
+- name: Native transition bridge 1 - the deployed chart again, fenced by the window
+  when: slinky_native_changing | default(false) and not ansible_check_mode
+  vars:
+    slinky_chart_native_workers: "{{ slinky_native_deployed }}"
+  ansible.builtin.include_tasks: charts-applied.yml
+
+- name: Revalidate the persistent admission overlay before chart reconciliation (bridge 2)
+  ansible.builtin.include_tasks: maintenance.yml
+  vars:
+    slinky_overlay_native_workers: "{{ slinky_native_deployed | intersect(slurm_native_workers | default([])) }}"
+
+- name: Native transition bridge 3a - the changing kind parked (NodeSet off, no native lines)
+  when: slinky_native_changing | default(false) and not ansible_check_mode
+  vars:
+    slinky_chart_native_workers: "{{ slinky_native_deployed | intersect(slurm_native_workers | default([])) }}"
+    slinky_chart_parked_workers: "{{ slinky_native_deployed | symmetric_difference(slurm_native_workers | default([])) }}"
+  block:
+    - name: Native transition bridge 3a - the parked chart
+      ansible.builtin.include_tasks: charts-applied.yml
+    - name: Native transition bridge 3a - Slurm has no partition and no NodeSet of the changing kind
+      ansible.builtin.command:
+        argv:
+          - bash
+          - -c
+          - |
+            set -o pipefail
+            # a failed query is never "gone": the wait goes on
+            parts=$({{ slinky_kubectl }} -n slurm exec slurm-controller-0 -c slurmctld -- scontrol show partition -o) || exit 1
+            {% for kind in slinky_nodesets if groups[kind] | default([]) | intersect(slinky_chart_parked_workers) | length > 0 %}
+            grep -q '^PartitionName={{ kind }} ' <<<"$parts" && exit 1
+            sets=$({{ slinky_kubectl }} -n slurm get nodeset slurm-worker-{{ kind }} -o name --ignore-not-found) || exit 1
+            [ -z "$sets" ] || exit 1
+            {% endfor %}
+            exit 0
+      register: slinky_bridge_parked
+      until: slinky_bridge_parked.rc == 0
+      retries: "{{ slinky_charts_wait_retries | default(40) }}"
+      delay: "{{ slinky_charts_wait_delay | default(3) }}"
+      changed_when: false
+
+# K3s suspends a running Helm job when a chart's values change, and an interrupted upgrade ends in
+# a reinstall under the default failure policy (1 Oct: a new LoginSet and new auth keys). So the
+# chart is written only while no Helm job for slurm runs and its release is deployed, and the
+# role then waits for the release to settle with the LoginSet, controller and auth keys unchanged.
+- name: No Helm job for slurm is running and its release is deployed (never write over a running upgrade)
+  ansible.builtin.command:
+    argv: ['/usr/bin/python3', '-c', "{{ lookup('ansible.builtin.file', role_path ~ '/files/prace-slinky-maintenance.py') }}", '--helm-idle']
+  register: slinky_helm_before
+  changed_when: false
+  check_mode: false          # read-only
+
+- name: The charts as K3s HelmChart objects (chart content from git, values pinned)
+  ansible.builtin.template:
+    src: prace-slinky-charts.yaml.j2
+    dest: "{{ slinky_manifest_dir }}/prace-slinky-charts.yaml"
+    owner: root
+    group: root
+    mode: "0600"
+  register: slinky_charts_manifest
+
+# The release must carry the slurm chart's values just written (merged with the overlay in the API),
+# not merely be idle: until K3s starts its job the old release is idle too (Session A's !73 check).
+- name: The slurm chart values just written (from the same template)
+  ansible.builtin.include_tasks: chart-values.yml
+  when: slinky_charts_manifest is changed and not ansible_check_mode
+
+- name: The release settled with those values, without replacing the LoginSet, controller or auth keys
+  ansible.builtin.command:
+    argv: ['/usr/bin/python3', '-c', "{{ lookup('ansible.builtin.file', role_path ~ '/files/prace-slinky-maintenance.py') }}", '--helm-settle']
+    stdin: "{{ {'before': slinky_helm_before.stdout | from_json, 'values': slinky_chart_values} | to_json }}"
+  changed_when: false
+  when: slinky_charts_manifest is changed and not ansible_check_mode
+
+- name: Native transition bridge 3b - the new chart is in the API and read with the overlay before the overlay follows it
+  when: slinky_native_changing | default(false) and not ansible_check_mode
+  ansible.builtin.include_tasks: charts-applied.yml
+  vars:
+    slinky_charts_written: true
+
+# T87 (3 Oct): the chart gives the login and slurmd containers the share check as their command; the
+# operator must carry it into the pods (verified here, not assumed), or a pod would start without it.
+- name: Verify the exact share wrapper and worker coverage
+  ansible.builtin.include_tasks: share-pods.yml
+  when: slinky_pod_shares | length > 0 and not ansible_check_mode
+
+# --- acceptance: operator, controller and one registered node per compute host
+- name: Operator ready
+  ansible.builtin.command: /usr/local/bin/k3s kubectl -n slinky rollout status deployment/slurm-operator --timeout=30s
+  register: slinky_op
+  until: slinky_op.rc == 0
+  retries: 20
+  delay: 15
+  changed_when: false
+  check_mode: false          # read-only
+
+- name: Controller answers (scontrol ping inside the controller pod)
+  ansible.builtin.command: /usr/local/bin/k3s kubectl -n slurm exec statefulset/slurm-controller -c slurmctld -- scontrol ping
+  register: slinky_ping
+  until: slinky_ping.rc == 0 and 'UP' in slinky_ping.stdout
+  retries: 30
+  delay: 15
+  changed_when: false
+  check_mode: false          # read-only
+
+# --- accounting policy again: a fresh bootstrap's first run, and anything the new configuration
+# needs that the first pass could not see
+- name: Accounting policy on the running controller
+  ansible.builtin.include_tasks: slurm-accounts.yml
+  when: not ansible_check_mode and not (slinky_db_rotating | default(false) | bool)
+
+- name: The credential changed in this run; slurmdbd uses the old one until it restarts
+  ansible.builtin.debug:
+    msg: >-
+      The accounting credential changed in this run. slurmdbd keeps the old one until its pod restarts
+      (runbook DB-05), so sacctmgr is not run after the change; the accounting policy was reconciled
+      before it. Converge again after DB-05: it checks the policy with the new credential.
+  when: not ansible_check_mode and (slinky_db_rotating | default(false) | bool)
+
+- name: Every QoS now exists; partitions may name theirs
+  ansible.builtin.set_fact:
+    slinky_known_qos: null
+  when: not ansible_check_mode
+
+- name: Revalidate the persistent admission overlay before the final chart reconciliation (bridge 4)
+  ansible.builtin.include_tasks: maintenance.yml
+  vars:
+    slinky_overlay_native_workers: "{{ slurm_native_workers | default([]) }}"
+
+- name: No Helm job for slurm is running before the second chart write (never write over a running upgrade)
+  ansible.builtin.command:
+    argv: ['/usr/bin/python3', '-c', "{{ lookup('ansible.builtin.file', role_path ~ '/files/prace-slinky-maintenance.py') }}", '--helm-idle']
+  register: slinky_helm_before_qos
+  changed_when: false
+  when: not ansible_check_mode
+
+- name: The charts again, now with the partition QoS (changes only after a fresh bootstrap)
+  ansible.builtin.template:
+    src: prace-slinky-charts.yaml.j2
+    dest: "{{ slinky_manifest_dir }}/prace-slinky-charts.yaml"
+    owner: root
+    group: root
+    mode: "0600"
+  register: slinky_charts_manifest_qos
+  when: not ansible_check_mode
+
+- name: The slurm chart values of the second write (the same template, the partition QoS now in)
+  ansible.builtin.include_tasks: chart-values.yml
+  when: slinky_charts_manifest_qos is changed
+
+- name: The release settled with those values after the second chart write, LoginSet, controller and auth keys unchanged
+  ansible.builtin.command:
+    argv: ['/usr/bin/python3', '-c', "{{ lookup('ansible.builtin.file', role_path ~ '/files/prace-slinky-maintenance.py') }}", '--helm-settle']
+    stdin: "{{ {'before': slinky_helm_before_qos.stdout | from_json, 'values': slinky_chart_values} | to_json }}"
+  changed_when: false
+  when: slinky_charts_manifest_qos is changed
+
+- name: The controller runs the policy configuration (the operator applies it asynchronously)
+  ansible.builtin.shell: |
+    set -o pipefail
+    S="/usr/local/bin/k3s kubectl -n slurm exec slurm-controller-0 -c slurmctld --"
+    $S scontrol show config | sed -nE 's/^(AccountingStorageEnforce|EnforcePartLimits|JobSubmitPlugins) *= *(.*)$/\1=\2/p'
+    $S scontrol show partition -o | sed -nE 's/^PartitionName=([^ ]+) .*QoS=([^ ]+) .*$/partition \1 qos=\2/p'
+  register: slinky_policy_live
+  until: slinky_policy_live.rc == 0 and (slinky_policy_expected_live | difference(slinky_policy_live.stdout_lines) | length == 0)
+  retries: 20
+  delay: 15
+  changed_when: false
+  when: not ansible_check_mode
+
+# --- recovery: NodeSet watchdog (the operator's retry backoff has no setting)
+- name: NodeSet watchdog script
+  ansible.builtin.copy:
+    src: prace-slinky-nudge.sh
+    dest: /usr/local/sbin/prace-slinky-nudge
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: NodeSet watchdog units (every minute)
+  ansible.builtin.copy:
+    dest: "/etc/systemd/system/{{ item.name }}"
+    owner: root
+    group: root
+    mode: "0644"
+    content: "{{ item.content }}"
+  loop:
+    - name: prace-slinky-nudge.service
+      content: |
+        # Managed by Ansible (roles/slinky)
+        [Unit]
+        Description=Nudge Slinky NodeSets whose slurmd pod is missing
+        After=k3s.service
+        [Service]
+        Type=oneshot
+        ExecStart=/usr/local/sbin/prace-slinky-nudge
+    - name: prace-slinky-nudge.timer
+      content: |
+        # Managed by Ansible (roles/slinky)
+        [Unit]
+        Description=Slinky NodeSet watchdog
+        [Timer]
+        OnBootSec=2min
+        OnUnitActiveSec=60s
+        AccuracySec=5s
+        [Install]
+        WantedBy=timers.target
+  loop_control: {label: "{{ item.name }}"}
+  register: slinky_nudge_units
+
+- name: NodeSet watchdog timer enabled
+  ansible.builtin.systemd:
+    name: prace-slinky-nudge.timer
+    enabled: true
+    state: started
+    daemon_reload: "{{ slinky_nudge_units.changed }}"
+
+# --- stale dynamic node records: a changed budget (CoreSpecCount/MemSpecLimit) makes Slurm
+# reject the re-registration (INVALID_REG, e.g. "CoreSpec differ"). The script repairs only that
+# case (capacity reason, NodeSet-owned, no jobs; diagnostics in /var/log/prace-slinky/) and
+# fails for any other invalid node, which needs diagnosis.
+- name: Wait until every slurmd pod has settled (all containers ready or restarting)
+  ansible.builtin.shell: |
+    set -o pipefail
+    /usr/local/bin/k3s kubectl -n slurm get pods -l app.kubernetes.io/name=slurmd --no-headers | awk '{split($2, r, "/"); if (r[1] != r[2]) print}' | wc -l
+  register: slinky_pending
+  until: slinky_pending.rc == 0 and slinky_pending.stdout == '0'
+  retries: 20
+  delay: 6
+  changed_when: false
+  failed_when: false
+  check_mode: false          # read-only
+
+- name: Re-register nodes whose dynamic record went stale after a budget change
+  ansible.builtin.command: /usr/local/sbin/prace-slinky-reregister
+  register: slinky_reregister
+  changed_when: "'re-registered' in slinky_reregister.stdout"
+
+# --- acceptance: the expected workers are usable. Expected = compute hosts in this run plus
+# every Kubernetes node labelled cpu/gpu; the query must succeed (an error is not "none").
+- name: Kubernetes worker nodes (query must succeed)
+  ansible.builtin.shell: |
+    set -o pipefail
+    /usr/local/bin/k3s kubectl get nodes -l 'prace.fleet/role in (cpu,gpu)' -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}'
+  register: slinky_k8s_workers
+  changed_when: false
+  check_mode: false          # read-only
+
+- name: Every expected worker is usable (fails closed)
+  ansible.builtin.command:
+    argv: "{{ ['/usr/local/sbin/prace-slinky-worker-check'] + slinky_expected }}"
+  vars:
+    # native workers are checked after tasks/native.yml has started their slurmd (worker-check.yml)
+    slinky_expected: >-
+      {{ (slinky_k8s_workers.stdout_lines + (ansible_play_hosts_all | intersect(groups['compute'] | default([]))))
+         | select | unique | difference(slurm_native_workers | default([])) | sort }}
+  register: slinky_workers
+  until: slinky_workers.rc == 0
+  retries: 30
+  delay: 15
+  changed_when: false
+  check_mode: false          # read-only
+  when: >-
+    (slinky_k8s_workers.stdout_lines + (ansible_play_hosts_all | intersect(groups['compute'] | default([]))))
+    | select | unique | difference(slurm_native_workers | default([])) | length > 0

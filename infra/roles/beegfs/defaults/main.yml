@@ -1,0 +1,355 @@
+---
+# roles/beegfs (Session A plan A4; DEFERRED until after the first scenario, D42). Draft for review,
+# not deployed. Identities, the qualification record and sizing live in
+# inventories/fleet/group_vars/all/beegfs.yml; the exact files (NEVRA, sha256) and the signing key
+# in roles/fleet_repo defaults (fleet_repo_beegfs_*); these defaults are mechanics. The only caller
+# is playbooks/beegfs.yml. TCP over the admin network only: no RDMA, no IB/IPoIB/ring or campus
+# address. Each 8.x behaviour relied on here is checked against the 8.4.1 sources, or marked for
+# live verification: agents/reviews/BEEGFS-DESIGN-CLOSURE-2026-10-05.md.
+
+# --- controller-private material: outside git, mode 0600, never logged. Generate once (see the
+# header of playbooks/beegfs.yml): a 128-byte random secret (doc 8.4 authentication.html) and,
+# with TLS on, the management's certificate and key (doc 8.4 tls.html).
+beegfs_private_dir: "{{ lookup('ansible.builtin.env', 'HOME') }}/.config/prace-lab/beegfs"
+beegfs_auth_secret_src: "{{ beegfs_private_dir }}/conn.auth"
+beegfs_tls_cert_src: "{{ beegfs_private_dir }}/mgmtd-cert.pem"
+beegfs_tls_key_src: "{{ beegfs_private_dir }}/mgmtd-key.pem"
+beegfs_auth_secret_min_bytes: 32
+
+# TLS: on, the documented default ("disabling is discouraged", tls.html). It covers at least the
+# beegfs CLI <-> management connection. Turning it off needs a recorded owner decision reference
+# (e.g. -e beegfs_tls_disable=true -e beegfs_tls_disable_decision=D44); the role refuses otherwise.
+beegfs_tls_disable: false
+beegfs_tls_disable_decision: ""
+
+# --- packages (8.4.1 metadata, evidence/2026-10-05/beegfs-pins). Each is installed as its pinned
+# NEVRA (roles/fleet_repo fleet_repo_beegfs_packages) from the BeeGFS repository only, and the
+# BeeGFS ones are version-locked by NEVRA. beegfs-utils (beegfs-fsck) is an admin tool: management
+# host only.
+beegfs_packages:
+  mgmtd: [beegfs-mgmtd, libbeegfs-license, beegfs-tools, beegfs-utils]
+  meta: [beegfs-meta]
+  storage: [beegfs-storage]
+  client: [beegfs-client, beegfs-tools]
+# Read-only NVMe health tools on the GPU hosts, installed before target preparation (prepare.yml
+# records each target's health before a first use).
+beegfs_host_tools: [nvme-cli, smartmontools]
+# Every name the role installs must be pinned (tasks/gates.yml).
+bg_required_pins: "{{ ((beegfs_packages.values() | flatten) + beegfs_host_tools + ['python3-dnf-plugin-versionlock']) | unique | sort }}"
+# RDMA support stays off until the ring is qualified (D42, D43): the role refuses a host that has it,
+# fleet_repo never carries it, and every service sets connUseRDMA = false as well.
+beegfs_refused_packages: [libbeegfs-ib]
+# The client module is built on the host at service start (beegfs-client requires gcc and make),
+# without RDMA (BEEGFS_NO_RDMA=1, beegfs-client-autobuild.conf 8.4.1), for the RUNNING kernel only
+# (the autobuild uses uname -r); client.yml also compiles it once for the next-boot kernel as a
+# check, so a kernel the client cannot build for fails now rather than as a missing /scratch after
+# the next reboot (Session B review S-6). Satisfied by what the host has or by pinned files only (bg_repo_opts): a host that lacks
+# part of the chain needs it pinned first (the qualification plan resolves each host's closure).
+beegfs_client_build_packages: [gcc, make, elfutils-libelf-devel]
+beegfs_client_build_args: "-j8 BEEGFS_NO_RDMA=1"
+beegfs_client_src: /opt/beegfs/src/client/client_module_8   # shipped by beegfs-client 8.4.1 (the compile check copies it)
+
+# --- ports (doc 8.4 advanced_topics/network_tuning.html). Not opened anywhere: the fleet already
+# accepts the admin network through the trusted zone (roles/fleet_net); tasks/firewall.yml proves
+# that and that no other zone exposes one of these.
+beegfs_ports:
+  mgmtd: [8008/tcp, 8008/udp, 8010/tcp]
+  meta: [8005/tcp, 8005/udp]
+  storage: [8003/tcp, 8003/udp]
+  client: [8004/tcp, 8004/udp]
+
+# --- paths on the hosts
+beegfs_conf_dir: /etc/beegfs
+beegfs_auth_file: /etc/beegfs/conn.auth                 # doc default for 8.x
+beegfs_tls_cert: /etc/beegfs/cert.pem                   # doc default (servers and the CLI)
+beegfs_tls_key: /etc/beegfs/key.pem                     # doc default; management host only
+beegfs_mgmtd_db: /var/lib/beegfs/mgmtd.sqlite           # = the 8.4.1 default db-file (beegfs-mgmtd.toml, config.rs)
+beegfs_iface_file: /etc/beegfs/prace-interfaces.conf     # connInterfacesFile: advertise the admin port only
+beegfs_netfilter_file: /etc/beegfs/prace-netfilter.conf  # connNetFilterFile: connect only into the admin network
+beegfs_tcponly_file: /etc/beegfs/prace-tcp-only.conf     # connTcpOnlyFilterFile: never RDMA there
+beegfs_server_root: /srv/beegfs                         # backing mounts: <root>/meta, <root>/t<target id>
+beegfs_marker: .prace-beegfs                             # identity marker at the root of each backing filesystem
+beegfs_scratch: /scratch
+beegfs_meta_lv: beegfs_meta
+beegfs_meta_vg: "{{ inventory_hostname.split('-') | last }}_vg"   # the GPU installers' VG (kickstart/build-ks.sh)
+beegfs_python: /usr/bin/python3
+beegfs_fstab: /etc/fstab
+beegfs_by_id_dir: /dev/disk/by-id
+beegfs_mgmtd_bin: /opt/beegfs/sbin/beegfs-mgmtd         # doc 8.4 quick_start_guide.html (--init)
+beegfs_grpc_port: 8010                                  # management gRPC (the beegfs CLI), network_tuning.html
+# The BeeGFS repository (roles/fleet_repo, tag beegfs_repo, serves it from the login node beside the
+# fleet repository). Every host gets it as a DISABLED repository; BeeGFS transactions enable it
+# alone, so only pinned files can enter one (and no other converge ever sees it).
+beegfs_repo_id: prace-beegfs
+beegfs_repo_file: /etc/yum.repos.d/prace-beegfs.repo
+# Host-side guard for the BeeGFS ports (tasks/netguard.yml): its own nftables table, loaded by its unit.
+beegfs_netguard_file: /etc/nftables/prace-beegfs.nft
+beegfs_netguard_unit: prace-beegfs-netguard
+beegfs_pod_networks: [10.42.0.0/16, 10.43.0.0/16]       # roles/k3s cluster and service CIDRs
+# The owned-window preflight (Slurm window contract): the same tool slinky-db-recover.yml and the
+# NRI step use. It needs -e @<intent> from `slurm-window.py intent` and checks the lease, the
+# closed fence and an empty queue on the login node, read-only.
+beegfs_window_check: ["{{ ansible_playbook_python }}", "{{ playbook_dir }}/../tools/require-closed-window.py"]
+
+# --- filesystems. ext4 for metadata exactly as the 8.4 metadata tuning page gives it
+# (-i 2048 -I 512 -J size=400 -O dir_index,filetype). XFS for the storage targets, whole disk.
+# mkfs never gets -f/-F. mkfs.xfs then refuses an existing signature by itself; mkfs.ext4 without a
+# terminal does NOT (e2fsprogs asks only on a TTY), so prepare.yml refuses any signature in the same
+# shell right before either mkfs (Session B review S-2).
+beegfs_meta_mkfs: [mkfs.ext4, -q, -I, "512", -i, "2048", -J, "size=400", -O, "dir_index,filetype"]
+beegfs_target_mkfs: [mkfs.xfs, -q]
+# nofail: a missing NVMe must not block boot; the services then refuse to start (guard drop-ins).
+beegfs_backing_mount_opts: "noatime,nodiratime,nodev,nosuid,noexec,nofail,x-systemd.device-timeout=30s"
+# /scratch root: 8.4.1 creates the filesystem root 0777 WITHOUT the sticky bit (meta App.cpp), so any
+# user could delete or rename everyone's entries. D-S default: 1777 root:root (as /tmp): every user
+# creates their own directories and cannot remove others'. Per-user/per-project directories
+# generated from the accounts data are the D-S alternative (owner decision).
+beegfs_scratch_root_mode: "1777"
+# /scratch client mount: column 3 of beegfs-mounts.conf is the option list (the 8.4.1 init script
+# appends it to cfgFile=...,_netdev[,fscontext=...]); the role checks nosuid,nodev took effect.
+beegfs_scratch_mount_opts: "rw,nosuid,nodev"
+
+# --- timings
+beegfs_service_settle_s: 10          # a started service must still be active after this long
+beegfs_first_run_wait_s: 30          # first start with storeAllowFirstRunInit=true, before switching it off
+# A started metadata/storage service must show its IDs Online and Good at the management within this
+# (an active unit is not health: a service whose registration was refused keeps running).
+beegfs_registration_retries: 12
+beegfs_registration_delay_s: 5
+
+# ---------------------------------------------------------------- derived (do not override)
+bg_mgmt_addr: "{{ hostvars[beegfs_mgmt_host].admin_ip }}"
+bg_meta_node: "{{ beegfs_meta_nodes | selectattr('host', 'equalto', inventory_hostname) | first | default(none) }}"
+bg_storage_node: "{{ beegfs_storage_nodes | selectattr('host', 'equalto', inventory_hostname) | first | default(none) }}"
+# This host's metadata item and storage targets as the prepare helper and the templates use them.
+bg_meta: >-
+  {{ none if bg_meta_node is none else
+     {'id': bg_meta_node.id, 'vg': beegfs_meta_vg, 'lv': beegfs_meta_lv, 'size_g': beegfs_meta_lv_size_g,
+      'reserve_g': beegfs_meta_vg_reserve_g, 'fstype': 'ext4', 'label': 'bgfs-md' ~ bg_meta_node.id,
+      'mount': beegfs_server_root ~ '/meta', 'store': beegfs_server_root ~ '/meta/beegfs_meta'} }}
+bg_targets: >-
+  {%- set ns = namespace(out=[]) -%}
+  {%- for t in (bg_storage_node.targets if bg_storage_node is not none else []) -%}
+  {%-   set i = (nvme_serials | default([])).index(t.serial) if t.serial in nvme_serials | default([]) else -1 -%}
+  {%-   set ns.out = ns.out + [{'serial': t.serial, 'id': t.id, 'node_id': bg_storage_node.id, 'fstype': 'xfs',
+                               'eui': (nvme_euis | default([]))[i] if i >= 0 and i < nvme_euis | default([]) | length else '',
+                               'label': 'bgfs-st' ~ t.id, 'mount': beegfs_server_root ~ '/t' ~ t.id,
+                               'store': beegfs_server_root ~ '/t' ~ t.id ~ '/beegfs_storage'}] -%}
+  {%- endfor -%}
+  {{ ns.out }}
+bg_all_ports: "{{ beegfs_ports.values() | flatten | unique | sort }}"
+# The port guard's sets (templates/prace-beegfs.nft.j2), from the same port table.
+bg_netguard_tcp: "{{ bg_all_ports | select('match', '^[0-9]+/tcp$') | map('regex_replace', '/tcp$', '') | map('int') | unique | sort }}"
+bg_netguard_udp: "{{ bg_all_ports | select('match', '^[0-9]+/udp$') | map('regex_replace', '/udp$', '') | map('int') | unique | sort }}"
+# The trusted zone's expected sources: the admin network (roles/fleet_net fleet_trusted_sources) and
+# the pod and service networks (roles/k3s); nothing else may be bound there (files/prace-beegfs-firewall).
+beegfs_trusted_sources: "{{ [admin_network] + beegfs_pod_networks }}"
+# Every BeeGFS transaction (install, version lock) on every host sees the BeeGFS repository alone.
+bg_repo_opts: ["--disablerepo=*", "--enablerepo={{ beegfs_repo_id }}"]
+# The pins, by package name (gates.yml loads roles/fleet_repo defaults into bg_fleet_repo).
+bg_pins: >-
+  {%- set ns = namespace(d={}) -%}
+  {%- for p in (bg_fleet_repo | default({})).fleet_repo_beegfs_packages | default([]) -%}
+  {%-   set ns.d = ns.d | combine({p.nevra.rsplit('-', 2)[0]: p}) -%}
+  {%- endfor -%}
+  {{ ns.d }}
+bg_beegfs_pins: "{{ bg_pins | dict2items | selectattr('key', 'match', '^(lib)?beegfs-') | map(attribute='value') | list }}"
+bg_key: "{{ (bg_fleet_repo | default({})).fleet_repo_beegfs_key | default({}) }}"
+bg_repo_url: "{{ (bg_fleet_repo | default({})).fleet_repo_beegfs_url | default('') }}"
+# Input of files/prace-beegfs-prepare (tasks/prepare.yml). Confirmed items reach it only when the
+# first use is authorised.
+bg_prepare_spec:
+  host: "{{ inventory_hostname }}"
+  os_wwn: "{{ os_disk.wwn | default('') }}"
+  fstab: "{{ beegfs_fstab }}"
+  by_id_dir: "{{ beegfs_by_id_dir }}"
+  confirm: "{{ bg_confirm_items if bg_first_use_authorised | bool else [] }}"
+  meta: "{{ bg_meta }}"
+  targets: "{{ bg_targets }}"
+# Active backing filesystems (tasks/prepare.yml sets bg_meta_item, bg_active_targets, bg_uuids)
+# and the files each must carry: the identity marker at its root and BeeGFS's numeric ID files
+# in its store directory (setting_ids.html: nodeNumID, targetNumID).
+bg_backing: >-
+  {%- set ns = namespace(out=[]) -%}
+  {%- if bg_meta_item | default(none) is not none and bg_meta is not none -%}
+  {%-   set ns.out = ns.out + [{'name': 'meta', 'kind': 'meta', 'mount': bg_meta.mount, 'store': bg_meta.store, 'fstype': 'ext4',
+                               'label': bg_meta.label, 'uuid': bg_meta_item.uuid, 'ids': {'nodeNumID': bg_meta.id}}] -%}
+  {%- endif -%}
+  {%- for t in bg_active_targets | default([]) -%}
+  {%-   set ns.out = ns.out + [{'name': t.serial, 'kind': 'storage', 'mount': t.mount, 'store': t.store, 'fstype': 'xfs',
+                               'label': t.label, 'uuid': bg_uuids[t.serial], 'ids': {'nodeNumID': t.node_id, 'targetNumID': t.id}}] -%}
+  {%- endfor -%}
+  {{ ns.out }}
+bg_backing_files: >-
+  {%- set ns = namespace(out=[]) -%}
+  {%- for b in bg_backing -%}
+  {%-   set ns.out = ns.out + [{'item': b.name, 'kind': b.kind, 'path': b.mount ~ '/' ~ beegfs_marker, 'mode': '0444',
+                               'content': 'kind=' ~ b.kind ~ ' host=' ~ inventory_hostname ~ ' item=' ~ b.name
+                                          ~ ' label=' ~ b.label ~ ' uuid=' ~ b.uuid ~ '\n'}] -%}
+  {%-   for k in b.ids | sort -%}
+  {%-     set ns.out = ns.out + [{'item': b.name, 'kind': b.kind, 'path': b.store ~ '/' ~ k, 'mode': '0644', 'content': b.ids[k] ~ '\n'}] -%}
+  {%-   endfor -%}
+  {%- endfor -%}
+  {{ ns.out }}
+# Filter files (network_configuration.html). connInterfacesFile takes the 8.2+ filter syntax
+# "<name> <address> <protocol>" (4 = IPv4); the two subnet files take one CIDR per line.
+bg_net_files:
+  - {path: "{{ beegfs_iface_file }}", content: "{{ bg_admin_iface | default('') }} * 4\n"}
+  - {path: "{{ beegfs_netfilter_file }}", content: "{{ admin_network }}\n"}
+  - {path: "{{ beegfs_tcponly_file }}", content: "{{ admin_network }}\n"}
+bg_mounts_conf: "{{ beegfs_scratch }} {{ beegfs_conf_dir }}/beegfs-client.conf {{ beegfs_scratch_mount_opts }}\n"
+# systemd drop-ins (templates/guard.conf.j2). A server whose backing filesystem is not mounted, or
+# lacks its marker or ID file, FAILS to start (Assert*: visible to monitoring, unlike a skipped
+# Condition*) instead of initialising an empty replacement. No CPU or memory limits (sizing
+# reservations only, inventory beegfs_resource_envelope).
+bg_guard_mgmtd:
+  why: the management database exists only after the armed first use (beegfs-mgmtd --init)
+  mounts: []
+  paths: ["{{ beegfs_mgmtd_db }}", "{{ beegfs_auth_file }}"]
+  requires: ["{{ beegfs_netguard_unit }}.service"]
+  after: [network-online.target, "{{ beegfs_netguard_unit }}.service"]
+  wants: [network-online.target]
+bg_guard_meta:
+  why: metadata only from its own recorded filesystem, never an empty replacement
+  mounts: "{{ bg_backing | selectattr('kind', 'equalto', 'meta') | map(attribute='mount') | list }}"
+  paths: "{{ bg_backing_files | selectattr('kind', 'equalto', 'meta') | map(attribute='path') | list + [beegfs_auth_file] }}"
+  requires: ["{{ beegfs_netguard_unit }}.service"]
+  after: [network-online.target, "{{ beegfs_netguard_unit }}.service"]
+  wants: [network-online.target]
+bg_guard_storage:
+  why: every storage target only from its own recorded filesystem, never an empty replacement
+  mounts: "{{ bg_backing | selectattr('kind', 'equalto', 'storage') | map(attribute='mount') | list }}"
+  paths: "{{ bg_backing_files | selectattr('kind', 'equalto', 'storage') | map(attribute='path') | list + [beegfs_auth_file] }}"
+  requires: ["{{ beegfs_netguard_unit }}.service"]
+  after: [network-online.target, "{{ beegfs_netguard_unit }}.service"]
+  wants: [network-online.target]
+# Ordering only: the client never requires the co-located services (they may start without it).
+bg_guard_client:
+  why: mount /scratch after the network and the local BeeGFS services (ordering only)
+  mounts: []
+  paths: ["{{ beegfs_auth_file }}"]
+  requires: ["{{ beegfs_netguard_unit }}.service"]
+  after: >-
+    {{ ['network-online.target', beegfs_netguard_unit ~ '.service'] + (['beegfs-mgmtd.service'] if inventory_hostname == beegfs_mgmt_host else [])
+       + (['beegfs-meta.service', 'beegfs-storage.service'] if bg_storage_node is not none else []) }}
+  wants: [network-online.target]
+
+# Every host of the run gets the shared settings. Each key is in the shipped 8.4.1 file (checked
+# against the sources, evidence/2026-10-05/beegfs-pins/check-sources.txt; conf-set.yml checks it
+# again on the host). The shipped files turn RDMA on (connUseRDMA = true, effective only with
+# libbeegfs-ib): off here as well. IPv4 only, like the filter files.
+bg_net_settings:
+  sysMgmtdHost: "{{ bg_mgmt_addr }}"
+  connAuthFile: "{{ beegfs_auth_file }}"
+  connDisableAuthentication: false
+  connInterfacesFile: "{{ beegfs_iface_file }}"
+  connNetFilterFile: "{{ beegfs_netfilter_file }}"
+  connTcpOnlyFilterFile: "{{ beegfs_tcponly_file }}"
+  connUseRDMA: false
+  connDisableIPv6: true
+# storeAllowFirstRunInit is true only during an armed first use, and switched off again in the
+# same run: with it off, a service refuses any directory without its format.conf (8.4.1
+# App::preinitStorage), so an empty replacement never starts. storeFsUUID binds each service to the
+# UUID of the filesystem under its directory (8.4.1 checkTargetUUID / checkTargetsUUIDs; one UUID per
+# target, in storeStorageDirectory order): a second, native guard beside the drop-ins.
+bg_meta_settings: >-
+  {{ bg_net_settings | combine({'storeMetaDirectory': bg_meta.store if bg_meta is not none else '',
+                                'storeFsUUID': (bg_meta_item | default(none) or {}).uuid | default(''),
+                                'storeAllowFirstRunInit': bg_first_run_now | default(false) | bool}) }}
+bg_storage_settings: >-
+  {{ bg_net_settings | combine({'storeStorageDirectory': bg_active_targets | default([]) | map(attribute='store') | join(','),
+                                'storeFsUUID': bg_active_targets | default([]) | map(attribute='serial')
+                                               | map('extract', bg_uuids | default({})) | join(','),
+                                'storeAllowFirstRunInit': bg_first_run_now | default(false) | bool}) }}
+bg_client_settings: "{{ bg_net_settings }}"
+# beegfs-mgmtd.toml (TOML; every key is in the shipped 8.4.1 file, commented). interfaces takes NIC
+# filters "[!] name addr protocol", like connInterfacesFile. registration-disable = true refuses NEW
+# metadata/storage nodes and targets (clients excluded, 8.4.1 config.rs): it is opened only while
+# an armed first use confirms a metadata or storage item, and closed again by the last play (a rogue
+# process that learns the connection token cannot then register a target and receive chunks).
+bg_mgmtd_settings:
+  db-file: "{{ beegfs_mgmtd_db }}"
+  auth-disable: false
+  auth-file: "{{ beegfs_auth_file }}"
+  tls-disable: "{{ beegfs_tls_disable | bool }}"
+  tls-cert-file: "{{ beegfs_tls_cert }}"
+  tls-key-file: "{{ beegfs_tls_key }}"
+  interfaces: ["{{ bg_admin_iface | default('') }} * 4"]
+  ipv6-disable: true
+  registration-disable: "{{ not bg_registration_open | bool }}"
+# What the management reports online (tasks/fs-state.yml). A line of `beegfs target list --state`
+# counts when its first ID is followed by Online and later by Good. The pattern is a variable, not a
+# Jinja literal (literals decode backslashes).
+bg_fs_online_rx: '\b([ms]:[0-9]+)\b.*\bOnline\b.*\bGood\b'
+bg_fs_online: "{{ (bg_fs_raw.stdout_lines | default([])) | map('regex_findall', bg_fs_online_rx) | flatten | unique | sort }}"
+# 8.4.1 clients refuse to mount without a metadata target or without any storage target (mount
+# sanity check, 'No storage targets known'): the clients play waits for one of each (stage gate).
+bg_fs_ready: "{{ bg_fs_online | select('match', '^m:') | list | length > 0 and bg_fs_online | select('match', '^s:') | list | length > 0 }}"
+# This host's items as the management names them (service.yml waits for them).
+bg_my_ids: >-
+  {{ (['m:' ~ bg_meta.id] if bg_meta is not none and bg_backing | selectattr('kind', 'equalto', 'meta') | list | length > 0 else [])
+     + (bg_active_targets | default([]) | map(attribute='id') | map('string') | map('regex_replace', '^', 's:') | list) }}
+# Registration is needed only when this run may bring up a new metadata node or storage target.
+bg_registration_open: >-
+  {{ bg_first_use_authorised_any | bool and
+     (bg_confirm_entries | map('string') | map('regex_replace', '^[^:]*:', '') | join(',')).split(',')
+     | reject('in', ['mgmtd', '']) | list | length > 0 }}
+
+# --- run gates (tasks/gates.yml). A confirmation entry is <host>:<item>[,<item>...]; several
+# entries are joined with '+' (or given as a JSON list). Items: 'mgmtd' (management host), 'meta'
+# (a GPU host's metadata LV) or an NVMe serial of that host (one storage target). A space would
+# make -e split the value and silently drop the rest (Ansible keeps it in _raw_params): refused.
+bg_confirm_entries: >-
+  {{ [] if beegfs_format_confirm | default(none) is none or beegfs_format_confirm | default('') == ''
+     else (beegfs_format_confirm.split('+') if beegfs_format_confirm is string else beegfs_format_confirm | list) }}
+bg_run_hosts: "{{ query('ansible.builtin.inventory_hostnames', ansible_limit | default('fleet')) | intersect(groups['fleet']) }}"
+bg_confirm_errors: >-
+  {%- set ns = namespace(e=[], hosts=[]) -%}
+  {%- if _raw_params is defined -%}
+  {%-   set ns.e = ns.e + ['an -e value contained a space and was split (' ~ (_raw_params | string) ~ ' was dropped); join entries with +'] -%}
+  {%- endif -%}
+  {%- if not beegfs_format_armed | default(false) | bool -%}
+  {%-   if bg_confirm_entries | length > 0 %}{% set ns.e = ns.e + ['beegfs_format_confirm given without -e beegfs_format_armed=true'] %}{% endif -%}
+  {%- else -%}
+  {%-   if bg_confirm_entries | length == 0 %}{% set ns.e = ns.e + ['armed first use needs -e beegfs_format_confirm=<host>:<item>[,<item>...]'] %}{% endif -%}
+  {%-   for entry in bg_confirm_entries -%}
+  {%-     set parts = (entry | string).split(':', 1) -%}
+  {%-     set h = parts[0] -%}
+  {%-     set items = (parts[1] if parts | length == 2 else '').split(',') -%}
+  {%-     set allowed = (['mgmtd'] if h == beegfs_mgmt_host else [])
+                        + (['meta'] if h in beegfs_meta_nodes | map(attribute='host') else [])
+                        + (beegfs_storage_nodes | selectattr('host', 'equalto', h) | map(attribute='targets') | flatten | map(attribute='serial') | list) -%}
+  {%-     if h in ns.hosts %}{% set ns.e = ns.e + [h ~ ' is named twice'] %}{% endif -%}
+  {%-     set ns.hosts = ns.hosts + [h] -%}
+  {%-     if h not in bg_run_hosts %}{% set ns.e = ns.e + [(entry | string) ~ ': ' ~ h ~ ' is not a host of this run'] -%}
+  {%-     elif '' in items %}{% set ns.e = ns.e + [(entry | string) ~ ': empty item'] -%}
+  {%-     elif items | unique | length != items | length %}{% set ns.e = ns.e + [(entry | string) ~ ': an item is named twice'] -%}
+  {%-     else -%}
+  {%-       for i in items if i not in allowed %}{% set ns.e = ns.e + [h ~ ': ' ~ i ~ ' is not one of ' ~ (allowed | join(',') or 'nothing (no first-use item on this host)')] %}{% endfor -%}
+  {%-     endif -%}
+  {%-   endfor -%}
+  {%- endif -%}
+  {{ ns.e }}
+bg_confirm_items: >-
+  {{ (bg_confirm_entries | map('string') | select('match', '^' ~ (inventory_hostname | regex_escape) ~ ':') | first | default(':')).split(':', 1)[1].split(',')
+     | reject('equalto', '') | list }}
+# This run read the lease on the login node and holds it (tasks/cluster-lease-check.yml). A run
+# started past the gates (--start-at-task) has no lease result and is never authorised.
+# The lease is the window tool's (holder=maint) and was taken for BeeGFS (label=beegfs-<stage>), so
+# another operation's lease id cannot run BeeGFS inside that operation's window (as the NVMe wipe).
+bg_lease_held: >-
+  {{ fleet_lease is defined and fleet_lease.rc | default(1) == 0 and fleet_lease_id | default('') | length > 0
+     and ('id=' ~ fleet_lease_id | default('') ~ ' ') in (fleet_lease.stdout | default('') ~ ' ')
+     and (' ' ~ fleet_lease.stdout | default('') ~ ' ') is search(' holder=maint ')
+     and (' ' ~ fleet_lease.stdout | default('') ~ ' ') is search(' label=beegfs-[a-z0-9-]+ ') }}
+# This run passed the controller-side gates (tasks/gates.yml) and holds the lease. Every entry
+# task file asserts it first; a run started past the gates has neither and changes nothing.
+bg_run_gated: "{{ bg_gates_passed | default(false) | bool and bg_lease_held | bool and bg_window_verified | default(false) | bool }}"
+# First use (format, management --init, first service start) is authorised only for this.
+bg_first_use_authorised: >-
+  {{ bg_first_use_authorised_any | bool and bg_confirm_items | length > 0 }}
+# The same, for the run as a whole (some host of this run has a first-use item).
+bg_first_use_authorised_any: >-
+  {{ fleet_armed | default(false) | bool and beegfs_format_armed | default(false) | bool
+     and bg_lease_held | bool and bg_window_verified | default(false) | bool
+     and bg_confirm_errors | length == 0 and bg_confirm_entries | length > 0 }}

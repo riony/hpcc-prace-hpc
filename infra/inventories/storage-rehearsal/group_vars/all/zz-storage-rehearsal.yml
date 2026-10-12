@@ -1,0 +1,12 @@
+---
+# Loaded last (alphabetical): the storage roles' interface (login_storage, storage_policy, nfs_home)
+# with the rehearsal's disk and sizes scaled down to the 24G data disk (home 6g, projects 6g,
+# apps 2g, 2g kept free). Everything else (mount and client options, quotas, local homes) comes
+# from the fleet's storage.yml, symlinked like accounts.yml; these values win (loaded later).
+storage_vg: sr_vg
+storage_pv_serial: prace-sr-data          # sr-login's data disk (QEMU serial=, lsblk SERIAL)
+storage_vg_reserve_g: 2
+storage_lvs:
+  - {name: home, size_g: 6, path: /home, label: prace-home, quota: usrquota, export: rw}
+  - {name: projects, size_g: 6, path: /projects, label: prace-proj, quota: prjquota, export: rw}
+  - {name: apps, size_g: 2, path: /apps, label: prace-apps, quota: "", export: ro}

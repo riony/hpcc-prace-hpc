@@ -1,0 +1,385 @@
+---
+# gitlab: GitLab CE on mgmt-git01 (management VM). Requires mgmt_host first
+# (data bind-mounted at /var/opt/gitlab) and Tailscale joined with HTTPS
+# certificates enabled for the tailnet. The initial root password is generated
+# by GitLab into /etc/gitlab/initial_root_password (root-only, removed after
+# 24 h); the owner reads it - this role never reads or prints it.
+
+- name: Require the GitLab data directory to be bind-mounted from /home
+  ansible.builtin.command: findmnt -no SOURCE /var/opt/gitlab
+  register: gl_mount
+  changed_when: false
+  check_mode: false
+  failed_when: "'gitlab-data' not in gl_mount.stdout"
+
+- name: Read Tailscale status
+  ansible.builtin.command: tailscale status --json
+  register: gl_ts
+  changed_when: false
+  check_mode: false
+
+- name: Require Tailscale HTTPS certificates for the GitLab name
+  ansible.builtin.assert:
+    that: gitlab_fqdn in ((gl_ts.stdout | from_json).CertDomains | default([]) or [])
+    fail_msg: "Tailscale cannot issue a certificate for {{ gitlab_fqdn }} (enable HTTPS certificates in the tailnet DNS settings)"
+
+# --- TLS certificate from Tailscale -------------------------------------------
+- name: Certificate directory
+  ansible.builtin.file:
+    path: /etc/gitlab/ssl
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+
+- name: Certificate renewal script
+  ansible.builtin.copy:
+    dest: /usr/local/sbin/gitlab-tailscale-cert
+    mode: "0755"
+    content: |
+      #!/bin/bash
+      # Managed by Ansible (roles/gitlab). Obtain/renew GitLab's certificate from
+      # Tailscale; reload nginx only when the certificate actually changed.
+      set -euo pipefail
+      FQDN="{{ gitlab_fqdn }}"
+      CRT="/etc/gitlab/ssl/$FQDN.crt"; KEY="/etc/gitlab/ssl/$FQDN.key"
+      before=$(sha256sum "$CRT" 2>/dev/null | cut -d' ' -f1 || true)
+      tailscale cert --cert-file "$CRT" --key-file "$KEY" "$FQDN"
+      chmod 600 "$KEY"; chmod 644 "$CRT"
+      after=$(sha256sum "$CRT" | cut -d' ' -f1)
+      if [ "$before" != "$after" ] && /opt/gitlab/bin/gitlab-ctl status nginx >/dev/null 2>&1; then
+        /opt/gitlab/bin/gitlab-ctl hup nginx
+      fi
+
+- name: Check whether a valid certificate exists for at least 30 more days
+  ansible.builtin.command: "openssl x509 -checkend 2592000 -noout -in /etc/gitlab/ssl/{{ gitlab_fqdn }}.crt"
+  register: gl_cert_ok
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Obtain the certificate now
+  ansible.builtin.command: /usr/local/sbin/gitlab-tailscale-cert
+  when: gl_cert_ok.rc != 0
+
+- name: Weekly certificate renewal (service + timer)
+  ansible.builtin.copy:
+    dest: "/etc/systemd/system/{{ item.name }}"
+    mode: "0644"
+    content: "{{ item.content }}"
+  loop:
+    - name: gitlab-tailscale-cert.service
+      content: |
+        [Unit]
+        Description=Renew GitLab's Tailscale-issued TLS certificate
+        After=tailscaled.service network-online.target
+        Wants=network-online.target
+        [Service]
+        Type=oneshot
+        ExecStart=/usr/local/sbin/gitlab-tailscale-cert
+    - name: gitlab-tailscale-cert.timer
+      content: |
+        [Unit]
+        Description=Weekly renewal of GitLab's Tailscale certificate
+        [Timer]
+        OnCalendar=weekly
+        RandomizedDelaySec=6h
+        Persistent=true
+        [Install]
+        WantedBy=timers.target
+  loop_control:
+    label: "{{ item.name }}"
+  notify: reload systemd
+
+# --- Package ------------------------------------------------------------------
+- name: GitLab CE package repository (official definition, signed metadata and packages)
+  ansible.builtin.yum_repository:
+    name: gitlab_gitlab-ce
+    description: gitlab_gitlab-ce
+    baseurl: https://packages.gitlab.com/gitlab/gitlab-ce/el/9/$basearch
+    gpgcheck: true
+    repo_gpgcheck: true
+    gpgkey:
+      - https://packages.gitlab.com/gpgkey/gpg.key
+      - https://packages.gitlab.com/gpgkey/gitlab/3D645A26AB9FBD22.pub.gpg
+      - https://packages.gitlab.com/gpgkey/gitlab/CB947AD886C8E8FD.pub.gpg
+    sslverify: true
+    sslcacert: /etc/pki/tls/certs/ca-bundle.crt
+    metadata_expire: "300"
+
+- name: Import GitLab's package signing keys
+  ansible.builtin.rpm_key:
+    key: "{{ item }}"
+    state: present
+  loop:
+    - https://packages.gitlab.com/gpgkey/gpg.key
+    - https://packages.gitlab.com/gpgkey/gitlab/3D645A26AB9FBD22.pub.gpg
+    - https://packages.gitlab.com/gpgkey/gitlab/CB947AD886C8E8FD.pub.gpg
+
+- name: Accept the repository metadata signing keys (dnf's per-repo keyring)
+  ansible.builtin.command: dnf -y -q makecache --repo gitlab_gitlab-ce
+  changed_when: false
+
+- name: GitLab config directory
+  ansible.builtin.file:
+    path: /etc/gitlab
+    state: directory
+    owner: root
+    group: root
+    mode: "0775"
+
+# We run reconfigure explicitly (handler) instead of from the package scriptlet.
+- name: Skip the package's automatic reconfigure
+  ansible.builtin.copy:
+    dest: /etc/gitlab/skip-auto-reconfigure
+    content: ""
+    mode: "0644"
+
+# Email is only switched on once the owner has stored the SMTP login (they type the app
+# password themselves; agents never see it). Stops the run before gitlab.rb changes.
+- name: Stored SMTP login (only when email is enabled)
+  ansible.builtin.stat:
+    path: "{{ gitlab_smtp_secret_file }}"
+  register: gl_smtp_secret
+  when: gitlab_smtp_enable
+
+- name: Email needs a sender and a stored SMTP login
+  ansible.builtin.assert:
+    that:
+      - gitlab_email_from | length > 0
+      - gl_smtp_secret.stat.exists and gl_smtp_secret.stat.size > 0
+    fail_msg: >-
+      gitlab_smtp_enable is true but gitlab_email_from is empty or no SMTP login is stored
+      ({{ gitlab_smtp_secret_file }}). The owner stores it first (docs/reference/GIT01-MANAGEMENT-READINESS.md,
+      "Outgoing email"), then re-run.
+    quiet: true
+  when: gitlab_smtp_enable
+
+- name: gitlab.rb
+  ansible.builtin.template:
+    src: gitlab.rb.j2
+    dest: /etc/gitlab/gitlab.rb
+    owner: root
+    group: root
+    mode: "0600"
+  notify: reconfigure gitlab
+
+- name: Install the pinned GitLab CE version
+  ansible.builtin.dnf:
+    name: "gitlab-ce-{{ gitlab_version }}"
+    state: present
+  notify: reconfigure gitlab
+
+- name: Apply configuration now
+  ansible.builtin.meta: flush_handlers
+
+- name: Wait until GitLab reports ready (local readiness probe)
+  ansible.builtin.command: >-
+    curl -s -o /dev/null -w '%{http_code}' --resolve {{ gitlab_fqdn }}:443:127.0.0.1
+    https://{{ gitlab_fqdn }}/-/readiness
+  register: gl_ready
+  until: gl_ready.stdout == "200"
+  retries: 60
+  delay: 10
+  changed_when: false
+  when: not ansible_check_mode
+
+# --- Application settings (idempotent; reports what it changed) ---------------
+- name: Sign-ups off; new projects and groups private by default
+  ansible.builtin.command:
+    argv:
+      - /opt/gitlab/bin/gitlab-rails
+      - runner
+      - >-
+        s = ApplicationSetting.current;
+        want = { signup_enabled: false,
+                 default_project_visibility: Gitlab::VisibilityLevel::PRIVATE,
+                 default_group_visibility: Gitlab::VisibilityLevel::PRIVATE };
+        diff = want.reject { |k, v| s.public_send(k) == v };
+        s.update!(diff) unless diff.empty?;
+        puts(diff.empty? ? "unchanged" : "changed #{diff.keys.join(',')}")
+  register: gl_settings
+  changed_when: gl_settings.stdout_lines | select('match', '^changed ') | list | length > 0
+  when: not ansible_check_mode
+
+# --- Team accounts and labels --------------------------------------------------
+# The owner runs the account script (it prints temporary passwords); Ansible only installs it.
+- name: Team-account script (run by the owner; see infra/gitlab/team-roster.example.csv)
+  ansible.builtin.copy:
+    src: gitlab-team-users.rb
+    dest: /usr/local/sbin/gitlab-team-users.rb
+    owner: root
+    group: git            # gitlab-rails runs as the git user and must be able to read it
+    mode: "0640"          # no secrets inside; passwords are generated at run time
+
+- name: Workflow labels on the team group (idempotent; reports what it created)
+  ansible.builtin.command:
+    argv:
+      - /opt/gitlab/bin/gitlab-rails
+      - runner
+      - >-
+        g = Group.find_by_full_path("{{ gitlab_team_group }}");
+        if g.nil? then puts "no group"; exit end;
+        want = {{ gitlab_team_labels | to_json }};
+        made = want.reject { |n, _| g.labels.exists?(title: n) }.map { |n, c| GroupLabel.create!(group: g, title: n, color: c); n };
+        puts(made.empty? ? "unchanged" : "changed " + made.join(","))
+  register: gl_labels
+  changed_when: gl_labels.stdout_lines | select('match', '^changed ') | list | length > 0
+  when: not ansible_check_mode
+
+# --- Branch protection -------------------------------------------------------
+# main accepts changes only through merge requests: nobody pushes directly,
+# Maintainers merge, force push is off. Idempotent; reports what it changed.
+- name: Protect main in the listed projects (merge requests only)
+  ansible.builtin.command:
+    argv:
+      - /opt/gitlab/bin/gitlab-rails
+      - runner
+      - >-
+        root = User.find_by_username("root"); changed = [];
+        {{ gitlab_mr_only_projects | to_json }}.each do |path|
+          p = Project.find_by_full_path(path); next puts("missing " + path) if p.nil?;
+          pb = p.protected_branches.find_by(name: "main");
+          if pb.nil? then
+            pb = ProtectedBranches::CreateService.new(p, root, name: "main",
+                   push_access_levels_attributes: [{ access_level: Gitlab::Access::NO_ACCESS }],
+                   merge_access_levels_attributes: [{ access_level: Gitlab::Access::MAINTAINER }]).execute;
+            changed << path + ":created" end;
+          pb.reload;
+          if pb.push_access_levels.map(&:access_level) != [Gitlab::Access::NO_ACCESS] then
+            pb.push_access_levels.drop(1).each(&:destroy!); pb.push_access_levels.first.update!(access_level: Gitlab::Access::NO_ACCESS); changed << path + ":push" end;
+          if pb.merge_access_levels.map(&:access_level) != [Gitlab::Access::MAINTAINER] then
+            pb.merge_access_levels.drop(1).each(&:destroy!); pb.merge_access_levels.first.update!(access_level: Gitlab::Access::MAINTAINER); changed << path + ":merge" end;
+          if pb.allow_force_push then pb.update!(allow_force_push: false); changed << path + ":force" end
+        end;
+        puts(changed.empty? ? "unchanged" : "changed " + changed.join(","))
+  register: gl_protect
+  changed_when: gl_protect.stdout_lines | select('match', '^changed ') | list | length > 0
+  failed_when: gl_protect.rc != 0 or gl_protect.stdout_lines | select('match', '^missing ') | list | length > 0
+  when: not ansible_check_mode
+
+# --- Pipeline schedules ------------------------------------------------------
+# Created/updated as the listed owner (scheduled pipelines run as that user). Runs in
+# check mode too (GL_DRY=1: reports what would change, saves nothing).
+# Note: the JSON below is Ruby source, where {"key": v} has symbol keys.
+- name: Pipeline schedules (idempotent; reports what it changed)
+  ansible.builtin.command:
+    argv:
+      - /opt/gitlab/bin/gitlab-rails
+      - runner
+      - >-
+        dry = ENV["GL_DRY"] == "1"; changed = [];
+        {{ gitlab_pipeline_schedules | to_json }}.each do |w|
+          p = Project.find_by_full_path(w[:project]); next puts("missing project " + w[:project]) if p.nil?;
+          owner = User.find_by_username(w[:owner]); next puts("missing owner " + w[:owner]) if owner.nil?;
+          want = w.slice(:description, :ref, :cron, :cron_timezone, :active);   # JSON "k": v gives symbol keys in Ruby
+          s = p.pipeline_schedules.find_by(description: w[:description]);
+          if s.nil? then
+            changed << w[:description] + ":created";
+            unless dry then
+              r = Ci::PipelineSchedules::CreateService.new(p, owner, want).execute;
+              next puts("error " + Array(r.message).join("; ")) unless r.success? end;
+            next end;
+          diff = want.reject { |k, v| s.public_send(k) == v };
+          if s.owner_id != owner.id then
+            changed << w[:description] + ":owner";
+            Ci::PipelineSchedules::TakeOwnershipService.new(s, owner).execute unless dry end;
+          next if diff.empty?;
+          changed << w[:description] + ":" + diff.keys.join("+");
+          unless dry then
+            r = Ci::PipelineSchedules::UpdateService.new(s.reload, owner, diff).execute;
+            puts("error " + Array(r.message).join("; ")) unless r.success? end
+        end;
+        puts(changed.empty? ? "unchanged" : "changed " + changed.join(","))
+  environment:
+    GL_DRY: "{{ ansible_check_mode | ternary('1', '0') }}"
+  check_mode: false
+  register: gl_schedules
+  changed_when: gl_schedules.stdout_lines | select('match', '^changed ') | list | length > 0
+  failed_when: gl_schedules.rc != 0 or gl_schedules.stdout_lines | select('match', '^(missing|error) ') | list | length > 0
+
+# --- Pipeline status emails -------------------------------------------------
+# Mail the listed addresses when a pipeline on the default branch fails (includes the
+# scheduled lab-drift-check). Active only while email is enabled. Check-mode aware.
+- name: Pipeline status emails (idempotent; reports what it changed)
+  ansible.builtin.command:
+    argv:
+      - /opt/gitlab/bin/gitlab-rails
+      - runner
+      - >-
+        dry = ENV["GL_DRY"] == "1"; changed = [];
+        {{ gitlab_pipeline_email_recipients | to_json }}.each do |path, rcpts|
+          p = Project.find_by_full_path(path.to_s); next puts("missing project " + path.to_s) if p.nil?;
+          i = p.pipelines_email_integration || p.build_pipelines_email_integration;
+          want = { recipients: rcpts.join(","), notify_only_broken_pipelines: true,
+                   notify_only_when_pipeline_status_changes: false, branches_to_be_notified: "default",
+                   pipeline_events: true, active: {{ gitlab_smtp_enable | to_json }} };
+          diff = want.reject { |k, v| i.public_send(k).to_s == v.to_s };
+          next if i.persisted? && diff.empty?;
+          changed << path.to_s + ":" + (i.persisted? ? diff.keys.join("+") : "created");
+          unless dry then i.assign_attributes(want); i.save! end
+        end;
+        puts(changed.empty? ? "unchanged" : "changed " + changed.join(","))
+  environment:
+    GL_DRY: "{{ ansible_check_mode | ternary('1', '0') }}"
+  check_mode: false
+  register: gl_pipeline_email
+  changed_when: gl_pipeline_email.stdout_lines | select('match', '^changed ') | list | length > 0
+  failed_when: gl_pipeline_email.rc != 0 or gl_pipeline_email.stdout_lines | select('match', '^missing ') | list | length > 0
+
+# --- Backups ------------------------------------------------------------------
+- name: Backup script (GitLab data + the config/secrets needed to restore it)
+  ansible.builtin.copy:
+    dest: /usr/local/sbin/gitlab-backup-with-config
+    mode: "0755"
+    content: |
+      #!/bin/bash
+      # Managed by Ansible (roles/gitlab). Application-consistent backup onto the
+      # disk covered by the storage-level snapshots. gitlab-secrets.json is needed
+      # to restore; without it encrypted CI variables and 2FA data are lost.
+      set -euo pipefail
+      /opt/gitlab/bin/gitlab-backup create CRON=1 STRATEGY=copy
+      d=/var/opt/gitlab/backups/config/$(date +%Y%m%dT%H%M)
+      install -d -m 700 "$d"
+      cp -a /etc/gitlab/gitlab-secrets.json /etc/gitlab/gitlab.rb "$d"/
+      chmod 600 "$d"/*
+      find /var/opt/gitlab/backups/config -mindepth 1 -maxdepth 1 -type d \
+        -mtime +{{ gitlab_backup_keep_days }} -exec rm -rf {} +
+
+- name: Nightly backup (service + timer)
+  ansible.builtin.copy:
+    dest: "/etc/systemd/system/{{ item.name }}"
+    mode: "0644"
+    content: "{{ item.content }}"
+  loop:
+    - name: gitlab-backup.service
+      content: |
+        [Unit]
+        Description=GitLab backup with config/secrets
+        [Service]
+        Type=oneshot
+        ExecStart=/usr/local/sbin/gitlab-backup-with-config
+    - name: gitlab-backup.timer
+      content: |
+        [Unit]
+        Description=Nightly GitLab backup (before the storage snapshot window)
+        [Timer]
+        OnCalendar={{ gitlab_backup_oncalendar }}
+        Persistent=true
+        [Install]
+        WantedBy=timers.target
+  loop_control:
+    label: "{{ item.name }}"
+  notify: reload systemd
+
+- name: Apply systemd unit changes
+  ansible.builtin.meta: flush_handlers
+
+- name: Enable the timers
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    enabled: true
+    state: started
+  loop:
+    - gitlab-tailscale-cert.timer
+    - gitlab-backup.timer

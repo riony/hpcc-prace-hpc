@@ -1,0 +1,190 @@
+---
+- name: Monitor account (service only, no login shell)
+  ansible.builtin.user:
+    name: "{{ fleet_monitor_user }}"
+    system: true
+    shell: /sbin/nologin
+    password: "!"
+    create_home: true
+    home: "{{ fleet_monitor_home }}"
+
+- name: Monitor state directory (state.json is read by the CI drift audit's freshness check)
+  ansible.builtin.file:
+    path: "{{ fleet_monitor_home }}"
+    state: directory
+    owner: "{{ fleet_monitor_user }}"
+    group: "{{ fleet_monitor_user }}"
+    mode: "0755"
+
+- name: Code and configuration directories
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: root
+    group: "{{ item.group }}"
+    mode: "{{ item.mode }}"
+  loop:
+    - {path: "{{ fleet_monitor_lib }}", group: root, mode: "0755"}
+    - {path: "{{ fleet_monitor_etc }}", group: "{{ fleet_monitor_user }}", mode: "0750"}
+
+- name: Keys generated here; the private keys never leave this VM
+  ansible.builtin.command: >-
+    ssh-keygen -q -t ed25519 -N "" -C "{{ item.comment }}" -f {{ item.path }}
+  args:
+    creates: "{{ item.path }}"
+  become: true
+  become_user: "{{ item.user }}"
+  loop:
+    - {user: "{{ fleet_monitor_user }}", path: "{{ fleet_monitor_home }}/.ssh/id_ed25519", comment: "prace-monitor@mgmt-git01"}
+    - {user: "{{ fleet_audit_user }}", path: "/home/{{ fleet_audit_user }}/.ssh/fleet_audit_ed25519", comment: "fleet-audit@mgmt-git01"}
+  loop_control:
+    label: "{{ item.path }}"
+
+- name: Verified login node host key (infra/audit/known_hosts)
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../audit/known_hosts"
+    dest: "{{ fleet_monitor_etc }}/known_hosts"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Monitor and evaluator code, expected fleet
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../{{ item }}"
+    dest: "{{ fleet_monitor_lib }}/{{ item | basename }}"
+    owner: root
+    group: root
+    mode: "0644"
+  loop: [tools/fleet_audit.py, tools/fleet_monitor.py, audit/deployed.json]   # the deployed profile (4 Oct), as the CI audit
+
+- name: Monitor configuration
+  ansible.builtin.copy:
+    dest: "{{ fleet_monitor_etc }}/monitor.json"
+    owner: root
+    group: "{{ fleet_monitor_user }}"
+    mode: "0640"
+    content: "{{ cfg | to_nice_json }}\n"
+  vars:
+    cfg:
+      target: "{{ fleet_monitor_target }}"
+      key: "{{ fleet_monitor_home }}/.ssh/id_ed25519"
+      known_hosts: "{{ fleet_monitor_etc }}/known_hosts"
+      expected: "{{ fleet_monitor_lib }}/deployed.json"
+      state_dir: "{{ fleet_monitor_home }}"
+      gitlab_url: "https://{{ gitlab_fqdn }}"
+      project: "{{ fleet_monitor_project }}"
+      owner: "{{ fleet_monitor_owner }}"
+      token_file: "{{ fleet_monitor_etc }}/gitlab-token"
+
+- name: Alert token present?
+  ansible.builtin.stat:
+    path: "{{ fleet_monitor_etc }}/gitlab-token"
+  register: fm_token
+
+- name: Alert token (project access token, api scope, Reporter; created once, never printed)
+  when: not fm_token.stat.exists
+  vars:
+    fm_token_tmp: /run/prace-monitor-token
+  block:
+    - name: Private staging directory for the git user (gitlab-rails runner drops to git)
+      ansible.builtin.file:
+        path: "{{ fm_token_tmp }}"
+        state: directory
+        owner: git
+        group: git
+        mode: "0700"
+    - name: Token creation script
+      ansible.builtin.template:
+        src: create-token.rb.j2
+        dest: "{{ fm_token_tmp }}/create-token.rb"
+        owner: git
+        group: git
+        mode: "0600"
+    - name: Create the token
+      ansible.builtin.command: gitlab-rails runner {{ fm_token_tmp }}/create-token.rb
+    - name: Move it to the monitor's configuration
+      ansible.builtin.command: install -o {{ fleet_monitor_user }} -g {{ fleet_monitor_user }} -m 0600 {{ fm_token_tmp }}/token {{ fleet_monitor_etc }}/gitlab-token
+  always:
+    - name: Remove the staging directory
+      ansible.builtin.file:
+        path: "{{ fm_token_tmp }}"
+        state: absent
+
+- name: Alert token readable by the monitor only
+  ansible.builtin.file:
+    path: "{{ fleet_monitor_etc }}/gitlab-token"
+    owner: "{{ fleet_monitor_user }}"
+    group: "{{ fleet_monitor_user }}"
+    mode: "0600"
+
+- name: Monitor units
+  ansible.builtin.copy:
+    dest: "/etc/systemd/system/{{ item.name }}"
+    owner: root
+    group: root
+    mode: "0644"
+    content: "{{ item.content }}"
+  loop:
+    - name: prace-fleet-monitor.service
+      content: |
+        # Managed by Ansible (roles/fleet_monitor)
+        [Unit]
+        Description=Off-node fleet health observation (read-only)
+        OnFailure=prace-fleet-monitor-failed.service
+        [Service]
+        Type=oneshot
+        User={{ fleet_monitor_user }}
+        ExecStart=/usr/bin/python3 {{ fleet_monitor_lib }}/fleet_monitor.py run --config {{ fleet_monitor_etc }}/monitor.json
+        TimeoutStartSec=120
+        NoNewPrivileges=yes
+        ProtectSystem=strict
+        ProtectHome=yes
+        ReadWritePaths={{ fleet_monitor_home }}
+        PrivateTmp=yes
+    - name: prace-fleet-monitor-failed.service
+      content: |
+        # Managed by Ansible (roles/fleet_monitor)
+        [Unit]
+        Description=Alert that the fleet monitor itself failed
+        [Service]
+        Type=oneshot
+        User={{ fleet_monitor_user }}
+        ExecStart=/usr/bin/python3 {{ fleet_monitor_lib }}/fleet_monitor.py self-alert --config {{ fleet_monitor_etc }}/monitor.json --reason "prace-fleet-monitor.service failed"
+        NoNewPrivileges=yes
+        ProtectSystem=strict
+        ProtectHome=yes
+        ReadWritePaths={{ fleet_monitor_home }}
+    - name: prace-fleet-monitor.timer
+      content: |
+        # Managed by Ansible (roles/fleet_monitor)
+        [Unit]
+        Description=Fleet health observation every {{ fleet_monitor_interval_s }} s
+        [Timer]
+        OnBootSec=2min
+        OnUnitActiveSec={{ fleet_monitor_interval_s }}s
+        AccuracySec=5s
+        [Install]
+        WantedBy=timers.target
+  loop_control:
+    label: "{{ item.name }}"
+  notify: reload systemd
+
+- name: Flush handlers (units loaded)
+  ansible.builtin.meta: flush_handlers
+
+- name: Public keys to authorize on the login node (inventories/fleet fleet_observer_keys)
+  ansible.builtin.command: cat {{ fleet_monitor_home }}/.ssh/id_ed25519.pub /home/{{ fleet_audit_user }}/.ssh/fleet_audit_ed25519.pub
+  register: fm_pub
+  changed_when: false
+  check_mode: false
+
+- name: Show them
+  ansible.builtin.debug:
+    msg: "{{ fm_pub.stdout_lines }}"
+
+- name: Monitor timer running (only once the login node authorizes the key)
+  ansible.builtin.systemd:
+    name: prace-fleet-monitor.timer
+    enabled: true
+    state: started
+  when: fleet_monitor_enable | default(false) | bool

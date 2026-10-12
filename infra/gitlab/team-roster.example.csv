@@ -1,0 +1,8 @@
+# Copy to ~/.config/prace-lab/gitlab-team-roster.csv (chmod 600; it holds names and emails,
+# so keep the real one out of git). Check it with a dry run, then create the accounts:
+#   ssh contributor@example.org 'DRY_RUN=1 gitlab-rails runner /usr/local/sbin/gitlab-team-users.rb' < ~/.config/prace-lab/gitlab-team-roster.csv
+#   ssh contributor@example.org 'gitlab-rails runner /usr/local/sbin/gitlab-team-users.rb' < ~/.config/prace-lab/gitlab-team-roster.csv
+# username,Full Name,email[,role]     role: guest|reporter|developer|maintainer (default developer)
+# Separate fields with commas (or tabs, as a spreadsheet paste gives you); spaces are not a separator.
+alice.tan,Alice Tan,contributor@example.org
+bob.lim,Bob Lim,contributor@example.org,developer

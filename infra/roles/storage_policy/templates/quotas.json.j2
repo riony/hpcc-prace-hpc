@@ -1,0 +1,16 @@
+{# Rendered by roles/storage_policy from storage.yml + accounts.yml; read by prace-quota-apply. #}
+{% set cats = ['team', 'synthetic', 'agents'] %}
+{% set ns = namespace(users=[], projects=[]) %}
+{% for u in cluster_users if u.state | default('present') == 'present' %}
+{%   set cat = u.groups | default([]) | select('in', cats) | first | default('default') %}
+{%   set q = storage_home_quota_user[u.name] if u.name in storage_home_quota_user else storage_home_quota[cat] %}
+{%   set ns.users = ns.users + [q | combine({'uid': u.uid, 'name': u.name})] %}
+{% endfor %}
+{% for p in storage_projects %}
+{%   set gid = (cluster_groups | selectattr('name', 'equalto', p.name) | first).gid %}
+{%   set ns.projects = ns.projects + [{'id': gid, 'name': p.name, 'dir': '/projects/' ~ p.name, 'bsoft': p.bsoft, 'bhard': p.bhard, 'isoft': p.isoft, 'ihard': p.ihard}] %}
+{% endfor %}
+{{ {
+  'home': none if 'home' in storage_defer else {'path': '/home', 'grace_s': storage_quota_grace_s, 'default': storage_home_quota.default, 'users': ns.users},
+  'projects': none if 'projects' in storage_defer else {'path': '/projects', 'grace_s': storage_quota_grace_s, 'projects': ns.projects}
+} | to_nice_json }}

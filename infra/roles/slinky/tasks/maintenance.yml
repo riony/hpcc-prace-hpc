@@ -1,0 +1,10 @@
+---
+# A lease-matched, source-recorded intent is required while a maintenance lease exists.
+# The overlay persists in K3s's manifest directory across reconciles and controller restarts.
+- name: Verify and persist the lease-bound chart admission state before reconciliation
+  ansible.builtin.command:
+    argv: "{{ ['/usr/bin/python3', '-c', lookup('ansible.builtin.file', role_path ~ '/files/prace-slinky-maintenance.py')] + (['--check'] if ansible_check_mode else []) }}"
+    stdin: "{{ lookup('ansible.builtin.template', 'prace-slinky-maintenance.json.j2') }}"
+  register: slinky_maintenance
+  changed_when: "'maintenance overlay changed' in slinky_maintenance.stdout"
+  check_mode: false

@@ -1,0 +1,52 @@
+---
+# Storage rehearsal guard: a storage playbook run against the rehearsal VMs imports this first.
+#   - name: Refuse anything but the storage rehearsal VMs
+#     ansible.builtin.import_playbook: storage-rehearsal-guard.yml
+#   tools/run-ansible.sh -i inventories/storage-rehearsal playbooks/<that playbook>.yml
+# Every targeted host must be sr-login or sr-client on the login node's 127.0.0.1 forward
+# (2242 / 2252), reached with ProxyJump root@192.0.2.205 and the rehearsal's pinned known_hosts.
+# Anything else (the fleet or rehearsal inventory, a mixed inventory, -e overrides of the host,
+# port, connection or ssh arguments) stops the whole run before any host is contacted: the play
+# runs on the targeted hosts themselves (so --limit cannot skip it, unlike a localhost play), its
+# assert runs on the controller only, and one failed host ends the run for all. The checks use
+# no helper variables, so -e cannot redefine them. Like playbooks/rehearsal.yml it is tagged
+# 'always': --skip-tags always and --start-at-task bypass it, so do not use those here.
+- name: Storage rehearsal guard (controller-side; stops unless every target is a storage rehearsal VM)
+  hosts: all
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - name: Every target is sr-login (127.0.0.1:2242) or sr-client (127.0.0.1:2252) behind root@192.0.2.205
+      ansible.builtin.assert:
+        that:
+          - inventory_hostname in ['sr-login', 'sr-client']
+          - storage_rehearsal | default(false) | bool
+          - (ansible_connection | default('ssh')) == 'ssh'
+          - ansible_host_key_checking | default(false) | bool
+          - ansible_ssh_host_key_checking | default(true) | bool
+          - (ansible_ssh_extra_args | default('')) == ''
+          - (ansible_ssh_args | default('')) == ''
+          - lookup('ansible.builtin.config', 'ssh_extra_args', plugin_type='connection', plugin_name='ssh') | default('', true) == ''
+          - >-
+            (ansible_ssh_common_args | default('') | split | join(' ')) ==
+            ('-F ' ~ lookup('env', 'HOME') ~ '/.cache/prace-storage-rehearsal/ssh_config -o ProxyJump=root@192.0.2.205'
+             ~ ' -o StrictHostKeyChecking=yes -o UserKnownHostsFile=' ~ lookup('env', 'HOME')
+             ~ '/.cache/prace-storage-rehearsal/known_hosts -o HostKeyAlgorithms=ssh-ed25519 -o IdentitiesOnly=yes')
+          - (ansible_host | default('')) == '127.0.0.1'
+          - (ansible_ssh_host | default('127.0.0.1')) == '127.0.0.1'
+          - (ansible_port | default(0) | int) == (2242 if inventory_hostname == 'sr-login' else 2252)
+          - (ansible_ssh_port | default(ansible_port | default(0)) | int) == (ansible_port | default(0) | int)
+          - (ansible_ssh_common_args | default('')) is search('(^|\s)-o ProxyJump=root@172\.21\.25\.205(\s|$)')
+          - (ansible_ssh_common_args | default('') | regex_findall('ProxyJump|ProxyCommand|(?:^|\s)-J') | length) == 1
+          - (ansible_ssh_common_args | default('')) is search('(^|\s)-o StrictHostKeyChecking=yes(\s|$)')
+          - (ansible_ssh_common_args | default('')) is search('(^|\s)-o UserKnownHostsFile=\S*/\.cache/prace-storage-rehearsal/known_hosts(\s|$)')
+          - (ansible_ssh_common_args | default('') | regex_findall('(?:^|\s)-F\s') | length) == 1
+          - (ansible_ssh_common_args | default('')) is search('(^|\s)-F \S*/\.cache/prace-storage-rehearsal/ssh_config(\s|$)')
+          - >-
+            ((ansible_ssh_extra_args | default('')) ~ ' ' ~ (ansible_ssh_args | default('')))
+            | regex_findall('Proxy|(?:^|\s)-[JF]|KnownHosts|StrictHostKeyChecking|HostName') | length == 0
+        fail_msg: >-
+          {{ inventory_hostname }} is not a storage rehearsal VM (127.0.0.1:2242/2252 through
+          root@192.0.2.205 with the rehearsal's known_hosts); refusing to run
+        quiet: true
+      tags: [always]

@@ -1,0 +1,42 @@
+---
+# Admission-only apply of a slurm-window.py intent: the first closed overlay of a window (runbook
+# step 2.3), a refreshed closed one, or `prepare-open`'s opening one. Installs the helper and the
+# overlay only: no database, account, image, worker, native or general chart convergence.
+- name: Admission overlay arming gate
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - ansible.builtin.assert:
+        that:
+          - fleet_armed | default(false) | bool
+          - slurm_window_intent is defined
+          - fleet_lease_id | default('') == slurm_window_intent.lease_id
+        quiet: true
+        fail_msg: Armed matching maintenance-window intent is required
+      tags: [always]
+
+- name: Apply only the persistent admission overlay
+  hosts: "{{ 'login' if (fleet_armed | default(false) | bool) else 'fleet_not_armed_no_hosts' }}"
+  gather_facts: false
+  tasks:
+    - name: Matching explicit window on the login node
+      ansible.builtin.assert:
+        that:
+          - fleet_armed | default(false) | bool
+          - slurm_window_intent is defined
+          - fleet_lease_id | default('') == slurm_window_intent.lease_id
+        quiet: true
+      tags: [always]
+    - name: The native worker topology is unchanged (the overlay must match the deployed chart)
+      ansible.builtin.include_role:
+        name: slinky
+        tasks_from: maintenance-topology.yml
+    - name: The maintenance overlay helper (a later close re-closes the overlay with it)
+      ansible.builtin.include_role:
+        name: slinky
+        tasks_from: maintenance-helper.yml
+    - name: Apply only maintenance state
+      ansible.builtin.include_role:
+        name: slinky
+        tasks_from: maintenance.yml

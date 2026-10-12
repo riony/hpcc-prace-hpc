@@ -1,0 +1,13 @@
+---
+# This node's ports, IPoIB addresses and subnet managers now (files/prace-ib-ports.py; read-only).
+- name: InfiniBand report (read-only)
+  ansible.builtin.script:
+    cmd: "prace-ib-ports.py{{ (' --ping ' ~ (ibf_ping | map('quote') | join(' '))) if ibf_ping | default([]) | length > 0 else '' }}"
+    executable: "{{ ib_fabric_helper_python }}"
+  register: ibf_report_run
+  changed_when: false
+  check_mode: false
+
+- name: The report
+  ansible.builtin.set_fact:
+    ibf_now: "{{ ibf_report_run.stdout | from_json }}"

@@ -1,0 +1,161 @@
+---
+# Managed by Ansible (roles/nfs_home): the login node exports /home, /projects (rw) and /apps
+# (ro) to the private network; the other nodes mount them (logins keep working even if BeeGFS
+# scratch is down). Shares in storage_defer are left untouched here (roles/login_storage).
+- name: NFS utilities (and the library the SELinux boolean module needs)
+  ansible.builtin.dnf:
+    name: [nfs-utils, python3-libsemanage]
+    state: present
+
+- name: Server side (login node)
+  when: fleet_role == 'login'
+  block:
+    # Checked before any export file is written: when it fails (or login_storage has not run
+    # yet), no new share becomes exportable.
+    - name: Every share to export is on its LV with quotas on (fail closed)
+      ansible.builtin.command: /usr/local/sbin/prace-storage-check
+      changed_when: false
+      check_mode: false
+      when: storage_enable | default(true) | bool and not ansible_check_mode
+
+    # Mountpoint protection prevents exporting the root-filesystem directory if its LV is absent.
+    - name: Export /home to the private network only
+      ansible.builtin.copy:
+        dest: /etc/exports.d/fleet-home.exports
+        mode: "0644"
+        content: |
+          # Managed by Ansible (roles/nfs_home)
+          /home {{ admin_network }}(rw,sync,root_squash,no_subtree_check,mountpoint)
+      register: nh_exports
+
+    - name: Export the other shares (/projects rw, /apps ro), private network only
+      ansible.builtin.copy:
+        dest: "/etc/exports.d/fleet-{{ item.name }}.exports"
+        mode: "0644"
+        content: |
+          # Managed by Ansible (roles/nfs_home)
+          {{ item.path }} {{ admin_network }}({{ item.export }},sync,root_squash,no_subtree_check,mountpoint)
+      loop: "{{ nh_shares }}"
+      loop_control: {label: "{{ item.path }}"}
+      register: nh_share_exports
+
+    - name: NFS server running
+      ansible.builtin.systemd:
+        name: nfs-server
+        state: started
+        enabled: true
+
+    - name: Exported paths now
+      ansible.builtin.command: exportfs -s
+      register: nh_live
+      changed_when: false
+      check_mode: false
+
+    # Reconcile, not only on a file change: re-export whenever the live set differs.
+    - name: Re-export when the files changed or the live set differs
+      ansible.builtin.command: exportfs -ra
+      when: >-
+        nh_exports is changed or nh_share_exports is changed
+        or (nh_live.stdout_lines | map('split') | map('first') | list | sort)
+           != ((['/home'] + nh_shares | map(attribute='path') | list) | sort)
+
+    - name: Exports as declared (paths, rw/ro, root_squash, sync, secure)
+      ansible.builtin.command: exportfs -v
+      register: nh_v
+      changed_when: false
+      check_mode: false
+
+    - name: Assert the export options
+      ansible.builtin.assert:
+        # No backslashes: Jinja string literals decode escapes (a regex word boundary would
+        # become a backspace). One option = a whole comma-separated word inside the parentheses.
+        that: >-
+          nh_v.stdout_lines | select('match', item.path ~ '[^-_./a-zA-Z0-9]+' ~ admin_network | regex_escape ~ '[(]')
+          | map('regex_replace', '^[^(]*[(]', ',') | map('regex_replace', '[)].*$', ',') | select('search', ',' ~ item.export ~ ',')
+          | select('search', ',(mountpoint|mp)(=' ~ (item.path | regex_escape) ~ ')?,')
+          | select('search', ',sync,') | select('search', ',secure,') | select('search', ',root_squash,')
+          | reject('search', ',insecure,|,no_root_squash,|,async,') | list | length == 1
+        fail_msg: "{{ item.path }} is not exported as declared: {{ nh_v.stdout }}"
+        quiet: true
+      loop: "{{ [{'path': '/home', 'export': 'rw'}] + nh_shares }}"
+      loop_control: {label: "{{ item.path }}"}
+      when: not ansible_check_mode
+
+- name: Client side (every other node)
+  when: fleet_role != 'login'
+  block:
+    - name: SELinux allows home directories on NFS
+      ansible.posix.seboolean:
+        name: use_nfs_home_dirs
+        state: true
+        persistent: true
+
+    - name: Install the non-destructive unmounted-directory guard
+      ansible.builtin.copy:
+        src: prace-nfs-underlay
+        dest: /usr/local/sbin/prace-nfs-underlay
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Inspect mountpoints without following symlinks
+      ansible.builtin.stat:
+        path: "{{ item.path }}"
+        follow: false
+      register: nh_dirs
+      loop: "{{ ([{'path': '/home', 'export': 'rw'}] if 'home' not in storage_defer else []) + nh_shares }}"
+      loop_control: {label: "{{ item.path }}"}
+
+    - name: Existing mountpoints must be directories rather than symlinks
+      ansible.builtin.assert:
+        that: not item.stat.exists or (item.stat.isdir | default(false) and not item.stat.islnk | default(false))
+        quiet: true
+      loop: "{{ nh_dirs.results }}"
+      loop_control: {label: "{{ item.item.path }}"}
+
+    - name: Create absent mountpoints only (never chown through an active NFS mount)
+      ansible.builtin.file:
+        path: "{{ item.item.path }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+      when: not item.stat.exists
+      loop: "{{ nh_dirs.results }}"
+      loop_control: {label: "{{ item.item.path }}"}
+
+    # Existing mounts are NOT unmounted by ordinary convergence. The operator prepares
+    # legacy /home in the fenced window. Mounted here is not a claim about its underlay.
+    - name: Guard empty unmounted directories including home; preserve legacy home only explicitly
+      ansible.builtin.shell: |
+        set -euo pipefail
+        p={{ item.path | quote }}
+        rc=0; out=$(findmnt -rn --mountpoint "$p" 2>&1) || rc=$?
+        if [ "$rc" = 0 ] && [ -n "$out" ]; then echo mounted-underlay-not-inspected; exit 0; fi
+        [ "$rc" = 1 ] && [ -z "$out" ] || { echo "mount observation failed"; exit 3; }
+        /usr/local/sbin/prace-nfs-underlay --path "$p"{% if item.path == '/home' and nfs_underlay_preserve_id | default('') | length > 0 %} --preserve-home {{ nfs_underlay_preserve_id | quote }}{% endif %}
+      args: {executable: /bin/bash}
+      register: nh_underlay
+      changed_when: >-
+        '"changed": true' in nh_underlay.stdout
+      loop: "{{ ([{'path': '/home', 'export': 'rw'}] if 'home' not in storage_defer else []) + nh_shares }}"
+      loop_control: {label: "{{ item.path }}"}
+
+    - name: Mount the login node's /home
+      ansible.posix.mount:
+        path: /home
+        src: "{{ hostvars[groups['login'][0]].admin_ip }}:/home"
+        fstype: nfs
+        opts: "rw,{{ storage_client_opts }}"
+        state: mounted
+      when: "'home' not in storage_defer"
+
+    - name: Mount the other shares (/apps read-only)
+      ansible.posix.mount:
+        path: "{{ item.path }}"
+        src: "{{ hostvars[groups['login'][0]].admin_ip }}:{{ item.path }}"
+        fstype: nfs
+        opts: "{{ item.export }},{{ storage_client_opts }}"
+        state: mounted
+      loop: "{{ nh_shares }}"
+      loop_control: {label: "{{ item.path }}"}

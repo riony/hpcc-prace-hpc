@@ -1,0 +1,181 @@
+---
+# Managed by Ansible (roles/slinky, from native-prepare.yml). The native slurmd's configuration:
+# the cluster's auth/slurm key, the controller's name, the systemd drop-in (configless from the
+# controller's service address, dynamic registration with this kind's feature, NodeAddr on the
+# private network, the NodeSet's job budget as CoreSpecCount/MemSpecLimit), and this host's
+# transition marker. Nothing is started. Separate so the offline tests run exactly these tasks
+# (tools/test-slinky-native.py).
+# argv, never a command string: the module splits a string like a shell and drops the backslash of
+# slurm\.key (the data key's own dot), and kubectl then prints nothing with rc 0 (P2, 5 Oct). An
+# empty or malformed key fails here, so the copy below never runs with an empty stdin (which left
+# base64 -d reading the SSH channel, a hang instead of a failure).
+- name: The cluster's auth/slurm key, read on the login node (never printed; non-empty base64 or stop)
+  ansible.builtin.command:
+    argv: "{{ slinky_kubectl.split() + slinky_key_query }}"
+  vars:
+    slinky_key_query: [-n, slurm, get, secret, slurm-auth-slurm, -o, 'jsonpath={.data.slurm\.key}']
+  delegate_to: "{{ groups['login'][0] }}"
+  register: slinky_key_b64
+  changed_when: false
+  failed_when: >-
+    slinky_key_b64.rc != 0 or slinky_key_b64.stdout is not
+    match('^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=|[A-Za-z0-9+/]{4})$')
+  check_mode: false          # read-only
+  no_log: true
+
+- name: The key file before this run
+  ansible.builtin.stat:
+    path: "{{ slinky_native_key_file }}"
+    get_checksum: false
+  register: slinky_key_before
+
+- name: The key on this host, byte for byte (replaced only when it differs)
+  ansible.builtin.command:
+    argv:
+      - sh
+      - -c
+      - >-
+        umask 077; t=$(mktemp "$(dirname "$1")/.slurm.key.XXXXXX") || exit 1;
+        base64 -d > "$t" && [ -s "$t" ] || { rm -f "$t"; echo "key decode failed"; exit 1; };
+        if cmp -s "$t" "$1"; then rm -f "$t"; echo same;
+        else chown "$2" "$t" && mv -f "$t" "$1" && echo changed; fi
+      - prace-key
+      - "{{ slinky_native_key_file }}"
+      - "{{ slinky_slurm_uid }}:{{ slinky_slurm_gid }}"
+    stdin: "{{ slinky_key_b64.stdout }}"
+  register: slinky_key_file
+  changed_when: slinky_key_file.stdout == 'changed'
+  no_log: true
+
+# Also when the bytes were already right: a drifted mode or owner is repaired (0600, slurm only)
+- name: The key is readable by slurm only
+  ansible.builtin.file:
+    path: "{{ slinky_native_key_file }}"
+    state: file
+    owner: "{{ slinky_slurm_uid }}"
+    group: "{{ slinky_slurm_gid }}"
+    mode: "0600"
+  when: not ansible_check_mode or slinky_key_before.stat.exists
+
+- name: The controller's service address (kube-proxy on this K3s agent routes it)
+  ansible.builtin.command: "{{ slinky_kubectl }} -n slurm get service slurm-controller -o jsonpath={.spec.clusterIP}"
+  delegate_to: "{{ groups['login'][0] }}"
+  register: slinky_ctl_ip
+  changed_when: false
+  check_mode: false          # read-only
+  failed_when: slinky_ctl_ip.rc != 0 or slinky_ctl_ip.stdout is not match('^[0-9.]+$')
+
+- name: The controller's name resolves on this host (slurm.conf names SlurmctldHost by it)
+  ansible.builtin.blockinfile:
+    path: "{{ slinky_native_hosts_file }}"
+    marker: "# {mark} prace Slinky controller (roles/slinky, native worker)"
+    block: "{{ slinky_ctl_ip.stdout }} {{ slinky_controller_name }}"
+  register: slinky_hosts
+
+# --- the job budget from this host's own topology. A first --check preview has only simulated
+# the package, so slurmd is not there yet: the preview says so and the apply computes it.
+- name: slurmd installed
+  ansible.builtin.stat:
+    path: "{{ slinky_native_slurmd }}"
+    get_checksum: false
+  register: slinky_slurmd_bin
+
+- name: slurmd is installed (the package task above ran)
+  ansible.builtin.assert:
+    that: slinky_slurmd_bin.stat.exists
+    fail_msg: "{{ slinky_native_slurmd }} is missing after the package install"
+    quiet: true
+  when: not ansible_check_mode
+
+- name: Preview only - the budget and the drop-in come after the install
+  ansible.builtin.debug:
+    msg: >-
+      preview: {{ slinky_native_slurmd }} is not installed yet; the apply installs it, computes
+      CoreSpecCount/MemSpecLimit from 'slurmd -C' for the {{ fleet_role }} budget
+      {{ slinky_nodeset_resources[fleet_role] }} and writes {{ slinky_native_dropin }}
+  when: not slinky_slurmd_bin.stat.exists
+
+- name: The drop-in
+  when: slinky_slurmd_bin.stat.exists
+  block:
+    - name: This host's topology and memory as slurmd sees them
+      ansible.builtin.command: "{{ slinky_native_slurmd }} -C"
+      register: slinky_slurmd_c
+      changed_when: false
+      check_mode: false          # read-only
+
+    - name: This host's cores, threads and memory (the key=value fields of slurmd -C)
+      ansible.builtin.set_fact:
+        slinky_native_hw: "{{ dict(slinky_slurmd_c.stdout_lines[0].split() | map('split', '=')) }}"
+
+    - name: This host's core count
+      ansible.builtin.set_fact:
+        slinky_native_cores: "{{ (slinky_native_hw.Boards | int) * (slinky_native_hw.SocketsPerBoard | int) * (slinky_native_hw.CoresPerSocket | int) }}"
+        slinky_native_threads: "{{ slinky_native_hw.ThreadsPerCore | int }}"
+        slinky_native_realmem: "{{ slinky_native_hw.RealMemory | int }}"
+
+    - name: The NodeSet's job budget as CoreSpecCount and MemSpecLimit (as the slurmd image does)
+      ansible.builtin.set_fact:
+        slinky_native_spec:
+          core_spec: "{{ (slinky_native_cores | int) - (slinky_nodeset_resources[fleet_role].cpu | int) // (slinky_native_threads | int) }}"
+          mem_spec: >-
+            {{ (slinky_native_realmem | int) - (slinky_nodeset_resources[fleet_role].memory[:-2] | int)
+               * (1024 if slinky_nodeset_resources[fleet_role].memory.endswith('Gi') else 1) }}
+          threads: "{{ slinky_native_threads | int }}"
+
+    - name: The budget fits this host
+      ansible.builtin.assert:
+        that:
+          - slinky_native_spec.core_spec | int >= 0
+          - slinky_native_spec.mem_spec | int >= 0
+          - (slinky_nodeset_resources[fleet_role].cpu | int) % (slinky_native_spec.threads | int) == 0
+        fail_msg: "budget {{ slinky_nodeset_resources[fleet_role] }} does not fit {{ slinky_slurmd_c.stdout_lines[0] }}"
+        quiet: true
+
+    - name: Drop-in directory for slurmd
+      ansible.builtin.file: {path: "{{ slinky_native_dropin | dirname }}", state: directory, mode: "0755"}
+
+    # 4 Oct (Session C): no pod, so neither the NRI mount guard nor the pods' share check applies here
+    - name: The native share gate (slurmd's ExecStartPre; reads the host's mounts only)
+      ansible.builtin.copy:
+        src: prace-native-share-check.sh
+        dest: "{{ slinky_native_share_check }}"
+        mode: "0755"
+      when: slinky_pod_shares | length > 0
+
+    - name: slurmd joins the Slinky controller (systemd drop-in; started by tasks/native.yml)
+      ansible.builtin.copy:
+        dest: "{{ slinky_native_dropin }}"
+        mode: "0644"
+        content: |
+          # Managed by Ansible (roles/slinky, tasks/native-config.yml): a native slurmd under the Slinky
+          # controller. The K3s agent provides the route to the controller's service address. Jobs use the
+          # host's shared storage: slurmd starts only with every required share mounted (never on the
+          # empty directories underneath), and only as the login node's NFS 4.2 export, hard, with
+          # nosuid, nodev and its mode (the share gate; no NRI guard or pod share check exists here).
+          [Unit]
+          After=network-online.target k3s-agent.service
+          Wants=network-online.target
+          {{ ('RequiresMountsFor=' ~ (slinky_pod_shares | map(attribute='path') | join(' '))) if slinky_pod_shares | length > 0 else '# no shared storage configured' }}
+          [Service]
+          {{ ('ExecStartPre=' ~ slinky_native_share_check ~ ' ' ~ hostvars[groups['login'][0]].admin_ip ~ ' ' ~ (slinky_share_modes | join(' '))) if slinky_pod_shares | length > 0 else '# no share gate: no shared storage configured' }}
+          ExecStart=
+          ExecStart={{ slinky_native_slurmd }} --systemd -Z --conf-server {{ slinky_controller_name }}:{{ slinky_controller_port }} --conf "Features={{ fleet_role }} NodeAddr={{ admin_ip }} CoreSpecCount={{ slinky_native_spec.core_spec }} MemSpecLimit={{ slinky_native_spec.mem_spec }}"
+          Delegate=yes
+          Restart=on-failure
+          RestartSec=10
+      register: slinky_dropin
+
+- name: Transition marker directory
+  ansible.builtin.file: {path: "{{ slinky_native_marker | dirname }}", state: directory, mode: "0755"}
+
+- name: Transition marker - native (tasks/native-off.yml sets leaving; worker-check.yml clears it)
+  ansible.builtin.copy:
+    dest: "{{ slinky_native_marker }}"
+    content: "native\n"
+    mode: "0644"
+
+# login.yml requires this from every host joining the native list (in --check: the preview passed)
+- name: Prepared for the NodeSet transition
+  ansible.builtin.set_fact:
+    slinky_native_prepared: true

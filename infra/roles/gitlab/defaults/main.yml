@@ -1,0 +1,41 @@
+---
+# GitLab CE on the management VM. Override per host in inventories/mgmt/host_vars.
+gitlab_version: "19.4.1-ce.0.el9"          # pinned; upgrade = change this + re-run
+gitlab_fqdn: "mgmt-git01.example-tailnet.ts.net"  # Tailscale name; certificate from `tailscale cert`
+gitlab_backup_oncalendar: "*-*-* 01:30:00"  # local time; align with the storage snapshot window
+# The read-only fleet dashboard (roles/fleet_dashboard): GitLab's nginx serves its scrubbed static
+# site at /prace-dash/ (GET and HEAD only, strict CSP). Enabling it changes gitlab.rb, so the next run
+# reconfigures GitLab (a brief interruption). Before the first one, check that no GitLab group or
+# user is named prace-dash (the location would shadow it).
+gitlab_prace_dash: false
+gitlab_prace_dash_root: /var/lib/prace-dash/www
+gitlab_backup_keep_days: 7
+gitlab_team_group: hpcc
+gitlab_team_labels:                          # name: colour (plain labels; scoped labels need a paid tier)
+  task: "#1068bf"
+  finding: "#c91c00"
+  handoff: "#6699cc"
+  lease: "#e9be74"
+  change-request: "#dc143c"
+  blocked: "#808080"
+  needs-verification: "#8fbc8f"
+  verified: "#009966"
+gitlab_mr_only_projects:                     # main: push = No one, merge = Maintainers
+  - hpcc/prace-hackathon
+gitlab_pipeline_schedules:                   # matched by project + description; owner runs the pipelines
+  - project: hpcc/prace-hackathon
+    description: lab-drift-check             # scheduled pipelines run only this job (.gitlab-ci.yml)
+    ref: refs/heads/main
+    cron: "0 7,19 * * *"
+    cron_timezone: Asia/Singapore
+    owner: team-user01                        # needs merge rights on main (protected-ref runner)
+    active: true
+# Outgoing email: off unless a host enables it AFTER the owner has stored the SMTP login in
+# GitLab's encrypted credentials (gitlab-rake gitlab:smtp:secret:write; never in gitlab.rb/git).
+gitlab_smtp_enable: false
+gitlab_smtp_address: smtp.gmail.com
+gitlab_smtp_port: 587                        # STARTTLS
+gitlab_email_from: ""                        # per host; for Gmail it must be the SMTP login
+gitlab_email_display_name: "HPCC GitLab"
+gitlab_smtp_secret_file: /var/opt/gitlab/gitlab-rails/shared/encrypted_settings/smtp.yaml.enc
+gitlab_pipeline_email_recipients: {}         # project path: [addresses]; failed pipelines on the default branch

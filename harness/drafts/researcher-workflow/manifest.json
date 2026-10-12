@@ -1,0 +1,292 @@
+{
+  "schema": "prace.scenario.v1",
+  "id": "researcher-workflow",
+  "version": 1,
+  "title": "Researcher workflow: CPU and GPU site examples, results kept",
+  "status": "smoke",
+  "description": "DRAFT (7 Oct 2026, revised after review), not yet runnable: needs the new action kinds env.modules, slurm.submit-example, file.tail and file.copy (see README). The agent equivalent of the recorded human researcher session: discover the environment, run the site's CPU and GPU examples as a normal user, read their output and keep the results, with independent accounting and replay. Benign; no security claim.",
+  "actor": {
+    "identity": "syn-smoke",
+    "project": "proj-ops",
+    "intent": "benign"
+  },
+  "boundaries": {
+    "action_targets": [
+      "login-pod"
+    ],
+    "observation_targets": [
+      "login-pod"
+    ],
+    "paths": [
+      "/tmp/prace-researcher-workflow-v1"
+    ],
+    "action_kinds": [
+      "env.modules",
+      "file.copy",
+      "file.list",
+      "file.mkdir",
+      "file.tail",
+      "slurm.submit-example",
+      "slurm.wait"
+    ]
+  },
+  "budgets": {
+    "max_actions": 16,
+    "max_seconds": 1200,
+    "max_output_bytes": 8192
+  },
+  "actions": [
+    {
+      "id": "look-around",
+      "kind": "file.list",
+      "target": "login-pod",
+      "identity": "syn-smoke",
+      "parameters": {
+        "path": "/tmp/prace-researcher-workflow-v1"
+      },
+      "timeout_seconds": 10,
+      "capture": {
+        "listing": "workspace_listing"
+      }
+    },
+    {
+      "id": "list-modules",
+      "kind": "env.modules",
+      "target": "login-pod",
+      "identity": "syn-smoke",
+      "parameters": {},
+      "timeout_seconds": 20,
+      "capture": {
+        "modules": "module_names"
+      }
+    },
+    {
+      "id": "prepare-study-dir",
+      "kind": "file.mkdir",
+      "target": "login-pod",
+      "identity": "syn-smoke",
+      "parameters": {
+        "path": "/tmp/prace-researcher-workflow-v1/vecadd-study",
+        "parents": false
+      },
+      "timeout_seconds": 10,
+      "capture": {}
+    },
+    {
+      "id": "submit-cpu-example",
+      "kind": "slurm.submit-example",
+      "target": "login-pod",
+      "identity": "syn-smoke",
+      "parameters": {
+        "workspace": "/tmp/prace-researcher-workflow-v1",
+        "run_id": "run-placeholder",
+        "account": "proj-ops",
+        "partition": "cpu",
+        "example": "batch.sh",
+        "example_sha256": "786108c6e348086463c01877050a7264890f38fb1c1c0817643729f1882a3e87",
+        "path": "/tmp/prace-researcher-workflow-v1/vecadd-study",
+        "source_sha256": {
+          "hello.c": "4137064bfe0a49683b3a648904696a8170c85e592f7b98dbab7f1b2be094c225",
+          "hello_threads.cpp": "1f90cc2b16cb46830ae5333b75095e629ba21ef2c41f212dfe5d3616b98ed2f8"
+        }
+      },
+      "timeout_seconds": 20,
+      "capture": {
+        "job_id": "cpu_job_id"
+      }
+    },
+    {
+      "id": "submit-gpu-example",
+      "kind": "slurm.submit-example",
+      "target": "login-pod",
+      "identity": "syn-smoke",
+      "parameters": {
+        "workspace": "/tmp/prace-researcher-workflow-v1",
+        "run_id": "run-placeholder",
+        "account": "proj-ops",
+        "partition": "gpu",
+        "example": "gpu.sh",
+        "example_sha256": "97f17da44cf92889a6d700a6c72b8749a8672f57beddd9b107209d7694ec342d",
+        "path": "/tmp/prace-researcher-workflow-v1/vecadd-study",
+        "source_sha256": {
+          "vector_add.cu": "51dfb80472f7ebcf5d856890210c69703650dad6ae5d24bc18da69d5cf032cb4"
+        }
+      },
+      "timeout_seconds": 20,
+      "capture": {
+        "job_id": "gpu_job_id"
+      }
+    },
+    {
+      "id": "wait-cpu-job",
+      "kind": "slurm.wait",
+      "target": "login-pod",
+      "identity": "syn-smoke",
+      "parameters": {
+        "workspace": "/tmp/prace-researcher-workflow-v1",
+        "run_id": "run-placeholder",
+        "job_id": "${cpu_job_id}"
+      },
+      "timeout_seconds": 300,
+      "capture": {
+        "job_state": "cpu_job_state"
+      }
+    },
+    {
+      "id": "wait-gpu-job",
+      "kind": "slurm.wait",
+      "target": "login-pod",
+      "identity": "syn-smoke",
+      "parameters": {
+        "workspace": "/tmp/prace-researcher-workflow-v1",
+        "run_id": "run-placeholder",
+        "job_id": "${gpu_job_id}"
+      },
+      "timeout_seconds": 300,
+      "capture": {
+        "job_state": "gpu_job_state"
+      }
+    },
+    {
+      "id": "read-cpu-output",
+      "kind": "file.tail",
+      "target": "login-pod",
+      "identity": "syn-smoke",
+      "parameters": {
+        "path": "/tmp/prace-researcher-workflow-v1/vecadd-study/batch.out",
+        "lines": 4
+      },
+      "timeout_seconds": 10,
+      "capture": {
+        "tail": "cpu_output_tail"
+      }
+    },
+    {
+      "id": "read-gpu-output",
+      "kind": "file.tail",
+      "target": "login-pod",
+      "identity": "syn-smoke",
+      "parameters": {
+        "path": "/tmp/prace-researcher-workflow-v1/vecadd-study/gpu.out",
+        "lines": 2
+      },
+      "timeout_seconds": 10,
+      "capture": {
+        "tail": "gpu_output_tail"
+      }
+    },
+    {
+      "id": "make-results-dir",
+      "kind": "file.mkdir",
+      "target": "login-pod",
+      "identity": "syn-smoke",
+      "parameters": {
+        "path": "/tmp/prace-researcher-workflow-v1/results",
+        "parents": false
+      },
+      "timeout_seconds": 10,
+      "capture": {}
+    },
+    {
+      "id": "copy-cpu-results",
+      "kind": "file.copy",
+      "target": "login-pod",
+      "identity": "syn-smoke",
+      "parameters": {
+        "path": "/tmp/prace-researcher-workflow-v1/vecadd-study/batch.out",
+        "destination": "/tmp/prace-researcher-workflow-v1/results/batch.out"
+      },
+      "timeout_seconds": 10,
+      "capture": {}
+    },
+    {
+      "id": "copy-gpu-results",
+      "kind": "file.copy",
+      "target": "login-pod",
+      "identity": "syn-smoke",
+      "parameters": {
+        "path": "/tmp/prace-researcher-workflow-v1/vecadd-study/gpu.out",
+        "destination": "/tmp/prace-researcher-workflow-v1/results/gpu.out"
+      },
+      "timeout_seconds": 10,
+      "capture": {}
+    },
+    {
+      "id": "check-results",
+      "kind": "file.list",
+      "target": "login-pod",
+      "identity": "syn-smoke",
+      "parameters": {
+        "path": "/tmp/prace-researcher-workflow-v1/results"
+      },
+      "timeout_seconds": 10,
+      "capture": {
+        "listing": "results_listing"
+      }
+    }
+  ],
+  "assertions": [
+    {
+      "id": "record-cpu-job-ok",
+      "phase": "record",
+      "category": "functional",
+      "description": "Independent accounting: the CPU example ran as the actor in proj-ops on the cpu partition with 4 CPUs, under its tagged job name, and ended COMPLETED 0:0."
+    },
+    {
+      "id": "record-gpu-job-ok",
+      "phase": "record",
+      "category": "functional",
+      "description": "Independent accounting: the GPU example ran as the actor in proj-ops on the gpu partition with 4 CPUs and 1 GPU, under its tagged job name, and ended COMPLETED 0:0."
+    },
+    {
+      "id": "record-results-ok",
+      "phase": "record",
+      "category": "functional",
+      "description": "The observer finds results/ holding exactly batch.out and gpu.out, each with the example's success line."
+    },
+    {
+      "id": "replay-cpu-job-ok",
+      "phase": "replay",
+      "category": "functional",
+      "description": "After deterministic replay from a clean workspace, a new CPU example job meets the same accounting expectations."
+    },
+    {
+      "id": "replay-gpu-job-ok",
+      "phase": "replay",
+      "category": "functional",
+      "description": "After deterministic replay from a clean workspace, a new GPU example job meets the same accounting expectations."
+    },
+    {
+      "id": "replay-results-ok",
+      "phase": "replay",
+      "category": "functional",
+      "description": "After replay, results/ again holds exactly batch.out and gpu.out with their success lines."
+    },
+    {
+      "id": "workspace-reset",
+      "phase": "cleanup",
+      "category": "cleanup",
+      "description": "No tagged job of this run is pending or running, and the run workspace is empty after the reports are written."
+    }
+  ],
+  "redaction": {
+    "keys": [
+      "password",
+      "token",
+      "secret",
+      "private_key"
+    ],
+    "patterns": [
+      "-----BEGIN [A-Z ]*PRIVATE KEY-----",
+      "(?i)bearer [A-Za-z0-9._-]{16,}",
+      "(?i)kubeconfig:[^ ]+"
+    ]
+  },
+  "gates": [],
+  "cleanup": {
+    "required": true,
+    "check_ids": [
+      "workspace-reset"
+    ]
+  }
+}

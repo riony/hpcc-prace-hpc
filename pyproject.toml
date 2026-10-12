@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "prace-nat-session"
+version = "0.1.0"
+description = "NeMo workflow for PRACE action recording, deterministic replay and evidence"
+requires-python = ">=3.12,<3.14"
+dependencies = ["nvidia-nat==1.9.0", "greenlet==3.5.6"]
+
+[project.entry-points."nat.components"]
+prace_session = "harness.nemo_session"
+
+[tool.setuptools.packages.find]
+include = ["harness*", "validation*"]

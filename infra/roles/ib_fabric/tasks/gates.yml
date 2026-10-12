@@ -1,0 +1,74 @@
+---
+# Controller-side gates of every ib_fabric run (no host is contacted here). playbooks/ib-fabric.yml
+# repeats them in every play, and every task file that changes a node repeats the gated check, so a
+# --limit or --start-at-task cannot skip them.
+- name: A known state
+  ansible.builtin.assert:
+    that: ib_fabric_state in ['present', 'absent']
+    fail_msg: "ib_fabric_state is present or absent"
+    quiet: true
+
+- name: The committed records (the decision and the peer map come from git, never from -e)
+  ansible.builtin.set_fact:
+    ibf_records: "{{ lookup('ansible.builtin.file', (inventory_dir | default(ansible_inventory_sources | first)) ~ '/group_vars/all/ib_fabric.yml') | from_yaml }}"
+  run_once: true
+
+- name: The owner's decision that lifts D42 and D43 for the ring is recorded (present only)
+  ansible.builtin.assert:
+    that: >-
+      ib_fabric_state == 'absent' or (
+        (ib_fabric_decision | default(none, true) | string) is match('D[0-9]+ ')
+        and (ib_fabric_decision | string).split()[0][1:] | int > 43
+        and ib_fabric_decision == ibf_records.ib_fabric_decision)
+    fail_msg: >-
+      D42 defers the fabric and D43 says no OpenSM/IPoIB/RDMA. Record the owner's later decision that lifts both for
+      the ring in inventories/fleet/group_vars/all/ib_fabric.yml (ib_fabric_decision: "D<n> (owner, <date>): ...",
+      n > 43), reviewed and merged, before any present run; a value given only with -e is refused.
+      Absent (the way back) needs no decision.
+    quiet: true
+
+- name: The peer map is the committed one (present only)
+  ansible.builtin.assert:
+    that: ib_fabric_state == 'absent' or (ib_fabric_peer_map | default(none)) == ibf_records.ib_fabric_peer_map
+    fail_msg: "ib_fabric_peer_map must be the committed value in ib_fabric.yml ({{ ibf_records.ib_fabric_peer_map }}), not -e"
+    quiet: true
+
+- name: Every run covers every GPU node (no --limit)
+  ansible.builtin.assert:
+    that: groups['gpu'] | difference(ansible_play_hosts_all) | length == 0
+    fail_msg: >-
+      A run needs every GPU node in the play ({{ groups['gpu'] | difference(ansible_play_hosts_all) }} missing):
+      present preflights both ends of each link (stage with -e ib_fabric_links=<link>), and the way back must stop
+      every link's manager before its ports stay INIT. Never --limit.
+    quiet: true
+
+- name: A lease id is given (the window tool's lease of this stage)
+  ansible.builtin.assert:
+    that: fleet_lease_id | default('') is match('^[0-9a-f]{16}$')
+    fail_msg: "Take the lease with the window tool (W lease-take --label ib-<stage>) and pass -e fleet_lease_id=<id>"
+    quiet: true
+
+- name: The plan, re-proved from the recorded peer map (tools/ib-fabric-check.py; controller, read-only)
+  ansible.builtin.command:
+    argv: "{{ ib_fabric_plan_cmd }}"
+  delegate_to: localhost
+  become: false
+  run_once: true
+  changed_when: false
+  check_mode: false
+  failed_when: false
+  register: ibf_plan_run
+  when: ib_fabric_state == 'present'
+
+- name: The plan proves every link of this stage (otherwise nothing is configured)
+  ansible.builtin.assert:
+    that: ib_fabric_state == 'absent' or ibf_plan_run.rc == 0
+    fail_msg: "No plan: {{ ((ibf_plan_run.stdout | default('')) ~ ' ' ~ (ibf_plan_run.stderr | default(''))) | trim }}"
+    quiet: true
+  run_once: true
+
+- name: This run's plan (absent removes by this role's own names and needs none)
+  ansible.builtin.set_fact:
+    ibf_plan: "{{ (ibf_plan_run.stdout | from_json) if ib_fabric_state == 'present' else {'hosts': {}} }}"
+    ibf_gates_passed: true
+  run_once: true

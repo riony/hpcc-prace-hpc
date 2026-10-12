@@ -1,0 +1,5 @@
+{
+{% for host in groups['fleet'] if hostvars[host].fleet_disabled_links | default([]) | length > 0 %}
+  "{{ host }}": {"address": "{{ hostvars[host].admin_ip }}", "interfaces": {{ hostvars[host].fleet_disabled_links | to_json }}}{% if not loop.last %},{% endif %}
+{% endfor %}
+}

@@ -1,0 +1,45 @@
+---
+# Shared storage on the login node (D39 storage step, 28 Sep; sizes and quotas approved by the
+# user as proposed). One LV per share on the login node's volume group, exported over NFSv4.2
+# to the private network. Kept apart from accounts.yml: the login pod's identity hash covers
+# that file (roles/slinky), and a quota change must not roll the login pod.
+storage_vg: hpe_vg
+storage_pv_serial: EXNVME00000001        # the login node's only NVMe (host_vars os_disk.serial)
+storage_vg_reserve_g: 300                # free space the role refuses to go below
+storage_server: 10.90.10.1               # login node admin_ip
+storage_lvs:
+  - {name: home, size_g: 200, path: /home, label: prace-home, quota: usrquota, export: rw}
+  - {name: projects, size_g: 250, path: /projects, label: prace-proj, quota: prjquota, export: rw}
+  - {name: apps, size_g: 150, path: /apps, label: prace-apps, quota: "", export: ro}
+storage_mount_opts: "defaults,nodev,nosuid"
+storage_client_opts: "nosuid,nodev,hard,_netdev,vers=4.2"
+# Shares the roles leave untouched (LV created and formatted, but not mounted, exported or
+# client-mounted). Used for the preparation window before the /home cutover:
+#   -e '{"storage_defer":["home"]}'
+storage_defer: []
+# Administrator and service homes live on the login node's local disk, not in the exported
+# /home: over NFS (AUTH_SYS) any client root could otherwise plant keys for them (user decision).
+storage_local_home_root: /var/lib/prace-local-home
+storage_local_home_users: [admin, prace-observer]
+# Old /home trees and leftovers are moved here, never deleted by a role.
+storage_premigration_root: /var/lib/prace-home-premigration
+
+# Quotas (user-approved defaults). Blocks in GiB unless a unit is given; grace 7 days.
+storage_quota_grace_s: 604800
+storage_home_quota:
+  team: {bsoft: 18g, bhard: 20g, isoft: 180000, ihard: 200000}
+  synthetic: {bsoft: 4608m, bhard: 5g, isoft: 45000, ihard: 50000}
+  agents: {bsoft: 4608m, bhard: 5g, isoft: 45000, ihard: 50000}
+  default: {bsoft: 900m, bhard: 1g, isoft: 9000, ihard: 10000}
+# Per-user overrides (the acceptance account gets a tiny quota so the quota-exceeded test is quick).
+storage_home_quota_user:
+  syn-probe: {bsoft: 200m, bhard: 256m, isoft: 1500, ihard: 2000}
+  # Component 4's tracer and observer keep nothing at home (6 Oct); this keeps the sum of hard limits
+  # within 80 % of the /home LV.
+  syn-tracer: {bsoft: 200m, bhard: 256m, isoft: 1500, ihard: 2000}
+  syn-observer: {bsoft: 200m, bhard: 256m, isoft: 1500, ihard: 2000}
+# Project directories: /projects/<group>, setgid 2770 with default ACLs; XFS project ID = GID.
+storage_projects:
+  - {name: proj-alpha, bsoft: 45g, bhard: 50g, isoft: 450000, ihard: 500000}
+  - {name: proj-beta, bsoft: 45g, bhard: 50g, isoft: 450000, ihard: 500000}
+  - {name: proj-ops, bsoft: 45g, bhard: 50g, isoft: 450000, ihard: 500000}   # operators and probes; the default project quota

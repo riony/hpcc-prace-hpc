@@ -1,0 +1,170 @@
+---
+# The BeeGFS client on every physical host: /scratch, one host mount per node (pods get host bind
+# mounts from Session B, never mounts of their own). The kernel module is built on the host when
+# the service starts, without RDMA, for the RUNNING kernel (the autobuild uses uname -r); the
+# next-boot kernel is compile-checked below, so a kernel without its kernel-devel or one the client
+# cannot build for fails here instead of at the next reboot.
+- name: This run passed its gates and holds the lease (a run started past them changes nothing)
+  ansible.builtin.assert:
+    that: bg_run_gated | bool
+    fail_msg: "{{ inventory_hostname }}: nothing done: the gates of playbooks/beegfs.yml did not pass in this run"
+    quiet: true
+
+- name: Shared preparation
+  ansible.builtin.include_tasks: common.yml
+
+- name: Kernel the host boots next
+  ansible.builtin.command: grubby --default-kernel
+  register: bg_boot_kernel
+  changed_when: false
+  check_mode: false
+
+- name: Pinned client packages, build tools and both kernels' headers
+  ansible.builtin.include_tasks: packages.yml
+  vars:
+    bg_pkg_names: "{{ beegfs_packages.client }}"
+    bg_pkg_extra: >-
+      {{ beegfs_client_build_packages
+         + (['kernel-devel-' ~ ansible_kernel, 'kernel-devel-' ~ (bg_boot_kernel.stdout | regex_replace('^/boot/vmlinuz-', ''))] | unique) }}
+
+- name: Module build without RDMA (beegfs-client-autobuild.conf)
+  ansible.builtin.include_tasks: conf-set.yml
+  vars:
+    bg_conf_path: "{{ beegfs_conf_dir }}/beegfs-client-autobuild.conf"
+    bg_conf_settings: {buildArgs: "{{ beegfs_client_build_args }}"}
+    bg_conf_format: kv
+
+- name: Autobuild changed
+  ansible.builtin.set_fact:
+    bg_autobuild_changed: "{{ bg_conf_changed }}"
+
+- name: The kernel the host boots next
+  ansible.builtin.set_fact:
+    bg_boot_kernel_release: "{{ bg_boot_kernel.stdout | regex_replace('^/boot/vmlinuz-', '') }}"
+
+# A compile check in a private copy (read-only for the host): the module itself is built by the
+# autobuild for the running kernel only.
+- name: The client module also compiles for the next-boot kernel (when it is not the running one)
+  ansible.builtin.shell: |
+    set -euo pipefail
+    k={{ bg_boot_kernel_release | quote }}
+    d=$(mktemp -d /var/tmp/prace-beegfs-build.XXXXXX); trap 'rm -rf "$d"' EXIT
+    cp -a {{ beegfs_client_src | quote }} "$d/"
+    if make -C "$d"/{{ beegfs_client_src | basename | quote }}/build KDIR="/usr/src/kernels/$k" {{ beegfs_client_build_args }} >"$d/log" 2>&1; then
+      echo "compiles for $k"
+    else tail -n 30 "$d/log"; echo "the BeeGFS client does not compile for the next-boot kernel $k"; exit 3; fi
+  args: {executable: /bin/bash}
+  changed_when: false
+  when: not ansible_check_mode and bg_pkgs_present | bool and bg_boot_kernel_release != ansible_kernel
+
+- name: Client configuration
+  ansible.builtin.include_tasks: conf-set.yml
+  vars:
+    bg_conf_path: "{{ beegfs_conf_dir }}/beegfs-client.conf"
+    bg_conf_settings: "{{ bg_client_settings }}"
+    bg_conf_format: conf
+
+- name: Mount table of the client service (/scratch only)
+  ansible.builtin.copy:
+    dest: "{{ beegfs_conf_dir }}/beegfs-mounts.conf"
+    content: "{{ bg_mounts_conf }}"
+    owner: root
+    group: root
+    mode: "0644"
+  register: bg_mounts
+
+- name: Client configuration changed
+  ansible.builtin.set_fact:
+    bg_client_changed: >-
+      {{ bg_conf_changed | bool or bg_autobuild_changed | bool or bg_mounts is changed
+         or bg_auth is changed or bg_net is changed }}
+
+# Like the backing mounts: an unmounted /scratch is an immutable empty directory, so a job can
+# never write into the root filesystem underneath it.
+- name: /scratch mountpoint (never followed through a symlink)
+  ansible.builtin.stat:
+    path: "{{ beegfs_scratch }}"
+    follow: false
+  register: bg_scratch
+
+- name: /scratch is a directory (or absent)
+  ansible.builtin.assert:
+    that: not bg_scratch.stat.exists or (bg_scratch.stat.isdir and not bg_scratch.stat.islnk)
+    fail_msg: "{{ beegfs_scratch }} exists and is not a directory"
+    quiet: true
+
+- name: Create /scratch
+  ansible.builtin.file:
+    path: "{{ beegfs_scratch }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  when: not bg_scratch.stat.exists
+
+- name: Immutable empty /scratch underneath the mount
+  ansible.builtin.shell: |
+    set -euo pipefail
+    p={{ beegfs_scratch | quote }}
+    r=0; out=$(findmnt -no FSTYPE --mountpoint "$p" 2>&1) || r=$?
+    [ $r = 0 ] && { echo "mounted $out"; exit 0; }
+    [ $r = 1 ] && [ -z "$out" ] || { echo "findmnt $p failed: $out"; exit 3; }
+    l=$(ls -A "$p") || { echo "cannot list $p"; exit 3; }
+    [ -z "$l" ] || { echo "$p is not mounted and not empty: refusing to mount over it"; exit 3; }
+    if lsattr -d "$p" | cut -d' ' -f1 | grep -q i; then echo immutable; else chattr +i "$p"; echo set; fi
+  args: {executable: /bin/bash}
+  register: bg_scratch_guard
+  changed_when: "'set' in bg_scratch_guard.stdout"
+  failed_when: bg_scratch_guard.rc != 0 or (bg_scratch_guard.stdout.startswith('mounted ') and bg_scratch_guard.stdout != 'mounted beegfs')
+
+- name: Drop-in directory
+  ansible.builtin.file:
+    path: /etc/systemd/system/beegfs-client.service.d
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Order the client after the network and the local services (ordering only)
+  ansible.builtin.template:
+    src: guard.conf.j2
+    dest: /etc/systemd/system/beegfs-client.service.d/10-prace-order.conf
+    owner: root
+    group: root
+    mode: "0644"
+  vars:
+    bg_guard: "{{ bg_guard_client }}"
+  register: bg_client_dropin
+
+- name: Licence state (a note for the owner's licensing track; never fatal)
+  ansible.builtin.include_tasks: licence.yml
+
+- name: Client running, /scratch mounted (restarted after a change)
+  ansible.builtin.systemd:
+    name: beegfs-client
+    state: "{{ 'restarted' if bg_client_changed | bool or bg_client_dropin is changed else 'started' }}"
+    enabled: true
+    daemon_reload: "{{ bg_client_dropin is changed }}"
+  when: bg_pkgs_present | bool or not ansible_check_mode
+
+- name: /scratch is a BeeGFS mount with nosuid,nodev
+  ansible.builtin.command: findmnt -no FSTYPE,OPTIONS --mountpoint {{ beegfs_scratch | quote }}
+  register: bg_scratch_mnt
+  changed_when: false
+  check_mode: false
+  failed_when: >-
+    bg_scratch_mnt.rc != 0 or bg_scratch_mnt.stdout.split() | first | default('') != 'beegfs'
+    or not (['nosuid', 'nodev'] is subset(bg_scratch_mnt.stdout.split() | last | default('') | split(',')))
+  when: not ansible_check_mode
+
+# 8.4.1 creates the root 0777 without the sticky bit: set the D-S mode once per run, through one
+# mounted client (it is one filesystem), and keep it.
+- name: /scratch root mode {{ beegfs_scratch_root_mode }} root:root (on the mounted BeeGFS root)
+  ansible.builtin.file:
+    path: "{{ beegfs_scratch }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "{{ beegfs_scratch_root_mode }}"
+  run_once: true
+  when: not ansible_check_mode

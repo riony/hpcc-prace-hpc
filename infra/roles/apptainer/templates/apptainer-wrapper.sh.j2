@@ -1,0 +1,10 @@
+#!/bin/sh
+# Managed by Ansible (roles/apptainer). The unprivileged Apptainer {{ apptainer_version }} unpacked into this tree
+# (module apptainer/{{ apptainer_module }}). Apptainer itself needs libsubid, which the slurmd image and the hosts
+# lack: the tree's libraries go on its library path only, never into the user's shell. Its helpers
+# get theirs from usr/libexec/apptainer/bin/.wrapper. Apptainer finds its configuration and helpers
+# from its own location (relocatable: TREE/usr/etc/apptainer, TREE/usr/libexec/apptainer).
+tree='{{ apptainer_tree }}'
+LD_LIBRARY_PATH="$tree/usr/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export LD_LIBRARY_PATH
+exec "$tree/usr/bin/apptainer" "$@"

@@ -1,0 +1,20 @@
+# Managed by Ansible (roles/beegfs): {{ bg_guard.why }}
+[Unit]
+{% if bg_guard.mounts | length > 0 %}
+RequiresMountsFor={{ bg_guard.mounts | join(' ') }}
+{% endif %}
+{% for m in bg_guard.mounts %}
+AssertPathIsMountPoint={{ m }}
+{% endfor %}
+{% for p in bg_guard.paths %}
+AssertPathExists={{ p }}
+{% endfor %}
+{% if bg_guard.requires | default([]) | length > 0 %}
+Requires={{ bg_guard.requires | join(' ') }}
+{% endif %}
+{% if bg_guard.after | length > 0 %}
+After={{ bg_guard.after | join(' ') }}
+{% endif %}
+{% if bg_guard.wants | length > 0 %}
+Wants={{ bg_guard.wants | join(' ') }}
+{% endif %}

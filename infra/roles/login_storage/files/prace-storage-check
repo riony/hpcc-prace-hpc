@@ -1,0 +1,61 @@
+#!/usr/bin/python3
+"""Fail-closed check of the login node's shared filesystems (roles/login_storage).
+
+Runs before nfs-server starts (ExecStartPre drop-in) and before the roles export anything.
+For every share in /etc/prace-storage/mounts.json: the path is mounted from its own LV, as XFS,
+and a share with a quota option has that quota's accounting AND enforcement on. Independent
+of /etc/fstab, so a missing fstab line is caught too. Exit 0 = all good; 1 = a share is wrong
+(each problem printed); 2 = the configuration file is missing or unreadable.
+"""
+import json
+import subprocess
+import sys
+
+CONFIG = "/etc/prace-storage/mounts.json"
+QUOTA_FLAG = {"usrquota": "u", "prjquota": "p"}
+QUOTA_NAME = {"u": "User", "p": "Project"}
+
+
+def run(*cmd):
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    return r.returncode, r.stdout
+
+
+def quota_on(path, kind):
+    rc, out = run("xfs_quota", "-x", "-c", f"state -{kind}", path)
+    if rc:
+        return False
+    lines = out.splitlines()
+    head = f"{QUOTA_NAME[kind]} quota state on"
+    for i, line in enumerate(lines):
+        if line.startswith(head):
+            block = " ".join(lines[i + 1:i + 3])
+            return "Accounting: ON" in block and "Enforcement: ON" in block
+    return False
+
+
+def main():
+    try:
+        shares = json.load(open(CONFIG))
+    except (OSError, ValueError) as err:
+        print(f"prace-storage-check: cannot read {CONFIG}: {err}")
+        return 2
+    problems = []
+    for s in shares:
+        rc, out = run("findmnt", "-no", "SOURCE,FSTYPE", "--mountpoint", s["path"])
+        found = out.split()
+        if rc or found != [s["source"], "xfs"]:
+            problems.append(f"{s['path']}: expected {s['source']} (xfs), found {' '.join(found) or 'not mounted'}")
+            continue
+        kind = QUOTA_FLAG.get(s.get("quota") or "")
+        if kind and not quota_on(s["path"], kind):
+            problems.append(f"{s['path']}: {QUOTA_NAME[kind].lower()} quota accounting/enforcement not on")
+    for p in problems:
+        print("prace-storage-check: " + p)
+    if not problems:
+        print(f"prace-storage-check: {len(shares)} share(s) mounted from their LVs with quotas on")
+    return 1 if problems else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

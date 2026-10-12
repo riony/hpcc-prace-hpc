@@ -1,0 +1,11 @@
+---
+# CPU node: Lenovo x3650 M5. Facts from evidence/2026-09-26/fleet-discovery (read-only, 26 Sep).
+ansible_host: 10.90.10.21
+fleet_role: cpu
+chassis_serial: EXSER02
+bmc: {address: 198.18.0.166, type: imm2, tunnel_port: 18445, user: USERID, password_file: ~/.config/prace-lab/imm-USERID.pw}
+os_disk: {kind: scsi_wwn, wwn: 600605b0000000000000000000000002}   # ServeRAID M5210 RAID1, 279 GB
+install_medium: {kind: usb, model: Flash Drive FIT, serial: 'EXSERIAL00000002'}   # rewritten from the running OS (user OK)
+admin_ip: 10.90.10.21
+admin_mac: 02:00:00:00:00:05       # eno2, today 10.88.0.2
+slurm_node: "CPUs=56 Boards=1 SocketsPerBoard=2 CoresPerSocket=14 ThreadsPerCore=2 RealMemory=125000"   # measured 27 Sep: 2x14x2, 127681 MiB

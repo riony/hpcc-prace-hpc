@@ -1,0 +1,9 @@
+---
+# The disposable container itself; never a real host (run.sh refuses outside a container).
+mgmt:
+  hosts:
+    localhost:
+      ansible_connection: local
+      ansible_python_interpreter: /usr/bin/python3   # the platform Python 3.9, as on mgmt-git01
+      gitlab_fqdn: gitlab.example.invalid
+      fleet_dashboard_enable: false     # no systemd in the container: units are written, never started

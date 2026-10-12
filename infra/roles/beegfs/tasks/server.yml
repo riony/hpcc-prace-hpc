@@ -1,0 +1,48 @@
+---
+# A GPU host: shared preparation, target preparation (first use only when armed and confirmed),
+# backing mounts, then the metadata and storage services for its ACTIVE items. Items that are not
+# active yet (pending first use) stay out of every configuration and are reported.
+- name: This run passed its gates and holds the lease (a run started past them changes nothing)
+  ansible.builtin.assert:
+    that: bg_run_gated | bool
+    fail_msg: "{{ inventory_hostname }}: nothing done: the gates of playbooks/beegfs.yml did not pass in this run"
+    quiet: true
+
+- name: This host has a metadata service and a storage service in the data file
+  ansible.builtin.assert:
+    that: bg_meta is not none and bg_storage_node is not none and bg_targets | length == 2
+    fail_msg: "{{ inventory_hostname }} has no complete entry in inventories/fleet/group_vars/all/beegfs.yml"
+    quiet: true
+
+- name: Shared preparation
+  ansible.builtin.include_tasks: common.yml
+
+- name: Read-only NVMe health tools (pinned files)
+  ansible.builtin.include_tasks: packages.yml
+  vars:
+    bg_pkg_names: "{{ beegfs_host_tools }}"
+    bg_pkg_extra: []
+
+- name: Target preparation (metadata LV and storage targets; first use only when armed and confirmed)
+  ansible.builtin.include_tasks: prepare.yml
+
+- name: Backing mounts, markers and ID files
+  ansible.builtin.include_tasks: mount.yml
+
+- name: Metadata service
+  ansible.builtin.include_tasks: service.yml
+  vars:
+    bg_svc: meta
+  when: bg_backing | selectattr('kind', 'equalto', 'meta') | list | length > 0
+
+- name: Storage service
+  ansible.builtin.include_tasks: service.yml
+  vars:
+    bg_svc: storage
+  when: bg_backing | selectattr('kind', 'equalto', 'storage') | list | length > 0
+
+- name: Part of /scratch on this host
+  ansible.builtin.debug:
+    msg: >-
+      active: {{ bg_backing | map(attribute='name') | list }};
+      pending first use: {{ bg_plan['items'] | rejectattr('active') | map(attribute='name') | list }}

@@ -1,0 +1,28 @@
+# Run from an editable install of the pinned repository. This default contacts
+# no cluster or model. Switch plan/SSH/model only in operator-owned config.
+# The two extra endpoints are evidence/status companions for harness.session_client;
+# all three entries must name the same run root.
+general:
+  front_end:
+    _type: fastapi
+    endpoints:
+      - path: /prace/status
+        method: POST
+        description: Read-only state, stage and progress of PRACE sessions
+        function_name: session_status
+      - path: /prace/export
+        method: POST
+        description: Export a complete session's verified bundle as a dashboard evidence folder
+        function_name: session_export
+functions:
+  session_status:
+    _type: prace_session_status
+    run_root: &run_root /tmp/prace-nat-sessions
+  session_export:
+    _type: prace_session_export
+    run_root: *run_root
+workflow:
+  _type: prace_session
+  plan: harness/examples/file-discovery.plan.json
+  run_root: *run_root
+  allow_remote: false

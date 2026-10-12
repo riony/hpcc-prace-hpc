@@ -1,0 +1,7 @@
+---
+# Reload NetworkManager so a freshly written keyfile is picked up. The profile is
+# then activated by the task after the flush_handlers call, not here, so the
+# ordering (reload -> activate) is explicit.
+- name: reload private network
+  ansible.builtin.command: nmcli connection reload
+  changed_when: true

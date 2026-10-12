@@ -1,0 +1,24 @@
+---
+# Virtual rehearsal of the fleet playbook against local VMs only.
+#   tools/run-ansible.sh -i inventories/rehearsal playbooks/rehearsal.yml -e fleet_armed=true
+- name: Rehearsal guard (controller only; stops unless every target is a local VM)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Every fleet host must resolve to 127.0.0.1, directly or through the login VM's forward
+      ansible.builtin.assert:
+        that:
+          - hostvars[item].rehearsal | default(false) | bool
+          - >-
+            hostvars[item].ansible_host == '127.0.0.1'
+            or ('root@127.0.0.1' in (hostvars[item].ansible_ssh_common_args | default(''))
+                and '-p 2222' in (hostvars[item].ansible_ssh_common_args | default(''))
+                and 'ProxyJump' not in (hostvars[item].ansible_ssh_common_args | default('')))
+        fail_msg: "{{ item }} does not resolve to a local rehearsal VM; refusing to run"
+        quiet: true
+      loop: "{{ groups['fleet'] }}"
+      tags: [always]
+
+- name: The fleet playbook itself
+  ansible.builtin.import_playbook: fleet.yml

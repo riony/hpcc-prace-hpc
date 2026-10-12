@@ -1,0 +1,46 @@
+#!/bin/bash
+# Managed by Ansible (roles/gitlab_runner). Registers the rootless-Podman CI runner once.
+# The runner authentication token is created by GitLab (gitlab-rails, which runs as the
+# git user), printed on the LAST line of its output, captured straight into a shell
+# variable and handed to gitlab-runner through the environment (CI_SERVER_TOKEN). It is
+# never displayed, written to disk (other than GitLab Runner's own 0600 config.toml) or
+# placed on a command line. Runners with this name that never contacted GitLab (orphans
+# of an interrupted run) are removed first, so a retry is safe.
+# Prints "registered" or "already registered".
+set -euo pipefail
+NAME="{{ gitlab_runner_name }}"
+# Capture output before searching it: `cmd | grep -q` under pipefail fails when grep exits
+# early (SIGPIPE to cmd), which would misreport a match as a failure.
+LIST=$(gitlab-runner list 2>&1 || true)
+if grep -qE "^${NAME}[[:space:]]" <<<"$LIST"; then echo "already registered"; exit 0; fi
+HELP=$(gitlab-runner register --help 2>&1 || true)
+grep -q 'CI_SERVER_TOKEN' <<<"$HELP" \
+  || { echo "gitlab-runner register does not read CI_SERVER_TOKEN; refusing" >&2; exit 1; }
+RUID=$(id -u {{ gitlab_runner_user }})
+SOCK=/run/user/$RUID/podman/podman.sock
+[ -S "$SOCK" ] || { echo "podman socket $SOCK missing" >&2; exit 1; }
+OUT=$(/opt/gitlab/bin/gitlab-rails runner "
+  g = Group.find_by_full_path('{{ gitlab_runner_group }}') or abort('group not found')
+  root = User.find_by_username('root')
+  Ci::Runner.where(description: '${NAME}', contacted_at: nil).find_each do |orphan|
+    Ci::Runners::UnregisterRunnerService.new(orphan, root).execute
+    warn('removed orphan runner id=' + orphan.id.to_s)
+  end
+  r = Ci::Runners::CreateRunnerService.new(user: root, params: {
+        runner_type: 'group_type', scope: g, description: '${NAME}',
+        tag_list: %w[{{ gitlab_runner_tags | join(' ') }}], run_untagged: true,
+        access_level: 'not_protected', locked: false,
+        maintenance_note: 'Rootless Podman on mgmt-git01; managed by Ansible roles/gitlab_runner' }).execute
+  abort(r.message.to_s) unless r.success?
+  puts r.payload[:runner].token
+")
+TOKEN=${OUT##*$'\n'}
+unset OUT
+[[ "$TOKEN" == glrt-* ]] || { echo "GitLab did not return a runner token" >&2; exit 1; }
+CI_SERVER_TOKEN="$TOKEN" gitlab-runner register --non-interactive \
+  --url "https://{{ gitlab_fqdn }}" --name "$NAME" --executor docker \
+  --docker-host "unix://$SOCK" --docker-image "{{ gitlab_runner_default_image }}" \
+  --docker-privileged=false --docker-pull-policy if-not-present --docker-volumes /cache \
+  --docker-security-opt "label=level:{{ gitlab_runner_selinux_level }}" >/dev/null
+unset TOKEN
+echo "registered"

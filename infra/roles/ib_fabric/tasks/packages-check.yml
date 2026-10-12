@@ -1,0 +1,27 @@
+---
+# Read-only: this node's packages against their exact pins. An installed package at another version
+# is refused (never upgraded or downgraded: rdma-core 61.0-2 is what the nodes run). The preflight runs
+# this on every node of the stage at once, so a conflict anywhere stops the run before any change.
+- name: This node's packages
+  ansible.builtin.set_fact:
+    ibf_pkg_names: "{{ ib_fabric_packages + (ib_fabric_packages_sm if ibf_host.sm | length > 0 else []) }}"
+
+- name: Installed versions (rpm -q; read-only)
+  ansible.builtin.command:
+    argv: "{{ ['rpm', '-q', '--qf', '%{NAME} %{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}\\n'] + ibf_pkg_names }}"
+  register: ibf_rpm
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: The installed set
+  ansible.builtin.set_fact:
+    ibf_installed: "{{ dict(ibf_rpm.stdout_lines | reject('match', 'package ') | map('split') | list) }}"
+
+- name: Nothing installed at another version
+  ansible.builtin.assert:
+    that: item not in ibf_installed or ibf_installed[item] == ibf_plan.pins[item]
+    fail_msg: "{{ inventory_hostname }}: {{ item }} is {{ ibf_installed[item] | default('') }}, pinned {{ ibf_plan.pins[item] }}; refused"
+    quiet: true
+  loop: "{{ ibf_pkg_names }}"
+

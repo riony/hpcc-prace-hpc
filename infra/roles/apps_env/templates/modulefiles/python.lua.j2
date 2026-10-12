@@ -1,0 +1,10 @@
+-- Managed by Ansible (roles/apps_env). Python {{ apps_env_python.module }}: the image's system Python under one documented name (T88).
+local root = "{{ apps_env_sw }}/python/{{ apps_env_python.module }}"
+help([[Python {{ apps_env_python.module }} ({{ apps_env_python.bin }}, the image's). Puts `python` and `python3` on PATH. Install packages
+for yourself with: python -m pip install --user NAME (into your home).]])
+whatis("Name: Python")
+whatis("Version: {{ apps_env_python.module }}")
+if mode() == "load" and not isFile("{{ apps_env_python.bin }}") then
+  LmodError("python/{{ apps_env_python.module }}: {{ apps_env_python.bin }} is missing in this image")
+end
+prepend_path("PATH", pathJoin(root, "bin"))

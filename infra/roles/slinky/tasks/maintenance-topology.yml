@@ -1,0 +1,84 @@
+---
+# The native worker list may change only in a full converge inside a closed maintenance window
+# (slinky_topology_change_allowed, from maintenance-preflight.yml) with the login node in the run:
+# there login.yml's bridge publishes the chart and the overlay in a safe order. Anywhere else, the
+# admission-only overlay playbook included, a change stops here before any worker preparation,
+# image, overlay or chart change.
+# "Deployed" is what Helm pairs with: the slurm chart values in K3s's manifest directory, read once
+# the API holds them (slinky_native_deployed, defaults/main.yml). Not the login node's native list
+# file: an interrupted run writes that before the chart, so it can run ahead of the chart.
+- name: The deployed chart, as Helm pairs it, before any Slinky mutation
+  delegate_to: "{{ groups['login'][0] }}"
+  run_once: true
+  block:
+    - name: Chart manifest identity
+      ansible.builtin.stat:
+        path: "{{ slinky_manifest_dir }}/prace-slinky-charts.yaml"
+        follow: false
+      register: slinky_charts_ondisk_stat
+      check_mode: false
+    - name: The chart manifest must be a regular file
+      ansible.builtin.assert:
+        that: not slinky_charts_ondisk_stat.stat.exists or (slinky_charts_ondisk_stat.stat.isreg and not slinky_charts_ondisk_stat.stat.islnk)
+        quiet: true
+    - name: Read the chart manifest (absent only before the first bootstrap)
+      ansible.builtin.slurp:
+        src: "{{ slinky_manifest_dir }}/prace-slinky-charts.yaml"
+      register: slinky_charts_ondisk
+      when: slinky_charts_ondisk_stat.stat.exists
+      check_mode: false
+    - name: The API holds that chart (bounded; a K3s that is down is only passed with the controller-down override)
+      ansible.builtin.command: "{{ slinky_kubectl }} -n kube-system get helmchart slurm -o jsonpath={.spec.valuesContent}"
+      register: slinky_charts_ondisk_api
+      until: >-
+        slinky_charts_ondisk_api.rc == 0 and (slinky_charts_ondisk_api.stdout | trim) ==
+        ((slinky_charts_ondisk.content | b64decode | from_yaml_all | selectattr('metadata.name', 'equalto', 'slurm')
+          | first).spec.valuesContent | trim)
+      retries: "{{ slinky_charts_wait_retries | default(40) }}"
+      delay: "{{ slinky_charts_wait_delay | default(3) }}"
+      changed_when: false
+      check_mode: false
+      when: slinky_charts_ondisk_stat.stat.exists and not slinky_preflight_controller_down | default(false) | bool
+    - name: The persistent maintenance overlay, if any
+      ansible.builtin.stat:
+        path: "{{ slinky_manifest_dir }}/prace-slinky-maintenance.yaml"
+        follow: false
+      register: slinky_topology_overlay_stat
+      check_mode: false
+    - name: Read it
+      ansible.builtin.slurp:
+        src: "{{ slinky_manifest_dir }}/prace-slinky-maintenance.yaml"
+      register: slinky_topology_overlay
+      when: slinky_topology_overlay_stat.stat.exists
+      check_mode: false
+    # The API holding the chart, or the Helm controller having read it, is not what the operator runs:
+    # a pending or failed upgrade leaves the previous release applied (a pod NodeSet under a parked
+    # chart, say), and the first overlay this run writes would pair with that. Wait until the release
+    # Helm last deployed has the topology of the chart and overlay on disk (review of ead54d0, R1).
+    - name: Helm has applied the chart and overlay on disk (bounded; read-only)
+      ansible.builtin.command:
+        argv: ['/usr/bin/python3', '-c', "{{ lookup('ansible.builtin.file', role_path ~ '/files/prace-slinky-helm-topology.py') }}"]
+        stdin: >-
+          {{ {'kubectl': slinky_kubectl, 'namespace': 'slurm', 'release': 'slurm', 'kinds': slinky_nodesets,
+              'chart': (slinky_charts_ondisk.content | b64decode | from_yaml_all | selectattr('metadata.name', 'equalto', 'slurm')
+                        | first).spec.valuesContent | from_yaml,
+              'overlay': ((slinky_topology_overlay.content | b64decode | from_json).spec.valuesContent | from_json)
+                         if slinky_topology_overlay is not skipped else none} | to_json }}
+      register: slinky_topology_applied
+      until: slinky_topology_applied.rc == 0 and (slinky_topology_applied.stdout | from_json).match
+      retries: "{{ slinky_charts_wait_retries | default(40) }}"
+      delay: "{{ slinky_charts_wait_delay | default(3) }}"
+      changed_when: false
+      check_mode: false
+      when: slinky_charts_ondisk_stat.stat.exists and not slinky_preflight_controller_down | default(false) | bool
+    - name: A native topology change only in a closed window's full converge, with the login node in the run
+      ansible.builtin.assert:
+        that: >-
+          (slurm_native_workers | default([]) | sort) == slinky_native_deployed
+          or (slinky_topology_change_allowed | default(false) | bool and groups['login'][0] in ansible_play_hosts
+              and not slinky_preflight_controller_down | default(false) | bool)
+        fail_msg: >-
+          STOP: the native worker list changes here (deployed {{ slinky_native_deployed }}, wanted
+          {{ slurm_native_workers | default([]) | sort }}); that needs a full converge (fleet.yml) with the
+          login node, inside a closed maintenance window (runbook step 7), never the overlay playbook
+        quiet: true

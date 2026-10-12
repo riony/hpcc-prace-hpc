@@ -1,0 +1,8 @@
+---
+# Stand-in for a compute node / NFS client (tools/storage-rehearsal.sh): 2 vCPU / 2048 MiB,
+# 20G OS overlay, no data disk.
+ansible_host: 127.0.0.1            # the login node's loopback (ProxyJump), never the workstation's
+ansible_port: 2252
+fleet_role: cpu
+os_disk: {kind: virtio, serial: prace-sr-client-os}  # lsblk SERIAL of the OS overlay (QEMU serial=)
+admin_ip: 10.90.10.21              # the private link to sr-login

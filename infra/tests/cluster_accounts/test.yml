@@ -1,0 +1,6 @@
+---
+- name: cluster_accounts role test (disposable container only)
+  hosts: fleet
+  gather_facts: false
+  roles:
+    - cluster_accounts

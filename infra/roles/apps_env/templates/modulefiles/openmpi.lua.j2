@@ -1,0 +1,15 @@
+-- Managed by Ansible (roles/apps_env). OpenMPI {{ apps_env_openmpi.module }}: the image's own build in {{ apps_env_openmpi.prefix }} (T88).
+local root = "{{ apps_env_openmpi.prefix }}"
+help([[OpenMPI 4.1.1 from the image (UCX 1.19, PMIx 3.2.3): mpicc, mpicxx, mpif90. Launch with mpirun inside a job
+(srun cannot start this build directly: it has no PMI-2 client). The InfiniBand ring is deferred: force TCP on
+the pod network in the job, as /apps/examples/mpi.sh does:
+  export OMPI_MCA_pml=ob1 OMPI_MCA_btl=self,tcp OMPI_MCA_btl_tcp_if_include={{ apps_env_mpi_subnet }} OMPI_MCA_oob_tcp_if_include={{ apps_env_mpi_subnet }}]])
+whatis("Name: OpenMPI")
+whatis("Version: 4.1.1")
+family("mpi")
+if mode() == "load" and not isDir(pathJoin(root, "bin")) then
+  LmodError("openmpi/{{ apps_env_openmpi.module }}: ", root, " is missing in this image")
+end
+setenv("MPI_HOME", root)
+prepend_path("PATH", pathJoin(root, "bin"))
+prepend_path("LD_LIBRARY_PATH", pathJoin(root, "lib"))

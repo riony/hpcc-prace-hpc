@@ -1,0 +1,126 @@
+#!/usr/bin/python3
+"""Deterministic listing of a directory tree, for proving that a copy is complete.
+
+    prace-tree-listing [--no-label] [--no-root] [--summary] PATH
+
+One JSON object per entry, sorted by relative path: type, uid, gid, mode, size, mtime_ns,
+sha256 (regular files), link target (symlinks), nlink, rdev (devices), every extended attribute
+("xattrs": name -> hex value, POSIX ACLs and user.* included, XFS's trusted.SGI_ACL_* duplicates
+of the ACLs excluded; {} = none) and, unless --no-label,
+the SELinux label ("selinux"; security.selinux never appears in "xattrs"). Stays on PATH's
+filesystem. --no-root leaves out the top directory's own entry (its owner and times belong to
+the mountpoint), --summary prints only "<entries> <sha256 of the listing>". Read-only; exit 2
+on any unreadable entry, including an attribute that cannot be listed or read.
+"""
+import errno
+import hashlib
+import json
+import os
+import stat
+import sys
+
+ACL = ("system.posix_acl_access", "system.posix_acl_default")
+LABEL = "security.selinux"
+# XFS stores POSIX ACLs as trusted.SGI_ACL_FILE/DEFAULT, listed only for root: the same ACL as
+# system.posix_acl_*, which is compared. cp -a skips them (/etc/xattr.conf), rsync -X copies them.
+DUPLICATES = ("trusted.SGI_ACL_FILE", "trusted.SGI_ACL_DEFAULT")
+ABSENT = (errno.ENODATA, errno.ENOTSUP, errno.EOPNOTSUPP)
+
+
+def xattrs(path, is_link, label):
+    """({name: hex value}, SELinux label or None). A listed name that vanished before it was read
+    is skipped; any other failure raises, so "unreadable" never looks like "no attributes"."""
+    try:
+        listed = set(os.listxattr(path, follow_symlinks=False))
+    except OSError as err:
+        raise OSError(err.errno, f"listxattr: {err.strerror}") from err
+    # Probed even when not listed, as before: ACLs (not on symlinks) and the label when requested.
+    probed = (set() if is_link else set(ACL)) | ({LABEL} if label else set())
+    values, found = {}, None
+    for name in sorted(listed | probed):
+        if (name == LABEL and not label) or name in DUPLICATES:
+            continue
+        try:
+            value = os.getxattr(path, name, follow_symlinks=False)
+        except OSError as err:
+            if (err.errno == errno.ENODATA) if name in listed else (err.errno in ABSENT):
+                continue
+            raise OSError(err.errno, f"getxattr {name}: {err.strerror}") from err
+        if name == LABEL:
+            found = value.rstrip(b"\0").decode(errors="backslashreplace")
+        else:
+            values[name] = value.hex()
+    return values, found
+
+
+def entry(root, rel, label):
+    path = os.path.join(root, rel) if rel != "." else root
+    st = os.lstat(path)
+    kind = ("dir" if stat.S_ISDIR(st.st_mode) else "file" if stat.S_ISREG(st.st_mode)
+            else "link" if stat.S_ISLNK(st.st_mode) else "fifo" if stat.S_ISFIFO(st.st_mode)
+            else "sock" if stat.S_ISSOCK(st.st_mode) else "chr" if stat.S_ISCHR(st.st_mode)
+            else "blk" if stat.S_ISBLK(st.st_mode) else "other")
+    e = {"path": rel, "type": kind, "uid": st.st_uid, "gid": st.st_gid,
+         "mode": oct(stat.S_IMODE(st.st_mode)), "nlink": st.st_nlink}
+    if kind != "dir":
+        e["mtime_ns"] = st.st_mtime_ns
+    if kind == "file":
+        e["size"] = st.st_size
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        e["sha256"] = h.hexdigest()
+    elif kind == "link":
+        e["target"] = os.readlink(path)
+    elif kind in ("chr", "blk"):
+        e["rdev"] = st.st_rdev
+    e["xattrs"], selinux = xattrs(path, kind == "link", label)
+    if selinux is not None:
+        e["selinux"] = selinux
+    return e
+
+
+def main(argv):
+    flags = {a for a in argv if a.startswith("--")}
+    args = [a for a in argv if not a.startswith("--")]
+    if len(args) != 1 or flags - {"--no-label", "--no-root", "--summary"}:
+        print(__doc__.strip(), file=sys.stderr)
+        return 2
+    root = os.path.abspath(args[0])
+    dev = os.lstat(root).st_dev
+    rels = [] if "--no-root" in flags else ["."]
+    errors = []
+
+    def onerror(err):
+        errors.append(str(err))
+
+    for dirpath, dirnames, filenames in os.walk(root, onerror=onerror):
+        keep = []
+        for d in dirnames:
+            full = os.path.join(dirpath, d)
+            if os.lstat(full).st_dev == dev:
+                keep.append(d)
+            rels.append(os.path.relpath(full, root))
+        dirnames[:] = keep
+        rels.extend(os.path.relpath(os.path.join(dirpath, f), root) for f in filenames)
+    listing = []
+    for rel in sorted(rels):
+        try:
+            listing.append(entry(root, rel, "--no-label" not in flags))
+        except OSError as err:
+            errors.append(f"{rel}: {err}")
+    if errors:
+        for err in errors:
+            print("unreadable: " + err, file=sys.stderr)
+        return 2
+    text = "\n".join(json.dumps(e, sort_keys=True) for e in listing) + "\n"
+    if "--summary" in flags:
+        print(len(listing), hashlib.sha256(text.encode()).hexdigest())
+    else:
+        sys.stdout.write(text)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

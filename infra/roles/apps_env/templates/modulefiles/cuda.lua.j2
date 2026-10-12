@@ -1,0 +1,15 @@
+-- Managed by Ansible (roles/apps_env). CUDA {{ apps_env_cuda.module }}: the GPU node's own toolkit, mounted read-only into
+-- the GPU worker pods (roles/slinky slinky_cuda_path); not in /apps (T88).
+local root = "{{ apps_env_cuda.path }}"
+help([[CUDA {{ apps_env_cuda.module }} (nvcc, libraries) from {{ apps_env_cuda.path }}. Present only on GPU nodes: load it inside a
+job on one (-p gpu --gres=gpu:1). nvcc needs a host C++ compiler: module load gcc/{{ apps_env_gcc.module }} first.]])
+whatis("Name: CUDA")
+whatis("Version: {{ apps_env_cuda.module }}")
+if mode() == "load" and not isDir(pathJoin(root, "bin")) then
+  LmodError("cuda/{{ apps_env_cuda.module }}: ", root, " is not on this node. CUDA is mounted only on the GPU nodes: ",
+            "load this module in a job there (-p gpu --gres=gpu:1)")
+end
+setenv("CUDA_HOME", root)
+setenv("CUDA_PATH", root)
+prepend_path("PATH", pathJoin(root, "bin"))
+prepend_path("LD_LIBRARY_PATH", pathJoin(root, "lib64"))

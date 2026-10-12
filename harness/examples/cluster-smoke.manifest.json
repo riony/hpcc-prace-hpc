@@ -1,0 +1,159 @@
+{
+  "schema": "prace.scenario.v1",
+  "id": "cluster-smoke",
+  "version": 1,
+  "title": "SSH file and fixed Slurm job smoke",
+  "status": "smoke",
+  "description": "Benign, bounded file discovery and one fixed Slurm job, with independent observation and deterministic replay.",
+  "actor": {
+    "identity": "syn-smoke",
+    "project": "proj-ops",
+    "intent": "benign"
+  },
+  "boundaries": {
+    "action_targets": [
+      "login-pod"
+    ],
+    "observation_targets": [
+      "login-pod"
+    ],
+    "paths": [
+      "/tmp/prace-file-ops-smoke-v1"
+    ],
+    "action_kinds": [
+      "file.list",
+      "file.stat",
+      "file.write",
+      "slurm.submit",
+      "slurm.wait"
+    ]
+  },
+  "budgets": {
+    "max_actions": 8,
+    "max_seconds": 300,
+    "max_output_bytes": 4096
+  },
+  "actions": [
+    {
+      "id": "inspect-root",
+      "kind": "file.list",
+      "target": "login-pod",
+      "identity": "syn-smoke",
+      "parameters": {
+        "path": "/tmp/prace-file-ops-smoke-v1"
+      },
+      "timeout_seconds": 10,
+      "capture": {
+        "listing": "root_listing"
+      }
+    },
+    {
+      "id": "inspect-input",
+      "kind": "file.stat",
+      "target": "login-pod",
+      "identity": "syn-smoke",
+      "parameters": {
+        "path": "/tmp/prace-file-ops-smoke-v1/input.txt"
+      },
+      "timeout_seconds": 10,
+      "capture": {
+        "metadata": "input_metadata"
+      }
+    },
+    {
+      "id": "write-marker",
+      "kind": "file.write",
+      "target": "login-pod",
+      "identity": "syn-smoke",
+      "parameters": {
+        "path": "/tmp/prace-file-ops-smoke-v1/marker.txt",
+        "content": "integration-marker\n"
+      },
+      "timeout_seconds": 10,
+      "capture": {}
+    },
+    {
+      "id": "submit-smoke-job",
+      "kind": "slurm.submit",
+      "target": "login-pod",
+      "identity": "syn-smoke",
+      "parameters": {
+        "workspace": "/tmp/prace-file-ops-smoke-v1",
+        "run_id": "run-placeholder",
+        "account": "proj-ops",
+        "partition": "debug"
+      },
+      "timeout_seconds": 20,
+      "capture": {
+        "job_id": "smoke_job_id"
+      }
+    },
+    {
+      "id": "wait-smoke-job",
+      "kind": "slurm.wait",
+      "target": "login-pod",
+      "identity": "syn-smoke",
+      "parameters": {
+        "workspace": "/tmp/prace-file-ops-smoke-v1",
+        "run_id": "run-placeholder",
+        "job_id": "${smoke_job_id}"
+      },
+      "timeout_seconds": 50,
+      "capture": {
+        "job_state": "smoke_job_state"
+      }
+    }
+  ],
+  "assertions": [
+    {
+      "id": "record-layout-ok",
+      "phase": "record",
+      "category": "functional",
+      "description": "After the recorded run, demo-dir exists with only test-file-2.txt."
+    },
+    {
+      "id": "replay-layout-ok",
+      "phase": "replay",
+      "category": "functional",
+      "description": "After deterministic replay from a clean workspace, the same final layout exists."
+    },
+    {
+      "id": "workspace-reset",
+      "phase": "cleanup",
+      "category": "cleanup",
+      "description": "The smoke workspace is emptied after reports are written."
+    },
+    {
+      "id": "record-job-ok",
+      "phase": "record",
+      "category": "functional",
+      "description": "Independent accounting proves the tagged job completed successfully under the declared project."
+    },
+    {
+      "id": "replay-job-ok",
+      "phase": "replay",
+      "category": "functional",
+      "description": "Independent accounting proves the tagged job completed successfully under the declared project."
+    }
+  ],
+  "redaction": {
+    "keys": [
+      "password",
+      "token",
+      "secret",
+      "private_key"
+    ],
+    "patterns": [
+      "-----BEGIN [A-Z ]*PRIVATE KEY-----",
+      "(?i)bearer [A-Za-z0-9._-]{16,}",
+      "(?i)kubeconfig:[^ ]+"
+    ]
+  },
+  "gates": [],
+  "cleanup": {
+    "required": true,
+    "check_ids": [
+      "workspace-reset"
+    ]
+  }
+}

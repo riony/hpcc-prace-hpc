@@ -1,0 +1,32 @@
+# Disposable CPU-only demonstration. No physical-host mounts or credentials.
+clusterName: prace-demo
+controller:
+  persistence:
+    enabled: false
+  slurmctld:
+    resources:
+      requests: {cpu: 100m, memory: 128Mi}
+  logfile:
+    image: {repository: docker.io/library/alpine, tag: "3.22.1"}
+accounting:
+  enabled: false
+restapi:
+  replicas: 1
+  slurmrestd:
+    resources:
+      requests: {cpu: 100m, memory: 128Mi}
+nodesets:
+  cpu:
+    replicas: 1
+    slurmd:
+      resources:
+        requests: {cpu: "1", memory: 512Mi}
+        limits: {cpu: "2", memory: 1Gi}
+    logfile:
+      image: {repository: docker.io/library/alpine, tag: "3.22.1"}
+partitions:
+  all:
+    enabled: true
+    configMap:
+      Default: "YES"
+      MaxTime: "00:05:00"

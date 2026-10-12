@@ -1,0 +1,120 @@
+---
+# Managed by Ansible (roles/slinky). Runs from fleet.yml's pre_tasks, before any role: the
+# accounting reconciler in plan-only mode on the login node. A user or association that the
+# converge would remove but that still has queued jobs (a revocation, D40) stops the whole run
+# here, before cluster_accounts removes the Linux user or the login pod loses the identity.
+# Read-only. Skipped only on a fresh bootstrap, which has no jobs to protect: no K3s on the login
+# node, or no controller in it (both established by a successful look, never by a failed query).
+# K3s or a controller that does not answer within slinky_preflight_retries x slinky_preflight_delay
+# stops the run: its queue cannot be checked.
+# The one exception is a recovery run that must converge while the controller is down (for
+# example the repair of a controller that does not start): -e slinky_preflight_controller_down=true
+# lets it go on only when BOTH hold, and stops it otherwise:
+#   - it runs under the maintenance lease (-e fleet_lease_id=<id>, the lease on the login node
+#     names it), so it is the operator's fenced recovery and no other converge overlaps;
+#   - it revokes nobody: no user that git marks absent still has a passwd entry on the login node
+#     (a revocation needs the queue check, so it waits for a working controller).
+# When the controller answers, the flag changes nothing: the check runs as always.
+- name: Scheduler preflight on the login node
+  delegate_to: "{{ groups['login'][0] }}"
+  run_once: true
+  check_mode: false          # read-only
+  any_errors_fatal: true     # every host stops, not only the login node that ran the check
+  vars:
+    slinky_preflight_revoked: >-
+      {{ slinky_accounts_spec.users | selectattr('state', 'defined') | selectattr('state', 'equalto', 'absent')
+         | map(attribute='name') | list }}
+    slinky_preflight_revoked_names: >-
+      {{ slinky_preflight_revoked_left.stdout_lines | default([]) | map('split', ':') | map('first') | list
+         if slinky_preflight_revoked_left is not skipped else [] }}
+    slinky_preflight_leased: >-
+      {{ slinky_preflight_lease is not skipped and slinky_preflight_lease.rc == 0
+         and fleet_lease_id | default('') | length > 0
+         and ('id=' ~ fleet_lease_id ~ ' ') in (slinky_preflight_lease.stdout ~ ' ') }}
+  block:
+    - name: K3s on the login node (none yet on a fresh bootstrap)
+      ansible.builtin.stat:
+        path: "{{ (slinky_kubectl | split)[0] }}"
+        get_checksum: false
+      register: slinky_preflight_k3s
+
+    - name: Controller exists (none yet on a fresh bootstrap)
+      ansible.builtin.command: "{{ slinky_kubectl }} -n slurm get statefulset slurm-controller -o name --ignore-not-found"
+      register: slinky_preflight_ctl
+      until: slinky_preflight_ctl.rc == 0
+      retries: "{{ slinky_preflight_retries }}"
+      delay: "{{ slinky_preflight_delay }}"
+      changed_when: false
+      ignore_errors: true      # stops the run below, with the reason
+      when: slinky_preflight_k3s.stat.exists
+
+    - name: Controller answers (for the scheduler preflight)
+      ansible.builtin.command: "{{ slinky_kubectl }} -n slurm exec statefulset/slurm-controller -c slurmctld -- scontrol ping"
+      register: slinky_preflight_ping
+      until: slinky_preflight_ping.rc == 0 and 'UP' in slinky_preflight_ping.stdout
+      retries: "{{ slinky_preflight_retries }}"
+      delay: "{{ slinky_preflight_delay }}"
+      changed_when: false
+      ignore_errors: true      # stops the run below, with the reason
+      when: slinky_preflight_ctl is not skipped and slinky_preflight_ctl is succeeded and slinky_preflight_ctl.stdout | length > 0
+
+    - name: Revoked users (git state absent) that still have a passwd entry here (a controller-down run may revoke nobody)
+      ansible.builtin.command:
+        argv: "{{ ['getent', 'passwd'] + slinky_preflight_revoked }}"
+      register: slinky_preflight_revoked_left
+      changed_when: false
+      failed_when: slinky_preflight_revoked_left.rc not in [0, 2]    # 2: some names not found
+      when:
+        - slinky_preflight_ctl is failed or slinky_preflight_ping is failed
+        - slinky_preflight_controller_down | bool
+        - slinky_preflight_revoked | length > 0
+
+    - name: The cluster lease on the login node (a controller-down run must hold it)
+      ansible.builtin.command: cat {{ fleet_lease_path | default('/run/prace-cluster-lease') }}/holder
+      register: slinky_preflight_lease
+      changed_when: false
+      failed_when: false
+      when:
+        - slinky_preflight_ctl is failed or slinky_preflight_ping is failed
+        - slinky_preflight_controller_down | bool
+
+    - name: K3s or a controller that does not answer stops the run (its queued jobs cannot be checked)
+      ansible.builtin.fail:
+        msg: >-
+          {{ 'The K3s API on ' ~ groups['login'][0] if slinky_preflight_ctl is failed else 'slurm-controller' }}
+          did not answer within {{ (slinky_preflight_retries | int) * (slinky_preflight_delay | int) }} s, so a revoked
+          user's queued jobs cannot be checked.
+          {% if not slinky_preflight_controller_down | bool %}Bring it up and run again. A recovery run that must converge
+          while it is down: -e slinky_preflight_controller_down=true, under the maintenance lease (-e fleet_lease_id=<id>),
+          and revoking nobody.{% else %}slinky_preflight_controller_down refused:{{
+          ' this run does not hold the cluster lease (-e fleet_lease_id=<id> of the lease on the login node);' if not slinky_preflight_leased else '' }}{{
+          (' it would revoke ' ~ slinky_preflight_revoked_names | join(', ') ~ ', which needs the queue check: keep them present in git until the controller answers.')
+          if slinky_preflight_revoked_names | length > 0 else '' }}{% endif %}
+      when:
+        - slinky_preflight_ctl is failed or slinky_preflight_ping is failed
+        - not (slinky_preflight_controller_down | bool and slinky_preflight_leased and slinky_preflight_revoked_names | length == 0)
+
+    - name: Controller down, recovery run accepted (lease held, nobody revoked)
+      ansible.builtin.debug:
+        msg: >-
+          WARNING: the controller does not answer; this run holds lease {{ fleet_lease_id }} and revokes nobody,
+          so it goes on without the queue check (slinky_preflight_controller_down)
+      when: slinky_preflight_ctl is failed or slinky_preflight_ping is failed
+
+    - name: Scheduler preflight (a revoked user's queued jobs stop the run before any identity change)
+      ansible.builtin.command:
+        argv: [python3, "-", --check, env]
+        stdin: "{{ lookup('ansible.builtin.file', role_path ~ '/files/prace-slurm-accounts.py') }}"
+      environment:
+        PRACE_SLURM_ACCOUNTS_SPEC: "{{ slinky_accounts_spec | to_json }}"
+        PRACE_KUBECTL: "{{ slinky_kubectl }}"
+      register: slinky_preflight
+      changed_when: false
+      failed_when: false
+      when: slinky_preflight_ping is not skipped and slinky_preflight_ping is succeeded
+
+    - name: Scheduler preflight must succeed before convergence
+      ansible.builtin.assert:
+        that: slinky_preflight.rc == 0
+        fail_msg: "{{ slinky_preflight.stdout | default('') }} {{ slinky_preflight.stderr | default('') }} Scheduler preflight failed; no convergence. If a credential rotation was interrupted, retain both files and use playbooks/slinky-db-recover.yml under the owned closed fence before retrying. Otherwise inspect the preflight failure; do not bypass it."
+      when: slinky_preflight is not skipped

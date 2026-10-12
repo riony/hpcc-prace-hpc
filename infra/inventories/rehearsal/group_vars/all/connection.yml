@@ -1,0 +1,6 @@
+---
+ansible_user: root
+ansible_python_interpreter: /usr/bin/python3
+rehearsal: true
+# Rehearsal-only trust store, filled by rehearsal/trust-hosts.sh from the VMs themselves.
+rehearsal_known_hosts: "~/scratch/rehearsal/known_hosts"

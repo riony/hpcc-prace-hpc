@@ -1,0 +1,128 @@
+---
+# Managed by Ansible (roles/rehearsal_host). Login node only (playbooks/rehearsal-host.yml).
+- name: "QEMU/KVM and UEFI firmware (no libvirt: VMs use localhost-only networking)"
+  ansible.builtin.dnf:
+    name: "{{ rehearsal_packages }}"
+    state: present
+
+- name: Unprivileged rehearsal user (runs every rehearsal VM; kvm group for /dev/kvm)
+  ansible.builtin.user:
+    name: "{{ rehearsal_user }}"
+    system: true
+    groups: [kvm]
+    append: true
+    shell: /bin/bash
+    home: "{{ rehearsal_dir }}"
+    create_home: false
+
+- name: Rehearsal volume (separate from the root filesystem)
+  ansible.builtin.command: lvcreate -y -n {{ rehearsal_lv.name }} -L {{ rehearsal_lv.size }} {{ rehearsal_lv.vg }}
+  args:
+    creates: "/dev/{{ rehearsal_lv.vg }}/{{ rehearsal_lv.name }}"
+
+- name: Filesystem on it (only if it has none)
+  ansible.builtin.shell: |
+    set -e
+    dev=/dev/{{ rehearsal_lv.vg }}/{{ rehearsal_lv.name }}
+    if blkid -o value -s TYPE "$dev" >/dev/null 2>&1; then echo present; else mkfs.xfs -q "$dev"; echo created; fi
+  register: rehearsal_fs
+  changed_when: "'created' in rehearsal_fs.stdout"
+
+- name: Mounted at the rehearsal directory
+  ansible.posix.mount:
+    path: "{{ rehearsal_dir }}"
+    src: "/dev/{{ rehearsal_lv.vg }}/{{ rehearsal_lv.name }}"
+    fstype: xfs
+    opts: defaults,nodev,nosuid
+    state: mounted
+
+- name: Rehearsal directory owned by the rehearsal user
+  ansible.builtin.file:
+    path: "{{ rehearsal_dir }}"
+    state: directory
+    owner: "{{ rehearsal_user }}"
+    group: "{{ rehearsal_user }}"
+    mode: "0750"
+
+- name: Memory guard
+  ansible.builtin.copy:
+    src: prace-rehearsal-memguard.sh
+    dest: /usr/local/sbin/prace-rehearsal-memguard
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Egress rules for the rehearsal user
+  ansible.builtin.template:
+    src: prace-rehearsal.nft.j2
+    dest: /etc/nftables/prace-rehearsal.nft
+    owner: root
+    group: root
+    mode: "0644"
+  notify: reload rehearsal egress rules
+
+- name: Unit that loads them (its own table only; ordered after firewalld)
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/prace-rehearsal-egress.service
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      # Managed by Ansible (roles/rehearsal_host)
+      [Unit]
+      Description=Confine the rehearsal user's network egress (table inet prace_rehearsal)
+      After=firewalld.service network-online.target
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      ExecStart=/usr/sbin/nft -f /etc/nftables/prace-rehearsal.nft
+      ExecStop=/usr/sbin/nft delete table inet prace_rehearsal
+      [Install]
+      WantedBy=multi-user.target
+  notify: reload rehearsal egress rules
+
+- name: Egress rules active
+  ansible.builtin.systemd:
+    name: prace-rehearsal-egress
+    enabled: true
+    state: started
+    daemon_reload: true
+
+- name: Flush handlers (rules loaded before any check)
+  ansible.builtin.meta: flush_handlers
+
+- name: The rehearsal user cannot reach the live fleet, a BMC or campus (fails closed)
+  ansible.builtin.shell: |
+    set -o pipefail
+    bad=""
+    for t in 10.90.10.13:22 10.90.10.1:22 10.90.10.1:6443 10.90.10.1:3306 192.0.2.205:22 198.18.0.126:443 192.0.2.254:53 10.43.0.1:443 127.0.0.1:22 127.0.0.1:6443 127.0.0.1:10250; do
+      h=${t%:*}; p=${t#*:}
+      if runuser -u {{ rehearsal_user }} -- timeout 4 bash -c "</dev/tcp/$h/$p" 2>/dev/null; then bad="$bad $t"; fi
+    done
+    nft list table inet prace_rehearsal >/dev/null
+    echo "${bad:-none reachable}"
+  register: rehearsal_egress
+  changed_when: false
+  failed_when: rehearsal_egress.rc != 0 or rehearsal_egress.stdout != 'none reachable'
+
+# The table must touch nothing but the rehearsal user's sockets. Forwarded pod traffic has no
+# socket, and its VXLAN encapsulation leaves this host through the output hook: on 28 September a
+# negated owner match dropped it and every Slurm worker went "Not responding". Ping each other
+# node's flannel address from inside a pod network namespace, i.e. along exactly that path.
+- name: Pod traffic to every other node still flows with the table loaded (fails closed)
+  ansible.builtin.shell: |
+    set -o pipefail
+    systemctl is-active -q k3s || { echo "k3s not running here; skipped"; exit 0; }
+    ns=$(ip netns list | awk '/^cni-/{print $1; exit}')
+    [ -n "$ns" ] || { echo "no pod network namespace"; exit 1; }
+    nodes=$(k3s kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name} {.spec.podCIDR}{"\n"}{end}')
+    bad="" n=0
+    while read -r name cidr; do
+      [ "$name" = "{{ inventory_hostname }}" ] && continue
+      n=$((n + 1)); a=${cidr%/*}
+      ip netns exec "$ns" ping -c 2 -W 2 "$a" >/dev/null 2>&1 || bad="$bad $name($a)"
+    done <<<"$nodes"
+    [ -z "$bad" ] || { echo "unreachable from a pod:$bad"; exit 1; }
+    echo "all $n other nodes reachable from a pod"
+  register: rehearsal_pod_path
+  changed_when: false

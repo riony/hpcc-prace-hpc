@@ -1,0 +1,33 @@
+---
+# Rollback: stop and remove the dashboard. The served location is removed separately (roles/gitlab,
+# gitlab_prace_dash: false, then gitlab-ctl reconfigure). The owner revokes the token in GitLab and
+# deletes its file by hand; the role never touches the token.
+- name: Timers stopped and disabled
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    enabled: false
+    state: stopped
+  loop: [prace-dash-observe.timer, prace-dash-gitlab.timer, prace-dash-evidence.timer]
+  failed_when: false
+  when: fleet_dashboard_enable | bool
+
+- name: Units, code, site, evidence copy, cache and configuration removed
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /etc/systemd/system/prace-dash-observe.service
+    - /etc/systemd/system/prace-dash-observe.timer
+    - /etc/systemd/system/prace-dash-gitlab.service
+    - /etc/systemd/system/prace-dash-gitlab.timer
+    - /etc/systemd/system/prace-dash-evidence.service
+    - /etc/systemd/system/prace-dash-evidence.timer
+    - "{{ fleet_dashboard_lib }}"
+    - "{{ fleet_dashboard_www }}"
+    - "{{ fleet_dashboard_home }}"
+    - "{{ fleet_dashboard_etc }}/dash.json"
+  notify: fleet_dashboard reload systemd
+
+- name: The token file is the owner's to revoke and delete
+  ansible.builtin.debug:
+    msg: "Left in place: {{ fleet_dashboard_token_file }} (revoke the token in GitLab, then delete the file) and the {{ fleet_dashboard_user }} account."

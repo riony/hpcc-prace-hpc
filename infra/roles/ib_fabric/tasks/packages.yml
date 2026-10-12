@@ -1,0 +1,21 @@
+---
+# The exact pinned files from the fleet repository only (no weak dependencies), after the check.
+- name: Gated
+  ansible.builtin.include_tasks: gated.yml
+
+- name: Changes (a run started past the gates skips everything here)
+  when: ibf_gate_ok | bool
+  block:
+    - name: Check
+      ansible.builtin.include_tasks: packages-check.yml
+
+    - name: Install the missing ones, exactly (fleet repository only, no weak dependencies)
+      ansible.builtin.command:
+        argv: "{{ ['dnf', '-y'] + ib_fabric_dnf_opts + ['install'] + (ibf_pkg_names | reject('in', ibf_installed) | map('extract', ibf_plan.pins) | list) }}"
+      when: ibf_pkg_names | reject('in', ibf_installed) | list | length > 0 and not ansible_check_mode
+
+    - name: Installed exactly as pinned
+      ansible.builtin.command:
+        argv: "{{ ['rpm', '-q'] + (ibf_pkg_names | map('extract', ibf_plan.pins) | list) }}"
+      changed_when: false
+      when: not ansible_check_mode

@@ -1,0 +1,43 @@
+---
+# Managed by Ansible (roles/slinky). Read-only, from native-prepare.yml: a native worker has the
+# job environment of the slurmd image (Session A review R4, 2 Oct), before the chart moves its jobs
+# here: exactly the image's package builds, the paths the shared modulefiles and examples use, and
+# Lmod's module command in a login shell. In --check (nothing installed yet) it only says so.
+- name: Preview - the job environment is checked after the install
+  ansible.builtin.debug:
+    msg: "preview: after the install, {{ slurm_native_runtime_packages | join(', ') }} must be installed at exactly these builds"
+  when: ansible_check_mode
+
+- name: Installed builds of the job environment's packages
+  ansible.builtin.command:
+    argv: "{{ ['rpm', '-q', '--qf', '%{NAME}-%{VERSION}-%{RELEASE}\\n']
+              + (slurm_native_runtime_packages | map('regex_replace', '-[^-]+-[^-]+$', '') | list) }}"
+  register: slinky_runtime_rpm
+  changed_when: false
+  failed_when: >-
+    slinky_runtime_rpm.rc != 0 or slinky_runtime_rpm.stdout_lines != slurm_native_runtime_packages
+  when: not ansible_check_mode
+
+- name: The paths the modulefiles and examples use
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  loop: "{{ slinky_native_runtime_paths }}"
+  register: slinky_runtime_paths
+  when: not ansible_check_mode
+
+- name: Every path is there
+  ansible.builtin.assert:
+    that: slinky_runtime_paths.results | rejectattr('stat.exists') | list == []
+    fail_msg: "missing on {{ inventory_hostname }}: {{ slinky_runtime_paths.results | rejectattr('stat.exists') | map(attribute='item') | join(', ') }}"
+    quiet: true
+  when: not ansible_check_mode
+
+- name: Lmod's module command in a login shell, at the image's version
+  ansible.builtin.shell: "{{ slinky_native_module_probe }}"
+  register: slinky_runtime_module
+  changed_when: false
+  failed_when: >-
+    slinky_runtime_module.rc != 0 or
+    ('Version ' ~ (slurm_native_runtime_packages | select('match', '^Lmod-') | first).split('-')[1] ~ ' ')
+    not in slinky_runtime_module.stdout
+  when: not ansible_check_mode

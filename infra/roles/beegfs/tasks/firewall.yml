@@ -1,0 +1,20 @@
+---
+# Firewall: the existing fleet pattern, nothing new opened. roles/fleet_net binds the admin network
+# to the trusted zone by SOURCE (cluster services: NFS, Slurm, NTP, repository), so BeeGFS on the
+# admin network needs no port of its own; a per-port rule would be inert. Instead this proves the
+# contract on every BeeGFS host (files/prace-beegfs-firewall, read-only): the admin network is in
+# trusted (runtime and permanent), and no BeeGFS port (beegfs_ports, doc network_tuning.html) is
+# open in any other zone, the login node's campus-facing public zone included.
+- name: Read the firewall (read-only)
+  ansible.builtin.script:
+    cmd: "prace-beegfs-firewall {{ {'admin_network': admin_network, 'ports': bg_all_ports, 'trusted_sources': beegfs_trusted_sources} | to_json | quote }}"
+    executable: "{{ beegfs_python }}"
+  register: bg_fw
+  changed_when: false
+  check_mode: false
+
+- name: BeeGFS ports are reachable from the admin network only
+  ansible.builtin.assert:
+    that: (bg_fw.stdout | from_json).errors | length == 0
+    fail_msg: "{{ inventory_hostname }}: {{ (bg_fw.stdout | from_json).errors | join(' | ') }}"
+    quiet: true

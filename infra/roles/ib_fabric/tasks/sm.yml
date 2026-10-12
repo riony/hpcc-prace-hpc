@@ -1,0 +1,123 @@
+---
+# The subnet managers of this node: one OpenSM per ring link whose sm is this node, bound to that
+# link's port GUID, with the link's own subnet prefix and cache.
+- name: Gated
+  ansible.builtin.include_tasks: gated.yml
+
+- name: Subnet managers (a run started past the gates skips everything here)
+  when: ibf_gate_ok | bool
+  block:
+    - name: Is the stock opensm.service masked? (it would bind the first active port it finds)
+      ansible.builtin.command: systemctl is-enabled opensm.service
+      register: ibf_stock
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: Mask the stock opensm.service
+      ansible.builtin.command: systemctl mask opensm.service
+      when: ibf_stock.stdout | trim != 'masked' and not ansible_check_mode
+
+    - name: Each instance's cache (guid2lid, neighbours, dumps), private to it
+      ansible.builtin.file:
+        path: "{{ ib_fabric_root }}var/cache/opensm/{{ item.link }}"
+        state: directory
+        mode: "0700"
+      loop: "{{ ibf_host.sm }}"
+      loop_control: {label: "{{ item.link }}"}
+
+    - name: Each instance's configuration
+      ansible.builtin.template:
+        src: prace-opensm.conf.j2
+        dest: "{{ ib_fabric_root }}etc/rdma/prace-opensm-{{ item.link }}.conf"
+        mode: "0644"
+      loop: "{{ ibf_host.sm }}"
+      loop_control: {label: "{{ item.link }}"}
+      register: ibf_sm_conf
+
+    - name: Each instance's partitions (the default partition with the IPoIB broadcast group)
+      ansible.builtin.template:
+        src: prace-opensm.partitions.j2
+        dest: "{{ ib_fabric_root }}etc/rdma/prace-opensm-{{ item.link }}.partitions"
+        mode: "0644"
+      loop: "{{ ibf_host.sm }}"
+      loop_control: {label: "{{ item.link }}"}
+      register: ibf_sm_part
+
+    - name: Each instance's planned other end (read by the unit's start check)
+      ansible.builtin.copy:
+        dest: "{{ ib_fabric_root }}etc/rdma/prace-opensm-{{ item.link }}.peer"
+        content: "{{ item.peer_guid | replace(':', '') }}\n"
+        mode: "0644"
+      loop: "{{ ibf_host.sm }}"
+      loop_control: {label: "{{ item.link }}"}
+      register: ibf_sm_peer
+
+    - name: The start check (prace-opensm-peer-check, the unit's ExecStartPre)
+      ansible.builtin.copy:
+        src: prace-opensm-peer-check
+        dest: "{{ ib_fabric_root }}usr/libexec/prace-opensm-peer-check"
+        mode: "0755"
+      register: ibf_sm_check
+
+    - name: The instance unit (prace-opensm@<link>.service)
+      ansible.builtin.copy:
+        src: prace-opensm@.service
+        dest: "{{ ib_fabric_root }}etc/systemd/system/prace-opensm@.service"
+        mode: "0644"
+      register: ibf_sm_unit
+
+    - name: systemd reads the unit
+      ansible.builtin.command: systemctl daemon-reload
+      when: ibf_sm_unit is changed and not ansible_check_mode
+
+    - name: Report again, just before any start (the neighbours are read now)
+      ansible.builtin.include_tasks: report.yml
+      when: not ansible_check_mode
+
+    - name: Each managed port's neighbour is still the planned other end (nothing starts on a moved cable)
+      ansible.builtin.assert:
+        that:
+          - (ibf_port.peer | default({}, true)).rc | default(1) == 0
+          - (ibf_port.peer | default({}, true)).port_guid | default('') == ibf_end.peer_guid
+          - "'channel adapter' in ((ibf_port.peer | default({}, true)).type | default('') | string | lower)"
+        fail_msg: "{{ inventory_hostname }} {{ item.link }}: neighbour {{ ibf_port.peer | default('unknown') }}, planned {{ ibf_end.peer_guid }}"
+        quiet: true
+      vars:
+        ibf_port: "{{ ibf_now.ports | selectattr('guid', 'equalto', item.guid) | first }}"
+        ibf_end: "{{ ibf_host.ports | selectattr('link', 'equalto', item.link) | first }}"
+      loop: "{{ ibf_host.sm }}"
+      loop_control: {label: "{{ item.link }}"}
+      when: not ansible_check_mode
+
+    - name: Each instance enabled and running (restarted when its configuration or the unit changed)
+      ansible.builtin.shell: |
+        set -eu
+        u='prace-opensm@{{ item.link }}.service'
+        [ "$(systemctl is-enabled "$u" 2>/dev/null || true)" = enabled ] || { systemctl enable "$u" >/dev/null; echo "enabled $u"; }
+        if [ "$(systemctl is-active "$u" 2>/dev/null || true)" != active ]; then systemctl start "$u"; echo "started $u"
+        elif [ '{{ restart }}' = True ]; then systemctl restart "$u"; echo "restarted $u"; fi
+      vars:
+        restart: >-
+          {{ ibf_sm_unit is changed or ibf_sm_check is changed
+             or (ibf_sm_peer.results | selectattr('item.link', 'equalto', item.link) | selectattr('changed') | list | length > 0)
+             or (ibf_sm_conf.results | selectattr('item.link', 'equalto', item.link) | selectattr('changed') | list | length > 0)
+             or (ibf_sm_part.results | selectattr('item.link', 'equalto', item.link) | selectattr('changed') | list | length > 0) }}
+      register: ibf_sm_run
+      changed_when: ibf_sm_run.stdout | length > 0
+      loop: "{{ ibf_host.sm }}"
+      loop_control: {label: "{{ item.link }}"}
+      when: not ansible_check_mode
+
+    - name: Wait until this node's managed ports are ACTIVE
+      ansible.builtin.script:
+        cmd: prace-ib-ports.py
+        executable: "{{ ib_fabric_helper_python }}"
+      register: ibf_wait
+      changed_when: false
+      until: >-
+        (ibf_wait.stdout | from_json).ports | selectattr('guid', 'in', ibf_host.sm | map(attribute='guid') | list)
+          | selectattr('state', 'equalto', 4) | list | length == ibf_host.sm | length
+      retries: "{{ ib_fabric_active_retries }}"
+      delay: "{{ ib_fabric_active_delay }}"
+      when: not ansible_check_mode

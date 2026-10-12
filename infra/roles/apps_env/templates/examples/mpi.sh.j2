@@ -1,0 +1,34 @@
+#!/bin/bash -l
+# Managed by Ansible (roles/apps_env). T88 example: MPI across two nodes over TCP on the pod network.
+# The only CPU node is the Lenovo, so two nodes means two GPU nodes: each node's task asks for one
+# GPU (a GPU node takes only jobs with a GPU) and at most 4 CPUs and 90 GiB per GPU. Submit from a
+# writable shared directory (your home or project: both nodes run the binary built there):
+#   sbatch -A proj-alpha /apps/examples/mpi.sh
+#SBATCH -J t88-mpi
+#SBATCH -p gpu
+#SBATCH -N 2
+#SBATCH --ntasks-per-node=1
+#SBATCH --gres=gpu:1
+#SBATCH -c 4
+#SBATCH --mem=32G
+#SBATCH -t 00:10:00
+set -eo pipefail
+module load gcc/11.5 openmpi/4.1
+# TCP only, on the pod network: the InfiniBand ring is deferred (D42); no RDMA or UCX transport.
+# oob: mpirun's own daemons talk on the pod network too
+export OMPI_MCA_pml=ob1 OMPI_MCA_btl=self,tcp OMPI_MCA_btl_tcp_if_include={{ apps_env_mpi_subnet }} OMPI_MCA_oob_tcp_if_include={{ apps_env_mpi_subnet }}
+work=$PWD/t88-build-$SLURM_JOB_ID
+mkdir -p "$work" && trap 'rm -rf "$work"' EXIT
+mpicc -O2 -o "$work/mpi_hello" /apps/examples/mpi_hello.c
+# mpirun, not srun: the images' OpenMPI 4.1.1 has no PMI-1/PMI-2 client and their Slurm no PMIx
+# plugin, so `srun --mpi=pmi2` cannot start it ("OMPI was not built with SLURM's PMI support", bench
+# 2 Oct). mpirun starts one daemon per node through Slurm inside this allocation, then the ranks.
+rc=0
+mpirun -n "$SLURM_NTASKS" --map-by node "$work/mpi_hello" | tee "$work/out" || rc=$?
+# two ranks on two different nodes, and the message really crossed (a failed launch, or ranks that
+# each started alone with size=1, fail here, never pass)
+if [ $rc != 0 ] || ! grep -qx "mpi: size=$SLURM_NNODES hosts=$SLURM_NNODES messages=$((SLURM_NNODES - 1))" "$work/out"; then
+  echo "t88-mpi FAILED (launch rc $rc): expected $SLURM_NNODES ranks on $SLURM_NNODES nodes" >&2
+  exit 1
+fi
+echo "t88-mpi ok: $SLURM_NNODES ranks on $SLURM_NNODES nodes over TCP"

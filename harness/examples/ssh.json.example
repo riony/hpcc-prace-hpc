@@ -1,0 +1,29 @@
+{
+  "schema": "prace.harness-ssh.v1",
+  "roles": {
+    "actor": {
+      "identity": "syn-smoke",
+      "ssh_alias": "prace-actor",
+      "remote_helper": "/apps/prace/REPLACE_WITH_FULL_EXECUTION_SHA/prace_file_ops_helper.py",
+      "identity_file": "/REPLACE/WITH/ABSOLUTE/keys/actor_ed25519",
+      "known_hosts": "/REPLACE/WITH/ABSOLUTE/keys/known_hosts",
+      "connect_timeout": 10
+    },
+    "tracer": {
+      "identity": "syn-tracer",
+      "ssh_alias": "prace-tracer",
+      "remote_helper": "/apps/prace/REPLACE_WITH_FULL_EXECUTION_SHA/prace_file_ops_helper.py",
+      "identity_file": "/REPLACE/WITH/ABSOLUTE/keys/tracer_ed25519",
+      "known_hosts": "/REPLACE/WITH/ABSOLUTE/keys/known_hosts",
+      "connect_timeout": 10
+    },
+    "observer": {
+      "identity": "syn-observer",
+      "ssh_alias": "prace-observer",
+      "remote_helper": "/apps/prace/REPLACE_WITH_FULL_EXECUTION_SHA/prace_file_ops_helper.py",
+      "identity_file": "/REPLACE/WITH/ABSOLUTE/keys/observer_ed25519",
+      "known_hosts": "/REPLACE/WITH/ABSOLUTE/keys/known_hosts",
+      "connect_timeout": 10
+    }
+  }
+}

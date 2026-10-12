@@ -1,0 +1,312 @@
+---
+- name: Remove the dashboard (fleet_dashboard_state=absent)
+  ansible.builtin.include_tasks: absent.yml
+  when: fleet_dashboard_state == 'absent'
+
+- name: Install the dashboard
+  when: fleet_dashboard_state == 'present'
+  block:
+    # First, before anything changes: the owner's token file must exist (the role never sees its content).
+    - name: Dashboard GitLab token present?
+      ansible.builtin.stat:
+        path: "{{ fleet_dashboard_token_file }}"
+        get_checksum: false
+        get_mime: false
+        get_attributes: false
+      register: fd_token
+
+    - name: Refuse without the owner-created token file
+      ansible.builtin.assert:
+        that: [fd_token.stat.exists, fd_token.stat.isreg | default(false), (fd_token.stat.size | default(0)) > 0]
+        fail_msg: >-
+          {{ fleet_dashboard_token_file }} is missing, not a file, or empty. The owner creates the
+          dashboard's own read-only GitLab token (scope read_api; project access token, Reporter, with an
+          expiry) and places it by hand, before this role runs:
+          sudo install -d -m 0750 {{ fleet_dashboard_etc }} &&
+          sudo sh -c 'umask 077; cat > {{ fleet_dashboard_token_file }}'  (paste the token, Enter, Ctrl-D).
+          Ansible never reads, copies or prints the token.
+        quiet: true
+
+    # Read on the controller from its checkout at HEAD (read-only commands, also in check mode).
+    - name: Deploy commit of the controller's checkout
+      ansible.builtin.command: git -C {{ fleet_dashboard_repo }} rev-parse HEAD
+      delegate_to: localhost
+      become: false
+      check_mode: false
+      changed_when: false
+      register: fd_commit
+
+    - name: Evidence tree must be clean at that commit (it is shipped as the pinned source)
+      ansible.builtin.command: git -C {{ fleet_dashboard_repo }} status --porcelain -- evidence
+      delegate_to: localhost
+      become: false
+      check_mode: false
+      changed_when: false
+      failed_when: fd_dirty.rc != 0 or fd_dirty.stdout | length > 0
+      register: fd_dirty
+
+    - name: Evidence folders the evidence collector reads
+      ansible.builtin.command: python3 {{ role_path }}/files/prace_dash_evidence.py select --repo {{ fleet_dashboard_repo }}
+      delegate_to: localhost
+      become: false
+      check_mode: false
+      changed_when: false
+      register: fd_select
+
+    - name: Account names (scrub map) and pinned versions, from the repository (no templating of their values)
+      ansible.builtin.set_fact:
+        fd_accounts: "{{ lookup('ansible.builtin.file', fleet_dashboard_accounts_file) | from_yaml }}"
+        fd_slinky: "{{ lookup('ansible.builtin.file', fleet_dashboard_repo ~ '/infra/roles/slinky/defaults/main.yml') | from_yaml }}"
+        fd_repo: "{{ lookup('ansible.builtin.file', fleet_dashboard_repo ~ '/infra/roles/fleet_repo/defaults/main.yml') | from_yaml }}"
+        fd_k3s: "{{ lookup('ansible.builtin.file', fleet_dashboard_repo ~ '/infra/roles/k3s/defaults/main.yml') | from_yaml }}"
+
+    # A first preview (--check) on a fresh VM: the account does not exist yet, so ownership by it is
+    # previewed as unchanged instead of failing the group lookup (Session review, 5 Oct).
+    - name: Dashboard account present already?
+      ansible.builtin.command: getent passwd {{ fleet_dashboard_user }}
+      check_mode: false
+      changed_when: false
+      failed_when: fd_getent.rc not in [0, 2]
+      register: fd_getent
+
+    - name: Dashboard account (service only, no login shell, no sudo, no key)
+      ansible.builtin.user:
+        name: "{{ fleet_dashboard_user }}"
+        system: true
+        shell: /sbin/nologin
+        password: "!"
+        create_home: false
+        home: "{{ fleet_dashboard_home }}"
+
+    - name: Directories
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: directory
+        owner: "{{ (item.owner == fleet_dashboard_user and fd_preview_only) | ternary(omit, item.owner) }}"
+        group: "{{ (item.group == fleet_dashboard_user and fd_preview_only) | ternary(omit, item.group) }}"
+        mode: "{{ item.mode }}"
+        setype: "{{ item.setype | default(omit) }}"
+      loop:
+        - {path: "{{ fleet_dashboard_home }}", owner: root, group: root, mode: "0755"}
+        - {path: "{{ fleet_dashboard_home }}/state", owner: "{{ fleet_dashboard_user }}", group: "{{ fleet_dashboard_user }}", mode: "0700"}
+        - {path: "{{ fleet_dashboard_home }}/src", owner: root, group: "{{ fleet_dashboard_user }}", mode: "0750"}
+        - {path: "{{ fleet_dashboard_home }}/src/evidence", owner: root, group: "{{ fleet_dashboard_user }}", mode: "0750"}
+        - {path: "{{ fleet_dashboard_www }}", owner: root, group: root, mode: "0755", setype: httpd_sys_content_t}
+        - {path: "{{ fleet_dashboard_www }}/data", owner: "{{ fleet_dashboard_user }}", group: "{{ fleet_dashboard_user }}", mode: "0755", setype: httpd_sys_content_t}
+        - {path: "{{ fleet_dashboard_lib }}", owner: root, group: root, mode: "0755"}
+        - {path: "{{ fleet_dashboard_etc }}", owner: root, group: "{{ fleet_dashboard_user }}", mode: "0750"}
+      loop_control:
+        label: "{{ item.path }}"
+
+    - name: Token readable by the dashboard only (owner and mode; the content is never read)
+      ansible.builtin.file:
+        path: "{{ fleet_dashboard_token_file }}"
+        owner: "{{ fleet_dashboard_user }}"
+        group: "{{ fleet_dashboard_user }}"
+        mode: "0600"
+      when: not fd_preview_only
+
+    - name: Collector code, scrub map and trust table (the workstation build tool is never installed here)
+      ansible.builtin.copy:
+        src: "{{ item }}"
+        dest: "{{ fleet_dashboard_lib }}/{{ item }}"
+        owner: root
+        group: root
+        mode: "0644"
+      loop: [prace_dash_common.py, prace_dash_observe.py, prace_dash_gitlab.py, prace_dash_evidence.py, prace_dash_physical.py, scrub-map.json, trust-table.json]
+      notify: fleet_dashboard refresh data
+
+    - name: Static site (no data; the collectors write data/)
+      ansible.builtin.copy:
+        src: "www/{{ item }}"
+        dest: "{{ fleet_dashboard_www }}/{{ item }}"
+        owner: root
+        group: root
+        mode: "0644"
+      loop: [index.html, app.css, app.js]
+
+    - name: Evidence folder directories
+      ansible.builtin.file:
+        path: "{{ fleet_dashboard_home }}/src/evidence/{{ item }}"
+        state: directory
+        owner: root
+        group: "{{ fd_preview_only | ternary(omit, fleet_dashboard_user) }}"
+        mode: "0750"
+      loop: "{{ fd_select.stdout | from_json }}"
+
+    - name: Evidence folders at the deploy commit (read by prace-dash-evidence, never served)
+      ansible.builtin.copy:
+        src: "{{ fleet_dashboard_repo }}/evidence/{{ item }}/"
+        dest: "{{ fleet_dashboard_home }}/src/evidence/{{ item }}/"
+        owner: root
+        group: "{{ fd_preview_only | ternary(omit, fleet_dashboard_user) }}"
+        mode: "0640"
+        directory_mode: "0750"
+        local_follow: false          # a link is never followed on the controller (select also skips folders with links)
+      loop: "{{ fd_select.stdout | from_json }}"
+      notify: fleet_dashboard refresh data
+
+    - name: Source record (the commit the evidence was shipped from)
+      ansible.builtin.copy:
+        dest: "{{ fleet_dashboard_home }}/src/SOURCE.json"
+        owner: root
+        group: "{{ fd_preview_only | ternary(omit, fleet_dashboard_user) }}"
+        mode: "0640"
+        content: "{{ {'commit': fd_commit.stdout, 'folders': fd_select.stdout | from_json} | to_nice_json }}\n"
+      notify: fleet_dashboard refresh data
+
+    - name: Dashboard configuration (no secret; the token stays in its own file)
+      ansible.builtin.copy:
+        dest: "{{ fleet_dashboard_etc }}/dash.json"
+        owner: root
+        group: "{{ fd_preview_only | ternary(omit, fleet_dashboard_user) }}"
+        mode: "0640"
+        content: "{{ cfg | to_nice_json }}\n"
+      notify: fleet_dashboard refresh data
+      vars:
+        users: "{{ fd_accounts.cluster_users | selectattr('groups', 'defined') | sort(attribute='uid') }}"
+        cfg:
+          schema: 1
+          www_data: "{{ fleet_dashboard_www }}/data"
+          state_dir: "{{ fleet_dashboard_home }}/state"
+          freeze_file: "{{ fleet_dashboard_freeze_file }}"
+          monitor:
+            state: "{{ fleet_dashboard_monitor_home }}/state.json"
+            history: "{{ fleet_dashboard_monitor_home }}/history.jsonl"
+            observation: "{{ fleet_dashboard_monitor_home }}/latest-observation.json"
+            profile: "{{ fleet_dashboard_monitor_lib }}/deployed.json"
+          gitlab:
+            url: "https://{{ gitlab_fqdn }}"
+            connect: "{{ fleet_dashboard_gitlab_connect }}"
+            project: "{{ fleet_dashboard_project }}"
+            token_file: "{{ fleet_dashboard_token_file }}"
+            reservation_labels: "{{ fleet_dashboard_reservation_labels }}"
+            monitor_labels: "{{ fleet_dashboard_monitor_labels }}"
+            drift_job: "{{ fleet_dashboard_drift_job }}"
+            monitor_token_expires: "{{ fleet_dashboard_monitor_token_expires }}"
+          evidence:
+            source: "{{ fleet_dashboard_home }}/src"
+          scrub:
+            map: "{{ fleet_dashboard_lib }}/scrub-map.json"
+            accounts:
+              synthetic: "{{ users | selectattr('groups', 'contains', 'synthetic') | map(attribute='name') | list }}"
+              agents: "{{ users | selectattr('groups', 'contains', 'agents') | map(attribute='name') | list }}"
+              team: "{{ users | selectattr('groups', 'contains', 'team') | map(attribute='name') | list }}"
+            names: "{{ {gitlab_fqdn: 'mgmt-vm'} }}"
+          inventory: "{{ fleet_dashboard_inventory }}"
+          static:
+            images: "{{ fd_slinky.slinky_images | dict2items }}"
+            versions:
+              Slinky charts: "{{ fd_slinky.slinky_chart_version }}"
+              K3s: "{{ fd_k3s.k3s_version }}"
+              NVIDIA driver: "{{ fd_repo.nvidia_driver_version }}"
+              CUDA toolkit: "{{ fd_repo.nvidia_cuda_version }}"
+              DCGM: "{{ fd_repo.nvidia_dcgm_version }}"
+              NCCL: "{{ fd_repo.nvidia_nccl_version }}"
+            policy: "{{ fleet_dashboard_policy | combine({'Projects': fd_accounts.cluster_groups | selectattr('gid', 'ge', 31001) | selectattr('gid', 'le', 31999) | map(attribute='name') | join(', ')}) }}"
+
+    - name: Collector units
+      ansible.builtin.copy:
+        dest: "/etc/systemd/system/{{ item.name }}"
+        owner: root
+        group: root
+        mode: "0644"
+        content: "{{ item.content }}"
+      loop:
+        - name: prace-dash-observe.service
+          content: |
+            # Managed by Ansible (roles/fleet_dashboard)
+            [Unit]
+            Description=Fleet dashboard: Cluster and Slurm data from the monitor's files (read-only, no network)
+            [Service]
+            Type=oneshot
+            User={{ fleet_dashboard_user }}
+            UMask=0022
+            ExecStart=/usr/bin/python3 {{ fleet_dashboard_lib }}/prace_dash_observe.py run --config {{ fleet_dashboard_etc }}/dash.json
+            TimeoutStartSec=60
+            {{ fd_hardening }}
+            PrivateNetwork=yes
+            RestrictAddressFamilies=AF_UNIX
+            IPAddressDeny=any
+            ReadWritePaths={{ fleet_dashboard_www }}/data
+        - name: prace-dash-observe.timer
+          content: |
+            # Managed by Ansible (roles/fleet_dashboard)
+            [Unit]
+            Description=Fleet dashboard observe every {{ fleet_dashboard_observe_s }} s
+            [Timer]
+            OnBootSec=3min
+            OnUnitActiveSec={{ fleet_dashboard_observe_s }}s
+            AccuracySec=5s
+            [Install]
+            WantedBy=timers.target
+        - name: prace-dash-gitlab.service
+          content: |
+            # Managed by Ansible (roles/fleet_dashboard)
+            [Unit]
+            Description=Fleet dashboard: CI/CD data from this VM's GitLab API (GET only, own read_api token)
+            ConditionPathExists={{ fleet_dashboard_token_file }}
+            [Service]
+            Type=oneshot
+            User={{ fleet_dashboard_user }}
+            UMask=0022
+            ExecStart=/usr/bin/python3 {{ fleet_dashboard_lib }}/prace_dash_gitlab.py run --config {{ fleet_dashboard_etc }}/dash.json
+            TimeoutStartSec=120
+            {{ fd_hardening }}
+            RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+            IPAddressDeny=any
+            IPAddressAllow=localhost
+            ReadWritePaths={{ fleet_dashboard_www }}/data {{ fleet_dashboard_home }}/state
+        - name: prace-dash-gitlab.timer
+          content: |
+            # Managed by Ansible (roles/fleet_dashboard)
+            [Unit]
+            Description=Fleet dashboard GitLab poll every {{ fleet_dashboard_gitlab_s }} s
+            [Timer]
+            OnBootSec=4min
+            OnUnitActiveSec={{ fleet_dashboard_gitlab_s }}s
+            AccuracySec=15s
+            [Install]
+            WantedBy=timers.target
+        - name: prace-dash-evidence.service
+          content: |
+            # Managed by Ansible (roles/fleet_dashboard)
+            [Unit]
+            Description=Fleet dashboard: evidence views from the shipped evidence folders (scrubbed only, no network)
+            [Service]
+            Type=oneshot
+            User={{ fleet_dashboard_user }}
+            UMask=0022
+            ExecStart=/usr/bin/python3 {{ fleet_dashboard_lib }}/prace_dash_evidence.py run --config {{ fleet_dashboard_etc }}/dash.json
+            TimeoutStartSec=300
+            {{ fd_hardening }}
+            PrivateNetwork=yes
+            RestrictAddressFamilies=AF_UNIX
+            IPAddressDeny=any
+            ReadWritePaths={{ fleet_dashboard_www }}/data
+        - name: prace-dash-evidence.timer
+          content: |
+            # Managed by Ansible (roles/fleet_dashboard)
+            [Unit]
+            Description=Fleet dashboard evidence build, {{ fleet_dashboard_evidence_calendar }}
+            [Timer]
+            OnBootSec=5min
+            OnCalendar={{ fleet_dashboard_evidence_calendar }}
+            [Install]
+            WantedBy=timers.target
+      loop_control:
+        label: "{{ item.name }}"
+      vars:
+        fd_hardening: "NoNewPrivileges=yes\nProtectSystem=strict\nProtectHome=yes\nPrivateTmp=yes\nPrivateDevices=yes\nCapabilityBoundingSet=\nProtectKernelTunables=yes\nProtectKernelModules=yes\nProtectControlGroups=yes\nRestrictSUIDSGID=yes\nLockPersonality=yes"
+      notify: fleet_dashboard reload systemd
+
+    - name: Flush handlers (units loaded, data refreshed)
+      ansible.builtin.meta: flush_handlers
+
+    - name: Collector timers running
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        enabled: true
+        state: started
+      loop: [prace-dash-observe.timer, prace-dash-gitlab.timer, prace-dash-evidence.timer]
+      when: fleet_dashboard_enable | bool and not ansible_check_mode

@@ -1,0 +1,10 @@
+---
+- name: restart slurmdbd
+  ansible.builtin.systemd: {name: slurmdbd, state: restarted}
+  when: fleet_role == 'login'
+- name: restart slurmctld
+  ansible.builtin.systemd: {name: slurmctld, state: restarted}
+  when: fleet_role == 'login'
+- name: restart slurmd
+  ansible.builtin.systemd: {name: slurmd, state: restarted}
+  when: fleet_role != 'login'

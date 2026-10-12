@@ -1,0 +1,41 @@
+---
+# Managed by Ansible (roles/slinky). Runs on every node for the Slinky backend, in this order so a
+# fresh all-fleet run works in one pass: (1) worker images on every compute node, (2) the login
+# node's database, manifests (controller, NodeSets), accounts, watchdog and fleet check, (3) each
+# compute node's own registration check. Worker-only runs skip (2) and still end with (3).
+# Native workers (slurm_native_workers, T89): a host leaving the list takes its native slurmd down,
+# and a joining host is installed and configured, BEFORE (2) changes its kind's NodeSet; (2)
+# refuses the change unless every changing host did (tasks/native-transition.yml). A listed host
+# starts its native slurmd AFTER (2) switched the NodeSet off. Each node has one slurmd at any time.
+- name: Maintenance and native topology preflight before any Slinky mutation
+  ansible.builtin.include_tasks: maintenance-preflight.yml
+
+- name: The NRI mount guard on every node, before any pod uses the shares (T87)
+  ansible.builtin.include_tasks:
+    file: nri-mount-guard.yml
+    apply: {tags: [slinky_nri]}
+  tags: [slinky_nri]
+  when: slinky_pod_shares | length > 0
+
+- name: Worker images on every compute node
+  ansible.builtin.include_tasks: images.yml
+
+- name: A host no longer native stops its native slurmd first
+  ansible.builtin.include_tasks: native-off.yml
+  when: fleet_role != 'login' and inventory_hostname not in slurm_native_workers | default([])
+
+- name: A joining native worker is installed and configured (nothing started)
+  ansible.builtin.include_tasks: native-prepare.yml
+  when: inventory_hostname in slurm_native_workers | default([])
+
+- name: Login node (manifests, database, accounts, watchdog, acceptance)
+  ansible.builtin.include_tasks: login.yml
+  when: fleet_role == 'login'
+
+- name: A native worker's slurmd joins the controller
+  ansible.builtin.include_tasks: native.yml
+  when: inventory_hostname in slurm_native_workers | default([])
+
+- name: This compute node is a usable Slinky worker
+  ansible.builtin.include_tasks: worker-check.yml
+  when: fleet_role != 'login'

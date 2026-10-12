@@ -1,0 +1,111 @@
+---
+# Install packages at their pinned NEVRAs (roles/fleet_repo fleet_repo_beegfs_packages, via bg_pins)
+# from the BeeGFS repository alone (bg_repo_opts: every other repository disabled for the
+# transaction), signature-checked (gpgcheck=1, the fingerprint-checked key from common.yml).
+#   bg_pkg_names   package names, each installed as its exact pinned NEVRA
+#   bg_pkg_extra   names satisfied by what the host has or by pinned files only (build chain)
+# Version-lock policy (BeeGFS packages only; the host tools follow the fleet's own updates):
+#   - one lock per package, its full NEVRA, added BEFORE the install so the transaction can take
+#     nothing else, with the same repository options (dnf versionlock resolves the spec: on the
+#     login node, which keeps its upstream repositories, a lock without them found no package);
+#   - no BeeGFS lock entry outside the pins: a stale lock from an earlier release fails the run (a release
+#     change is a new pin set, a new qualification and a window, never an in-place upgrade);
+#   - after the install, rpm must report exactly the pinned NEVRAs and libbeegfs-ib must be absent.
+- name: Pinned NEVRAs of these packages
+  ansible.builtin.set_fact:
+    bg_pkg_nevras: "{{ bg_pkg_names | map('extract', bg_pins) | map(attribute='nevra') | list }}"
+    bg_pkg_locked: "{{ bg_pkg_names | select('match', '^(lib)?beegfs-') | list }}"
+
+- name: "Version-lock plugin (as the host has it, or the pinned file: no other repository is enabled)"
+  ansible.builtin.command:
+    argv: "{{ ['dnf', '-y'] + bg_repo_opts + ['install', 'python3-dnf-plugin-versionlock'] }}"
+  register: bg_vl
+  changed_when: "'Nothing to do' not in bg_vl.stdout"
+  when: bg_pkg_locked | length > 0
+
+- name: Current BeeGFS lock entries
+  ansible.builtin.command:
+    argv: "{{ ['dnf'] + bg_repo_opts + ['versionlock', 'list'] }}"
+  register: bg_locks
+  changed_when: false
+  check_mode: false
+  failed_when: false
+  when: bg_pkg_locked | length > 0
+
+# Against every pinned BeeGFS NEVRA, not only this step's: a host runs several steps (meta then
+# storage; management then client on the login node), and an earlier step's lock is legitimate.
+- name: No lock for any other BeeGFS release (a stale entry would hold an old version)
+  vars:
+    want: "{{ bg_beegfs_pins | map(attribute='nevra') | map('regex_replace', '[.](x86_64|noarch)$', '.*') | list }}"
+    have: "{{ (bg_locks.stdout_lines | default([])) | select('match', '^(lib)?beegfs-') | list }}"
+  ansible.builtin.assert:
+    that: have | difference(want) | length == 0
+    fail_msg: "{{ inventory_hostname }}: BeeGFS lock entries {{ have | difference(want) }} are not the pins {{ want }}"
+    quiet: true
+  when: bg_pkg_locked | length > 0
+
+- name: Lock the BeeGFS packages at their pinned NEVRAs (before installing them)
+  ansible.builtin.shell: |
+    set -euo pipefail
+    have=$(dnf {{ bg_repo_opts | map('quote') | join(' ') }} versionlock list 2>/dev/null || true)
+    added=0
+    {% for name in bg_pkg_locked %}
+    want={{ bg_pins[name].nevra | regex_replace('[.](x86_64|noarch)$', '.*') | quote }}
+    if ! grep -qxF -- "$want" <<<"$have"; then
+      dnf {{ bg_repo_opts | map('quote') | join(' ') }} versionlock add {{ bg_pins[name].nevra | quote }} >/dev/null && added=1
+    fi
+    {% endfor %}
+    echo "added=$added"
+  args: {executable: /bin/bash}
+  register: bg_lock
+  changed_when: "'added=1' in bg_lock.stdout"
+  when: bg_pkg_locked | length > 0
+
+- name: Install them (exact NEVRAs; the BeeGFS repository alone; RDMA support never)
+  ansible.builtin.command:
+    argv: >-
+      {{ ['dnf', '-y'] + bg_repo_opts + ['install'] + bg_pkg_nevras + (bg_pkg_extra | default([]))
+         + ['--exclude=' ~ (beegfs_refused_packages | join(','))] }}
+  register: bg_install
+  changed_when: "'Nothing to do' not in bg_install.stdout"
+
+- name: Installed NEVRAs
+  ansible.builtin.command:
+    argv: "{{ ['rpm', '-q', '--qf', '%{NAME}-%{EPOCHNUM}:%{VERSION}-%{RELEASE}.%{ARCH}\\n'] + bg_pkg_names }}"
+  register: bg_rpm
+  changed_when: false
+  check_mode: false
+  failed_when: false
+
+- name: Packages present (a check-mode preview of a fresh host skips the service steps)
+  ansible.builtin.set_fact:
+    bg_pkgs_present: "{{ bg_rpm.rc == 0 }}"
+
+- name: Exactly the pinned NEVRAs, each locked
+  ansible.builtin.assert:
+    that:
+      - bg_rpm.rc == 0
+      - bg_rpm.stdout_lines | sort == bg_pkg_nevras | sort
+    fail_msg: "{{ inventory_hostname }}: installed {{ bg_rpm.stdout_lines }}, pinned {{ bg_pkg_nevras }}"
+    quiet: true
+  when: not ansible_check_mode
+
+- name: The lock list now holds every pinned BeeGFS NEVRA
+  ansible.builtin.command:
+    argv: "{{ ['dnf'] + bg_repo_opts + ['versionlock', 'list'] }}"
+  register: bg_locks_after
+  changed_when: false
+  check_mode: false
+  failed_when: >-
+    bg_locks_after.rc != 0 or
+    (bg_pkg_locked | map('extract', bg_pins) | map(attribute='nevra') | map('regex_replace', '[.](x86_64|noarch)$', '.*') | list)
+    | difference(bg_locks_after.stdout_lines) | length > 0
+  when: not ansible_check_mode and bg_pkg_locked | length > 0
+
+- name: RDMA support is absent (TCP only until the ring is qualified)
+  ansible.builtin.command:
+    argv: "{{ ['rpm', '-q'] + beegfs_refused_packages }}"
+  register: bg_refused
+  changed_when: false
+  check_mode: false
+  failed_when: bg_refused.rc == 0 or (bg_refused.stdout_lines | reject('search', 'is not installed') | list | length) > 0

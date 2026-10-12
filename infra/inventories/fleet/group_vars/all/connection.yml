@@ -1,0 +1,7 @@
+---
+# All access goes through the login node (rule, 26 Sep): controller routes 10.10.0.0/16
+# into Tailscale (tailnet peer OPNsense), so nothing may address fleet IPs directly.
+ansible_user: root                 # bootstrap key path; admin policy decided under T41
+ansible_ssh_common_args: '-o ProxyJump=admin@192.0.2.205 -o StrictHostKeyChecking=yes'
+ansible_python_interpreter: /usr/bin/python3
+fleet_armed: false                 # informational only: fleet.yml can be armed ONLY by -e fleet_armed=true

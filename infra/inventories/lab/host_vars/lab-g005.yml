@@ -1,0 +1,48 @@
+# g005 lab-g005 (HPE XL270d Gen10, 8 x V100) :  host-specific variables
+# Sources: live read over key SSH 2026-09-24 (NIC MACs, block devices, VG/LVs,
+# online CPUs) and evidence/2026-09-22/g005-raid-install-verification.md.
+# Values marked PENDING are not yet established and must not be guessed.
+
+# Private address configured 2026-09-24 (NM profile private-eno2); reached only
+# through the .205 bastion. admin's sudo policy matches the Lenovo (password
+# required) until decided; converge with -e ansible_user=root (root key login).
+ansible_host: 10.88.0.3
+ansible_user: admin
+ansible_ssh_common_args: '-o ProxyJump=admin@192.0.2.205'
+
+hardware:
+  serial: EXSERIAL05
+  ilo: 198.18.0.128               # iLO 5 v1.40; host console via `vsp` (ttyS0), not textcons
+  online_cpus: 36                  # 2 x Gold 6150, HT disabled (nproc, 2026-09-24)
+  gpus: "8 x Tesla V100 SXM2 32GB" # runtime not yet qualified (T51)
+  os_disk:                         # P408i-a RAID1 logical volume :  kickstart target
+    serial: EXRAIDLV000005
+    wwn: "60050000a346210d311ce34853176ea6"
+    size: 447.1G
+  nvme:                            # wiped 2026-09-23; roles planned under T52
+    - {serial: EXNVME00000051, size: 1.5T, planned: "local scratch / model cache"}
+    - {serial: EXNVME00000052, size: 1.5T, planned: "shared-data backing"}
+
+network:
+  private_ip: 10.88.0.3
+  private_prefix: 24
+  private_iface: eno2              # MAC 02:00:00:00:00:14; selected 2026-09-24 by ARP reply from Lenovo eno2
+  # eno3/eno4 also have carrier (eno3 = campus 203.0.113.x VLAN, uplink deferred); not configured.
+  nics:
+    - {name: eno1, mac: "02:00:00:00:00:18", speed: 1G}
+    - {name: eno2, mac: "02:00:00:00:00:14", speed: 1G, note: "private switch; 10.88.0.3/24"}
+    - {name: eno3, mac: "02:00:00:00:00:19", speed: 1G, note: "carrier; campus .26 VLAN; no address"}
+    - {name: eno4, mac: "02:00:00:00:00:1a", speed: 1G, note: "carrier; unidentified segment; no address"}
+    - {name: eno5np0, mac: "02:00:00:00:00:1b", speed: 25G}
+    - {name: eno6np1, mac: "02:00:00:00:00:1c", speed: 25G}
+    - {name: ens10f0np0, mac: "02:00:00:00:00:12", speed: 25G}
+    - {name: ens10f1np1, mac: "02:00:00:00:00:13", speed: 25G, note: "carrier; unidentified segment; no address"}
+    - {name: ibs11f0, speed: "EDR 100G", note: "InfiniBand link up; unconfigured"}
+
+storage:
+  vg: g005_vg                      # 444.51g, 256.51g free (reserved deliberately)
+  root_lv: 81920m
+  swap_lv: 8192m
+  images_lv: 102400m
+
+timezone: Asia/Singapore

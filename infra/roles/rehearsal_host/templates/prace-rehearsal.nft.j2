@@ -1,0 +1,32 @@
+# Managed by Ansible (roles/rehearsal_host). Loaded by prace-rehearsal-egress.service; touches only
+# its own table (firewalld and K3s keep theirs). Confines everything the rehearsal user sends.
+#
+# Only packets whose socket belongs to the rehearsal user enter the confinement chain; every
+# other packet leaves this table at the base chain's accept policy. Never write the selector as
+# 'meta skuid != <user> accept': packets without a socket (the kernel's flannel VXLAN
+# encapsulation) do not match it, fell through to the private-range drop, and cut all
+# cross-node pod traffic on 28 September (evidence/2026-09-28/rehearsal-egress-incident).
+table inet prace_rehearsal
+delete table inet prace_rehearsal
+table inet prace_rehearsal {
+  chain output {
+    type filter hook output priority filter; policy accept;
+    meta skuid "{{ rehearsal_user }}" jump confine
+  }
+  chain confine {
+    # Loopback: the VMs' own links are localhost UDP (-netdev dgram), and port forwards into a VM
+    # answer on established connections. New TCP connections to host services on 127.0.0.1 (sshd,
+    # K3s API, kubelet) are refused: QEMU user networking maps a guest's gateway onto host loopback.
+    # The host's own 10.90.10.1 / 192.0.2.205 also travel via "lo" and fall under the drop below.
+    ip daddr 127.0.0.0/8 ct state established,related accept
+    ip daddr 127.0.0.0/8 meta l4proto udp accept
+    ip daddr 127.0.0.0/8 counter drop
+    ip6 daddr ::1 counter drop
+{% for a in rehearsal_allowed_v4 %}
+    ip daddr {{ a }} udp dport 53 accept
+    ip daddr {{ a }} tcp dport 53 accept
+{% endfor %}
+    ip daddr { {{ rehearsal_blocked_v4 | join(', ') }} } counter drop
+    meta nfproto ipv6 counter drop
+  }
+}

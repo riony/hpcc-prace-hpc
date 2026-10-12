@@ -1,0 +1,8 @@
+{
+  "schema": "prace.permission-followup.v1",
+  "campaign_config": "/PRIVATE/ORIGINAL/continuous.json",
+  "followup_root": "/PRIVATE/permission-followups",
+  "followup_id": "repair-night-one",
+  "repair_helper": "/apps/prace/REPLACE_WITH_REVIEWED_FULL_SHA/prace_permission_repair.py",
+  "duration_seconds": 300
+}

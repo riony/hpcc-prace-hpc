@@ -1,0 +1,10 @@
+---
+# Host baseline: apply as soon as Rocky SSH is reachable.
+# Bootstrap password from kickstart is replaced by key-based access + rotation in hardening role (later).
+- name: Host baseline
+  hosts: lab_hosts
+  become: true
+  gather_facts: true
+  roles:
+    - host_base
+    - lab_deploy_key   # authorize the mgmt-git01 lab deploy runner (source-restricted)

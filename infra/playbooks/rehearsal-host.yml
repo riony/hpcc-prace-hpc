@@ -1,0 +1,30 @@
+---
+# Rehearsal host on the login node (roles/rehearsal_host).
+#   tools/run-ansible.sh -i inventories/fleet playbooks/rehearsal-host.yml -e fleet_armed=true
+# Armed like fleet.yml: the host pattern is empty unless -e fleet_armed=true.
+- name: Arming gate (clear message)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Refuse unless explicitly armed
+      ansible.builtin.assert:
+        that: fleet_armed | default(false) | bool
+        fail_msg: "Not armed: pass -e fleet_armed=true"
+        quiet: true
+      tags: [always]
+
+- name: Rehearsal host
+  hosts: "{{ 'login' if (fleet_armed | default(false) | bool) else 'fleet_not_armed_no_hosts' }}"
+  gather_facts: false
+  pre_tasks:
+    - name: Armed (checked again before any connection)
+      ansible.builtin.assert:
+        that: fleet_armed | default(false) | bool
+        quiet: true
+      tags: [always]
+    - name: Gather facts (only after the armed check)
+      ansible.builtin.setup:
+      tags: [always]
+  roles:
+    - rehearsal_host

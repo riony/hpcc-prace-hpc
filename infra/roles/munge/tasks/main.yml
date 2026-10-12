@@ -1,0 +1,37 @@
+---
+# Managed by Ansible (roles/munge). One key for the cluster: generated on the login node,
+# copied to the others through the controller's memory only (never logged or written locally).
+- name: munge
+  ansible.builtin.dnf:
+    name: [munge, munge-libs]
+    state: present
+
+- name: Generate the cluster key once (login node; munge 0.5.13 on EL9 has create-munge-key, not mungekey)
+  ansible.builtin.command: /usr/sbin/create-munge-key
+  args:
+    creates: /etc/munge/munge.key
+  when: fleet_role == 'login'
+
+- name: Read the key from the login node
+  ansible.builtin.slurp:
+    src: /etc/munge/munge.key
+  delegate_to: "{{ groups['login'][0] }}"
+  run_once: true
+  register: mu_key
+  no_log: true
+
+- name: The same key on every node (munge-owned, 0400)
+  ansible.builtin.copy:
+    dest: /etc/munge/munge.key
+    content: "{{ mu_key.content | b64decode }}"
+    owner: munge
+    group: munge
+    mode: "0400"
+  no_log: true
+  notify: restart munge
+
+- name: munge running
+  ansible.builtin.systemd:
+    name: munge
+    state: started
+    enabled: true

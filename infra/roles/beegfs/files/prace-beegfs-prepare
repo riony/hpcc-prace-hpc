@@ -1,0 +1,250 @@
+#!/usr/bin/env python3
+"""Read-only inspection and first-use plan for roles/beegfs (tasks/prepare.yml). Rocky 9 python3.
+
+It never writes to a disk, to LVM or to a file: it runs only lsblk, wipefs --no-act, blkid -p,
+pvs, vgs and lvs, and reads the fstab file and the /dev/disk/by-id links.
+
+  prace-beegfs-prepare '<spec JSON>'      ->  plan JSON on stdout (exit 0), or exit 1 on a crash
+
+Items: this host's metadata LV and each storage target. A target is the NVMe whose serial is in
+the spec: exactly one disk must report that serial (lsblk), with the EUI when one is recorded,
+and the commands use its /dev/disk/by-id link, never /dev/nvmeXn1. State of an item:
+  absent   the metadata LV does not exist yet
+  missing  no disk (or more than one) reports the target's serial, or it has no by-id link
+  blank    no partition, holder, mount or signature (lsblk, wipefs --no-act, blkid -p)
+  ours     exactly the expected filesystem type and label on the whole device, nothing on top
+  foreign  anything else (old LVM, a partition table, another filesystem, the OS disk ...)
+Recorded: this host's fstab has an entry for the item's mount path, by UUID. That entry is the
+persistent record that the item belongs to /scratch. It is written, with a pre-generated UUID,
+BEFORE mkfs, so an interrupted first use resumes with the same UUID.
+
+Decision per item ("confirmed": named in this run's armed first-use confirmation):
+  ours + recorded, same UUID           active, nothing to do
+  ours + recorded, other UUID          error
+  ours + not recorded                  error: a filesystem from an earlier deployment (the OS disk
+                                       was reinstalled?). Never re-adopted: whole-scratch recreation
+  blank + recorded                     confirmed: format with the recorded UUID; else error
+  blank + not recorded                 confirmed: record, then format; else pending
+  absent (metadata LV)                 confirmed: create (VG free >= size + reserve), record, format;
+                                       recorded: error; else pending
+  missing or foreign                   confirmed or recorded: error; else pending (reported)
+"""
+import glob
+import json
+import os
+import re
+import subprocess
+import sys
+import uuid
+
+GIB = 1024 ** 3
+SERIAL = re.compile(r"^[A-Za-z0-9_-]{4,40}$")
+LABEL = re.compile(r"^[A-Za-z0-9_-]{1,12}$")
+
+
+def run(*args, ok=(0,)):
+    r = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True,
+                       timeout=120, env=dict(os.environ, LC_ALL="C"))
+    if ok is not None and r.returncode not in ok:
+        raise RuntimeError("read-only command failed: %s (rc %d): %s"
+                           % (" ".join(args), r.returncode, (r.stderr or r.stdout).strip()[:300]))
+    return r
+
+
+def jrun(*args):
+    return json.loads(run(*args).stdout)
+
+
+def clean(v):
+    return "" if v is None else str(v).strip()
+
+
+def walk(dev):
+    yield dev
+    for child in dev.get("children") or []:
+        yield from walk(child)
+
+
+def mounts(dev):
+    m = dev.get("mountpoints")
+    if m is None:
+        m = [dev.get("mountpoint")]
+    return [x for x in m if x]
+
+
+def lvm(cmd, fields, *extra):
+    key = {"pvs": "pv", "vgs": "vg", "lvs": "lv"}[cmd]
+    rep = jrun(cmd, "--reportformat", "json", "--units", "b", "--nosuffix", "-o", fields, *extra)
+    return [row for r in rep.get("report", []) for row in r.get(key, [])]
+
+
+def fstab_entries(path):
+    """{mount path: source} of the non-comment lines."""
+    out = {}
+    with open(path) as f:
+        for line in f:
+            fields = line.split("#", 1)[0].split()
+            if len(fields) >= 2:
+                out[fields[1]] = fields[0]
+    return out
+
+
+def probe(dev):
+    """What is on a device: lsblk tree, wipefs signatures, blkid -p values."""
+    tree = jrun("lsblk", "-J", "-b", "-o", "NAME,PATH,TYPE,FSTYPE,LABEL,UUID,PTTYPE,MOUNTPOINTS,SIZE", dev)
+    nodes = tree.get("blockdevices") or []
+    if len(nodes) != 1:
+        raise RuntimeError("lsblk %s: %d devices" % (dev, len(nodes)))
+    sigs = [ln.split()[0] for ln in run("wipefs", "--no-act", "--noheadings", "--output", "TYPE,OFFSET", dev).stdout.splitlines()
+            if ln.strip()]
+    b = run("blkid", "-p", "-o", "export", dev, ok=(0, 2))
+    values = {}
+    if b.returncode == 0:
+        values = dict(ln.split("=", 1) for ln in b.stdout.splitlines() if "=" in ln)
+    return nodes[0], sigs, values
+
+
+def classify(dev, item):
+    """(state, fs_uuid, detail) for a device that exists."""
+    node, sigs, values = probe(dev)
+    children = node.get("children") or []
+    where = sorted(set(m for n in walk(node) for m in mounts(n)))
+    if not children and not where and not sigs and not values and not clean(node.get("fstype")) \
+            and not clean(node.get("pttype")):
+        return "blank", "", "no partition, holder, mount or signature"
+    if (not children and not clean(node.get("pttype")) and "PTTYPE" not in values
+            and values.get("TYPE") == item["fstype"] and values.get("LABEL") == item["label"]
+            and set(sigs) <= {item["fstype"]} and set(where) <= {item["mount"]}):
+        return "ours", values.get("UUID", ""), "%s %s" % (item["fstype"], item["label"])
+    what = ["%s=%s" % (k, values[k]) for k in ("TYPE", "PTTYPE", "LABEL") if k in values]
+    what += ["signatures " + ",".join(sigs)] if sigs else []
+    what += ["children " + ",".join(clean(c.get("name")) for c in children)] if children else []
+    what += ["mounted " + ",".join(where)] if where else []
+    return "foreign", values.get("UUID", ""), "; ".join(what) or "unrecognised content"
+
+
+def resolve_target(t, disks, os_wwn, by_id_dir):
+    """(by-id path, None) or (None, why) for a target's NVMe, by serial (and EUI when recorded)."""
+    same = [d for d in disks if clean(d.get("serial")) == t["serial"] and clean(d.get("type")) == "disk"]
+    if len(same) != 1:
+        return None, "%d disks report serial %s, need exactly one" % (len(same), t["serial"])
+    d = same[0]
+    wwn = clean(d.get("wwn")).lower()
+    if os_wwn and wwn.replace("0x", "") == os_wwn:
+        return None, "serial %s is the OS disk" % t["serial"]
+    if t.get("eui") and wwn != t["eui"].lower():
+        return None, "serial %s reports %s, host_vars record %s" % (t["serial"], wwn or "no EUI", t["eui"])
+    links = sorted(p for p in glob.glob(os.path.join(by_id_dir, "nvme-*_" + t["serial"]))
+                   if os.path.realpath(p) == os.path.realpath(clean(d.get("path"))))
+    if not links:
+        return None, "no %s/nvme-*_%s link to %s" % (by_id_dir, t["serial"], clean(d.get("path")))
+    return links[0], None
+
+
+def decide(item, state, fs_uuid, recorded, confirmed, errors):
+    """Fill item['action'] / item['active'] / item['uuid']; append errors."""
+    name = item["name"]
+    rec_uuid = recorded[5:] if recorded and recorded.startswith("UUID=") else ""
+    if recorded and not rec_uuid:
+        errors.append("%s: fstab records %s for %s, not a UUID" % (name, recorded, item["mount"]))
+        return
+    item.update(recorded_uuid=rec_uuid, fs_uuid=fs_uuid, action="pending", active=False, uuid="")
+    if state == "ours":
+        if not recorded:
+            errors.append("%s: holds BeeGFS %s %s (UUID %s) that this host has no record of: a filesystem from an "
+                          "earlier deployment. It is never re-adopted; whole-scratch recreation decides its fate"
+                          % (name, item["fstype"], item["label"], fs_uuid))
+        elif rec_uuid != fs_uuid:
+            errors.append("%s: fstab records UUID %s, the device has %s" % (name, rec_uuid, fs_uuid))
+        else:
+            item.update(action="none", active=True, uuid=fs_uuid)
+    elif state in ("blank", "absent"):
+        if recorded and (state == "absent" or not confirmed):
+            errors.append("%s: recorded in fstab (UUID %s) but %s%s" % (
+                name, rec_uuid, state, "" if state == "absent" else ": finish its first use with an armed, confirmed run"))
+        elif confirmed:
+            item.update(action="create" if state == "absent" else "format", uuid=rec_uuid or str(uuid.uuid4()))
+    else:
+        if confirmed or recorded:
+            errors.append("%s: %s (%s); nothing is formatted. A disk that is not blank goes through the reviewed "
+                          "wipe first" % (name, state, item.get("detail", "")))
+
+
+def plan(spec):
+    errors, notes, items = [], [], []
+    confirm = set(spec.get("confirm") or [])
+    fstab = fstab_entries(spec["fstab"])
+    os_wwn = clean(spec.get("os_wwn")).lower().replace("0x", "")
+    known = {"meta"} | {t["serial"] for t in spec.get("targets") or []}
+    for c in sorted(confirm - known):
+        errors.append("confirmation names %s, which is not an item of this host" % c)
+
+    meta = spec.get("meta")
+    if meta:
+        item = dict(meta, name="meta", dev="/dev/%s/%s" % (meta["vg"], meta["lv"]))
+        vgs = [v for v in lvm("vgs", "vg_name,vg_free") if clean(v.get("vg_name")) == meta["vg"]]
+        if len(vgs) != 1:
+            errors.append("meta: volume group %s not found" % meta["vg"])
+        else:
+            pv_disks = set()
+            for pv in [p for p in lvm("pvs", "pv_name,vg_name") if clean(p.get("vg_name")) == meta["vg"]]:
+                inv = jrun("lsblk", "-J", "-s", "-o", "NAME,PATH,TYPE,WWN", clean(pv.get("pv_name")))
+                for n in [n for top in inv.get("blockdevices") or [] for n in walk(top)]:
+                    if clean(n.get("type")) == "disk":
+                        pv_disks.add(clean(n.get("wwn")).lower().replace("0x", ""))
+            if not os_wwn or pv_disks != {os_wwn}:
+                errors.append("meta: %s sits on %s, expected only the RAID1 OS disk %s"
+                              % (meta["vg"], sorted(pv_disks) or "no disk", os_wwn or "(unrecorded)"))
+            lv = [r for r in lvm("lvs", "lv_name,lv_size,vg_name", meta["vg"]) if clean(r.get("lv_name")) == meta["lv"]]
+            free = int(float(clean(vgs[0].get("vg_free")) or 0))
+            item["vg_free_g"] = round(free / GIB, 2)
+            if lv:
+                size = int(float(clean(lv[0].get("lv_size")) or 0))
+                item["size_now_g"] = round(size / GIB, 2)
+                if size < meta["size_g"] * GIB:
+                    errors.append("meta: %s/%s is %.2f GiB, smaller than %d GiB; it is never resized"
+                                  % (meta["vg"], meta["lv"], size / GIB, meta["size_g"]))
+                state, fs_uuid, detail = classify(item["dev"], item)
+            else:
+                state, fs_uuid, detail = "absent", "", "no LV %s in %s" % (meta["lv"], meta["vg"])
+                if "meta" in confirm and free < (meta["size_g"] + meta["reserve_g"]) * GIB:
+                    errors.append("meta: %s has %.2f GiB free; creating %d GiB would go below the %d GiB reserve"
+                                  % (meta["vg"], free / GIB, meta["size_g"], meta["reserve_g"]))
+                    confirm.discard("meta")
+            item.update(state=state, detail=detail)
+            decide(item, state, fs_uuid, fstab.get(meta["mount"]), "meta" in confirm, errors)
+            items.append(item)
+
+    targets = spec.get("targets") or []
+    if targets:
+        disks = jrun("lsblk", "-J", "-b", "-d", "-o", "NAME,PATH,TYPE,SERIAL,WWN")["blockdevices"]
+    for t in targets:
+        item = dict(t, name=t["serial"])
+        if not SERIAL.match(t["serial"]) or not LABEL.match(t["label"]):
+            errors.append("%s: malformed serial or label %s" % (t["serial"], t["label"]))
+            continue
+        dev, why = resolve_target(t, disks, os_wwn, spec.get("by_id_dir") or "/dev/disk/by-id")
+        if dev is None:
+            state, fs_uuid, detail = "missing", "", why
+        else:
+            state, fs_uuid, detail = classify(dev, item)
+        item.update(dev=dev or "", state=state, detail=detail)
+        decide(item, state, fs_uuid, fstab.get(t["mount"]), t["serial"] in confirm, errors)
+        items.append(item)
+
+    for i in items:
+        if i.get("action") == "pending":
+            notes.append("%s: %s, not part of /scratch yet (%s)" % (i["name"], i["state"], i.get("detail", "")))
+    return {"errors": errors, "notes": notes, "items": items}
+
+
+def main():
+    if len(sys.argv) != 2:
+        sys.stderr.write(__doc__)
+        return 2
+    print(json.dumps(plan(json.loads(sys.argv[1])), indent=1, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

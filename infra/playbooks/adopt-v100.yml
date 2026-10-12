@@ -1,0 +1,77 @@
+---
+# Source preparation only. First install, bootstrap private IP, verify host keys,
+# stage signed baseline RPMs, then populate this separate inventory.
+- name: Adopt explicitly qualified g003 or g004
+  hosts: v100_adoption
+  serial: 1
+  any_errors_fatal: true
+  gather_facts: false
+  become: true
+  pre_tasks:
+    - name: Refuse unqualified inventory before connecting to a host
+      ansible.builtin.assert:
+        that:
+          - inventory_hostname in ['lab-g003', 'lab-g004']
+          - adoption_ready | default(false) | bool
+          - private_iface | default('') is match('^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,14}$')
+          - private_mac | default('') is match('^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$')
+          - adoption_os_wwn | default('') is match('^([0-9a-f]{16}|[0-9a-f]{32})$')
+          - private_prefix | int == 24
+          - private_zone == 'public'
+          - private_ip == {'lab-g003':'10.88.0.4', 'lab-g004':'10.88.0.5'}[inventory_hostname]
+          - ansible_host == private_ip
+        fail_msg: 'Inventory remains disarmed/incomplete. Discover this chassis disk and NIC; follow docs/history/G003-G004-ADOPTION.md.'
+      tags: always
+
+    - name: Read-only chassis, installed root disk, private network and RPM guard
+      ansible.builtin.script:
+        cmd: >-
+          ../tools/check-v100-adoption.py
+          --node {{ inventory_hostname | replace('lab-', '') | quote }}
+          --interface {{ private_iface | quote }} --mac {{ private_mac | quote }}
+          --wwn {{ adoption_os_wwn | quote }}
+        executable: /usr/bin/python3
+      register: adoption_preflight
+      changed_when: false
+      check_mode: false
+      tags: always
+
+    - name: Gather facts after the read-only guard passes
+      ansible.builtin.setup:
+      tags: always
+
+  roles:
+    - private_net
+    - host_base
+
+  post_tasks:
+    - name: Complete pending service handlers
+      ansible.builtin.meta: flush_handlers
+
+    - name: Check required services
+      ansible.builtin.command: systemctl is-active sshd chronyd firewalld
+      changed_when: false
+      check_mode: false
+      when: not ansible_check_mode
+
+    - name: Wait for selected private NTP source
+      ansible.builtin.command: chronyc -n sources
+      register: adoption_ntp
+      changed_when: false
+      check_mode: false
+      until: "'^* 10.88.0.1 ' in adoption_ntp.stdout"
+      retries: 12
+      delay: 10
+      when: not ansible_check_mode
+
+    - name: Read failed units
+      ansible.builtin.command: systemctl --failed --no-legend --plain
+      register: adoption_failed
+      changed_when: false
+      check_mode: false
+      when: not ansible_check_mode
+
+    - name: Require no failed units
+      ansible.builtin.assert:
+        that: adoption_failed.stdout | trim == ''
+      when: not ansible_check_mode

@@ -1,0 +1,119 @@
+---
+# Every BeeGFS host: the admin port, the fleet repository's signing key for the pinned release,
+# /etc/beegfs, the connection secret, the TLS certificate, the network filter files and the
+# firewall check. Services and clients use only the admin network (10.90.10.0/25): never the
+# campus address, a ring /30 or IPoIB.
+- name: This run passed its gates and holds the lease (a run started past them changes nothing)
+  ansible.builtin.assert:
+    that: bg_run_gated | bool
+    fail_msg: "{{ inventory_hostname }}: nothing done: the gates of playbooks/beegfs.yml did not pass in this run"
+    quiet: true
+
+- name: The admin port (holds admin_ip; set at install or first boot and adopted by roles/fleet_net)
+  ansible.builtin.set_fact:
+    bg_admin_ifaces: >-
+      {{ ansible_facts.interfaces | default([]) | map('regex_replace', '-', '_') | map('extract', ansible_facts)
+         | selectattr('ipv4', 'defined') | selectattr('ipv4.address', 'equalto', admin_ip)
+         | map(attribute='device') | list }}
+
+- name: Exactly one port holds the admin address
+  ansible.builtin.assert:
+    that: bg_admin_ifaces | length == 1
+    fail_msg: "{{ bg_admin_ifaces | length }} ports hold {{ admin_ip }}; run the fleet net role first"
+    quiet: true
+
+- name: BeeGFS advertises and uses that port only
+  ansible.builtin.set_fact:
+    bg_admin_iface: "{{ bg_admin_ifaces[0] }}"
+
+- name: Repository files that name BeeGFS (packages come only from the BeeGFS repository)
+  ansible.builtin.find:
+    paths: /etc/yum.repos.d
+    patterns: "*.repo"
+    contains: "(?i).*beegfs.*"
+  register: bg_upstream_repos
+
+- name: No other BeeGFS repository on the host (only the role's own, disabled one)
+  ansible.builtin.assert:
+    that: bg_upstream_repos.files | map(attribute='path') | reject('equalto', beegfs_repo_file) | list | length == 0
+    fail_msg: >-
+      {{ bg_upstream_repos.files | map(attribute='path') | reject('equalto', beegfs_repo_file) | list }} add a BeeGFS
+      repository; remove it (the pinned BeeGFS repository only)
+    quiet: true
+
+- name: BeeGFS signing key from the BeeGFS repository
+  ansible.builtin.get_url:
+    url: "{{ bg_repo_url }}/keys/{{ bg_key.file }}"
+    dest: "/etc/pki/rpm-gpg/{{ bg_key.file }}"
+    checksum: "sha256:{{ bg_key.sha256 }}"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Import it only if the fingerprint matches (the login node is not trusted blindly)
+  ansible.builtin.rpm_key:
+    key: "/etc/pki/rpm-gpg/{{ bg_key.file }}"
+    fingerprint: "{{ bg_key.fingerprint }}"
+    state: present
+
+- name: The BeeGFS repository, DISABLED (BeeGFS transactions enable it alone; no other converge sees it)
+  ansible.builtin.copy:
+    dest: "{{ beegfs_repo_file }}"
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      # Managed by Ansible (roles/beegfs): exactly the pinned files (roles/fleet_repo fleet_repo_beegfs_packages).
+      # Used only as: dnf --disablerepo='*' --enablerepo={{ beegfs_repo_id }} ...
+      [{{ beegfs_repo_id }}]
+      name=BeeGFS pinned files (fleet)
+      baseurl={{ bg_repo_url }}
+      enabled=0
+      gpgcheck=1
+      gpgkey=file:///etc/pki/rpm-gpg/{{ bg_key.file }}
+      metadata_expire=60
+
+- name: Host guard for the BeeGFS ports (pods, other networks, unprivileged sockets)
+  ansible.builtin.include_tasks: netguard.yml
+
+- name: BeeGFS configuration directory
+  ansible.builtin.file:
+    path: "{{ beegfs_conf_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Connection secret, identical on every service and client (root, 0400)
+  ansible.builtin.copy:
+    src: "{{ beegfs_auth_secret_src }}"
+    dest: "{{ beegfs_auth_file }}"
+    owner: root
+    group: root
+    mode: "0400"
+  register: bg_auth
+  no_log: true
+
+- name: The management's TLS certificate (public; the beegfs CLI verifies the management with it)
+  ansible.builtin.copy:
+    src: "{{ beegfs_tls_cert_src }}"
+    dest: "{{ beegfs_tls_cert }}"
+    owner: root
+    group: root
+    mode: "0644"
+  register: bg_cert_file
+  when: not beegfs_tls_disable | bool
+
+- name: Interface, outbound-network and TCP-only filter files (admin network only)
+  ansible.builtin.copy:
+    dest: "{{ item.path }}"
+    content: "{{ item.content }}"
+    owner: root
+    group: root
+    mode: "0644"
+  loop: "{{ bg_net_files }}"
+  loop_control: {label: "{{ item.path }}"}
+  register: bg_net
+
+- name: Firewall contract (admin network trusted by source; no BeeGFS port open in another zone)
+  ansible.builtin.include_tasks: firewall.yml

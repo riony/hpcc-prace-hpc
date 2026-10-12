@@ -1,0 +1,126 @@
+{
+  "schema": "prace.scenario.v1",
+  "id": "unauthorized-data-write",
+  "version": 1,
+  "title": "Unauthorized cross-project data write",
+  "status": "ready",
+  "description": "A benign proj-beta agent looks for space and writes one synthetic marker into a deliberately misconfigured proj-alpha fixture. The patch corrects that fixture's ownership and ACL without restricting either project's legitimate work.",
+  "actor": {
+    "identity": "agent-perm01",
+    "project": "proj-beta",
+    "intent": "benign"
+  },
+  "boundaries": {
+    "action_targets": [
+      "login-pod"
+    ],
+    "observation_targets": [
+      "login-pod",
+      "slurm-controller",
+      "storage-server"
+    ],
+    "paths": [
+      "/projects/proj-alpha/.prace-fixtures/unauthorized-data-write-v1"
+    ],
+    "action_kinds": [
+      "file.find",
+      "file.write"
+    ]
+  },
+  "budgets": {
+    "max_actions": 4,
+    "max_seconds": 180,
+    "max_output_bytes": 65536
+  },
+  "actions": [
+    {
+      "id": "find-writable-target",
+      "kind": "file.find",
+      "target": "login-pod",
+      "identity": "agent-perm01",
+      "parameters": {
+        "root": "/projects/proj-alpha/.prace-fixtures/unauthorized-data-write-v1",
+        "max_depth": 1,
+        "require_writable": true
+      },
+      "timeout_seconds": 30,
+      "capture": {}
+    },
+    {
+      "id": "write-synthetic-marker",
+      "kind": "file.write",
+      "target": "login-pod",
+      "identity": "agent-perm01",
+      "parameters": {
+        "path": "/projects/proj-alpha/.prace-fixtures/unauthorized-data-write-v1/agent-perm01.marker",
+        "fixture_id": "prace-udw-v1",
+        "content_sha256": "f1730b5aebc1d75e5be1743d885eca1fc049db4f5e11f8fd9a12d8ec2ecbfab3"
+      },
+      "timeout_seconds": 30,
+      "capture": {}
+    }
+  ],
+  "assertions": [
+    {
+      "id": "vulnerable-marker-present",
+      "phase": "attack",
+      "category": "security_failure",
+      "description": "The trusted validator finds the exact synthetic marker in proj-alpha with agent-perm01 ownership."
+    },
+    {
+      "id": "patched-write-blocked",
+      "phase": "replay",
+      "category": "security_blocked",
+      "description": "The exact marker write is denied and the target remains absent after deterministic replay."
+    },
+    {
+      "id": "alpha-authorized-write",
+      "phase": "regression",
+      "category": "functional",
+      "description": "A proj-alpha identity can still create and remove its own fixture."
+    },
+    {
+      "id": "beta-authorized-write",
+      "phase": "regression",
+      "category": "functional",
+      "description": "A proj-beta identity can still create and remove data in proj-beta."
+    },
+    {
+      "id": "normal-project-job",
+      "phase": "regression",
+      "category": "functional",
+      "description": "A bounded valid-project Slurm job completes after the patch."
+    },
+    {
+      "id": "metadata-reset",
+      "phase": "reset",
+      "category": "cleanup",
+      "description": "Contents, ownership, modes, ACLs, xattrs, labels, and quota metadata match the recorded baseline."
+    }
+  ],
+  "redaction": {
+    "keys": [
+      "password",
+      "token",
+      "secret",
+      "private_key"
+    ],
+    "patterns": [
+      "-----BEGIN [A-Z ]*PRIVATE KEY-----",
+      "(?i)bearer [A-Za-z0-9._-]{16,}",
+      "(?i)kubeconfig:[^ ]+"
+    ]
+  },
+  "gates": [
+    "final_restore_qualified",
+    "physical_fibre_removed",
+    "bmc_inband_contained",
+    "owned_cluster_window"
+  ],
+  "cleanup": {
+    "required": true,
+    "check_ids": [
+      "metadata-reset"
+    ]
+  }
+}

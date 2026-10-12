@@ -1,0 +1,22 @@
+pwd
+module avail
+#3
+mkdir -p ~/vecadd-study && cd ~/vecadd-study
+cp /apps/examples/batch.sh /apps/examples/gpu.sh .
+head -14 gpu.sh
+#4
+sbatch -A proj-alpha batch.sh
+sbatch -A proj-alpha gpu.sh
+squeue --me
+#3
+jobwait() { local a=$1 b=$2 end=$((SECONDS+480)) s v left; while [ "$SECONDS" -lt "$end" ]; do left=$((end-SECONDS)); [ "$left" -gt 20 ] && left=20; if s=$(timeout -k 1 "$left" sacct -n -X -P -j "$a,$b" --format=JobID,State,ExitCode); then [ "$SECONDS" -ge "$end" ] && break; v=$(awk -F'|' -v a="$a" -v b="$b" '$1==a||$1==b {n[$1]++; st[$1]=$2; ex[$1]=$3} END {t="^(COMPLETED|FAILED|CANCELLED|TIMEOUT|OUT_OF_MEMORY|NODE_FAIL|PREEMPTED|BOOT_FAIL|DEADLINE|REVOKED)"; if (n[a]!=1 || n[b]!=1 || st[a]!~t || st[b]!~t) print "wait"; else if (st[a]=="COMPLETED" && ex[a]=="0:0" && st[b]=="COMPLETED" && ex[b]=="0:0") print "ok"; else print "fail"}' <<<"$s"); [ "$v" = ok ] && { echo "both jobs COMPLETED 0:0"; return 0; }; [ "$v" = fail ] && { echo "STOP: a job did not end COMPLETED 0:0:"; echo "$s"; return 1; }; fi; left=$((end-SECONDS)); [ "$left" -le 0 ] && break; [ "$left" -gt 5 ] && left=5; sleep "$left"; done; echo "STOP: jobs not finished within 480 s"; return 1; }
+jobwait {1} {2} || exit 1
+sacct -X -j {1},{2} --format=JobID,JobName,Partition,Account,AllocCPUS,State,Elapsed
+ls
+tail -4 slurm-{1}.out
+tail -6 slurm-{2}.out
+#3
+mkdir -p /projects/proj-alpha/carol && cp slurm-{1}.out slurm-{2}.out /projects/proj-alpha/carol/
+ls -l /projects/proj-alpha/carol
+#2
+exit

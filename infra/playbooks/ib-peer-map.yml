@@ -1,0 +1,203 @@
+---
+# Explicit preparation + read-only directed-route mapping, separate from fleet.yml.
+# No SM, IPoIB, RDMA workload, port setting, driver or firmware change.
+- name: Peer-map gate before any fleet connection
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Require an armed operation, existing owner lease, source pin and private output
+      ansible.builtin.assert:
+        that:
+          - fleet_armed | default(false) | bool
+          - fleet_lease_id | default('') is match('^[0-9a-f]{16}$')
+          - ib_peer_revision | default('') is match('^[0-9a-f]{40}$')
+          - ib_peer_output | default('') is match('^/[A-Za-z0-9_./-]+$')
+          - ib_peer_install | default(false) | type_debug == 'bool'
+        fail_msg: "Peer mapping needs fleet_armed=true, the operator lease, a full source revision and a new absolute private output directory"
+        quiet: true
+      tags: [always]
+
+    - name: Verify the source and a new output path locally
+      ansible.builtin.command:
+        argv:
+          - "{{ ansible_playbook_python }}"
+          - -c
+          - |
+            import pathlib, subprocess, sys
+            root = pathlib.Path(sys.argv[1]).resolve()
+            output = pathlib.Path(sys.argv[3])
+            assert subprocess.check_output(['git','-C',str(root),'rev-parse','HEAD'],text=True).strip() == sys.argv[2], 'source pin differs'
+            assert not subprocess.check_output(['git','-C',str(root),'status','--porcelain']), 'source is dirty'
+            assert output.is_absolute() and not output.exists(), 'output must be new'
+            assert not any(p.is_symlink() for p in (output,*output.parents)), 'output has a symlink component'
+            assert root != output.resolve() and root not in output.resolve().parents, 'keep evidence outside source'
+            assert output.parent.is_dir(), 'output parent does not exist'
+          - "{{ playbook_dir }}/../.."
+          - "{{ ib_peer_revision }}"
+          - "{{ ib_peer_output }}"
+      changed_when: false
+      check_mode: false
+      tags: [always]
+
+    - name: Verify the existing closed and quiet operator window
+      ansible.builtin.command:
+        argv: ["{{ ansible_playbook_python }}", "{{ playbook_dir }}/../tools/slurm-window.py", check, --lease-id, "{{ fleet_lease_id }}"]
+      changed_when: false
+      check_mode: false
+      tags: [always]
+
+    - name: Record successful gate for the GPU play
+      ansible.builtin.set_fact:
+        ib_peer_gate_ok: true
+      tags: [always]
+
+- name: Exact diagnostics and directed-route maps of the three ring nodes
+  # If localhost was skipped by a limit/tag/start filter, the gate never succeeds.
+  hosts: "{{ 'gpu' if hostvars['localhost'].ib_peer_gate_ok | default(false) else 'ib_peer_no_authorized_hosts' }}"
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+  vars:
+    ib_peer_packages: "{{ ib_peer_repo_pins.fleet_repo_extra_packages | selectattr('nevra', 'match', '^(infiniband-diags|libibumad)-') | list }}"
+    ib_peer_cache: /var/cache/prace-ib-peer-map
+    ib_peer_rpm_files:
+      - "{{ ib_peer_cache }}/{{ ib_peer_packages[0].nevra }}.rpm"
+      - "{{ ib_peer_cache }}/{{ ib_peer_packages[1].nevra }}.rpm"
+  tasks:
+    - name: Load only the repository pins into a private variable namespace
+      ansible.builtin.include_vars:
+        file: ../roles/fleet_repo/defaults/main.yml
+        name: ib_peer_repo_pins
+
+    - name: Only declared GPU ring nodes
+      ansible.builtin.assert:
+        that:
+          - fleet_role == 'gpu'
+          - inventory_hostname in ['lab-g003', 'lab-g004', 'lab-g005']
+          - ib_ring_ports | length == 2
+          - ib_peer_packages | length == 2
+        quiet: true
+
+    - name: Read chassis identity before preparation
+      ansible.builtin.command:
+        argv: [cat, /sys/class/dmi/id/product_serial]
+      changed_when: false
+      check_mode: false
+      register: ib_peer_serial
+
+    - name: Expected chassis
+      ansible.builtin.assert:
+        that: ib_peer_serial.stdout | trim == chassis_serial
+        quiet: true
+
+    - name: Optional exact diagnostics preparation
+      when: ib_peer_install | default(false) | bool
+      block:
+        - name: Private pinned RPM cache
+          ansible.builtin.file:
+            path: "{{ ib_peer_cache }}"
+            state: directory
+            owner: root
+            group: root
+            mode: '0700'
+
+        - name: Fetch exactly the two hash-pinned RPMs from the existing private repository
+          ansible.builtin.get_url:
+            url: "http://{{ hostvars[groups['login'][0]].admin_ip }}/fleet-repo/packages/{{ item.nevra }}.rpm"
+            dest: "{{ ib_peer_cache }}/{{ item.nevra }}.rpm"
+            checksum: "sha256:{{ item.sha256 }}"
+            owner: root
+            group: root
+            mode: '0600'
+            use_proxy: false
+          loop: "{{ ib_peer_packages }}"
+
+        - name: Verify both RPM signatures before installation
+          ansible.builtin.command:
+            argv: [rpm, --checksig, "{{ ib_peer_cache }}/{{ item.nevra }}.rpm"]
+          loop: "{{ ib_peer_packages }}"
+          changed_when: false
+          register: ib_peer_signatures
+          failed_when: ib_peer_signatures.rc != 0 or 'signatures OK' not in ib_peer_signatures.stdout
+          when: not ansible_check_mode
+
+        - name: Install only the two local packages with all repositories disabled
+          ansible.builtin.dnf:
+            name: "{{ ib_peer_rpm_files }}"
+            state: present
+            disablerepo: '*'
+            disable_gpg_check: false
+          when: not ansible_check_mode
+
+    - name: Require the exact diagnostics versions (preparation preview is not a map proof)
+      ansible.builtin.command:
+        argv: [rpm, -q, --qf, "%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}\n", infiniband-diags, libibumad]
+      changed_when: false
+      check_mode: false
+      register: ib_peer_installed
+      failed_when: ib_peer_installed.rc != 0 or (ib_peer_installed.stdout_lines | sort) != (ib_peer_packages | map(attribute='nevra') | list | sort)
+      when: not (ansible_check_mode and ib_peer_install | default(false) | bool)
+
+    - name: Collect each directed-route map without starting a subnet manager
+      ansible.builtin.script:
+        cmd: ../tools/ib-peer-map.sh
+        executable: /bin/bash
+      changed_when: false
+      register: ib_peer_map
+      when: not ansible_check_mode
+
+    - name: Private off-fleet output directory
+      ansible.builtin.file:
+        path: "{{ ib_peer_output }}"
+        state: directory
+        mode: '0700'
+      delegate_to: localhost
+      become: false
+      run_once: true
+      when: not ansible_check_mode
+
+    - name: Preserve each complete map off the fleet
+      ansible.builtin.copy:
+        content: "{{ ib_peer_map.stdout }}\n"
+        dest: "{{ ib_peer_output }}/{{ inventory_hostname }}.txt"
+        mode: '0600'
+        force: false
+      delegate_to: localhost
+      become: false
+      when: not ansible_check_mode
+
+    - name: Require all three maps and reciprocal inventory-matched peers
+      ansible.builtin.command:
+        argv:
+          - "{{ ansible_playbook_python }}"
+          - "{{ playbook_dir }}/../tools/ib-peer-check.py"
+          - "{{ ib_peer_output }}/lab-g003.txt"
+          - "{{ ib_peer_output }}/lab-g004.txt"
+          - "{{ ib_peer_output }}/lab-g005.txt"
+      changed_when: false
+      delegate_to: localhost
+      become: false
+      run_once: true
+      register: ib_peer_result
+      failed_when: false
+      when: not ansible_check_mode
+
+    - name: Preserve the peer-check result
+      ansible.builtin.copy:
+        content: "{{ {'source_revision': ib_peer_revision, 'rc': ib_peer_result.rc, 'stdout': ib_peer_result.stdout, 'stderr': ib_peer_result.stderr} | to_nice_json }}\n"
+        dest: "{{ ib_peer_output }}/peer-check.json"
+        mode: '0600'
+        force: false
+      delegate_to: localhost
+      become: false
+      run_once: true
+      when: not ansible_check_mode
+
+    - name: Failed or incomplete mapping stops after its evidence is saved
+      ansible.builtin.assert:
+        that: ib_peer_result.rc == 0
+        fail_msg: "Peer mapping is unproved; retain the maps and peer-check.json and keep fabric activation separate"
+        quiet: true
+      run_once: true
+      when: not ansible_check_mode

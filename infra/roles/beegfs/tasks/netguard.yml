@@ -1,0 +1,61 @@
+---
+# Host guard for the BeeGFS ports on every BeeGFS host (templates/prace-beegfs.nft.j2 says why): its
+# own nftables table, loaded at boot by its own unit before any BeeGFS service, which Requires it
+# (stopping the guard stops them). Replaced atomically (one nft transaction), never flushed first.
+# The firewall contract (firewall.yml) still proves the zone side; this narrows what the trusted pod
+# networks and unprivileged processes can reach. Live proof belongs to the qualification: a pod and a
+# non-root process are refused, the services and the kernel client are not.
+- name: Port guard rules (checked by nft before they are installed)
+  ansible.builtin.template:
+    src: prace-beegfs.nft.j2
+    dest: "{{ beegfs_netguard_file }}"
+    owner: root
+    group: root
+    mode: "0644"
+    validate: /usr/sbin/nft -c -f %s
+  register: bg_ng_file
+
+- name: Its unit (its own table only; ordered after firewalld, before the BeeGFS services)
+  ansible.builtin.copy:
+    dest: "/etc/systemd/system/{{ beegfs_netguard_unit }}.service"
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      # Managed by Ansible (roles/beegfs)
+      [Unit]
+      Description=Guard the BeeGFS ports (table inet prace_beegfs)
+      After=firewalld.service
+      Before=network-online.target beegfs-mgmtd.service beegfs-meta.service beegfs-storage.service beegfs-client.service
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      ExecStart=/usr/sbin/nft -f {{ beegfs_netguard_file }}
+      ExecReload=/usr/sbin/nft -f {{ beegfs_netguard_file }}
+      ExecStop=/usr/sbin/nft delete table inet prace_beegfs
+      [Install]
+      WantedBy=multi-user.target
+  register: bg_ng_unit
+
+- name: "Guard active (reloaded in place after a change: the table is never absent)"
+  ansible.builtin.systemd:
+    name: "{{ beegfs_netguard_unit }}"
+    enabled: true
+    state: "{{ 'reloaded' if bg_ng_file is changed and not bg_ng_unit is changed else 'started' }}"
+    daemon_reload: "{{ bg_ng_unit is changed }}"
+  when: not ansible_check_mode
+
+- name: The loaded table is the file's (read-only)
+  ansible.builtin.shell: |
+    set -euo pipefail
+    live=$(nft list table inet prace_beegfs)
+    for want in 'hook input' 'hook forward' 'hook output' 'meta skuid != 0' {{ beegfs_pod_networks | map('quote') | join(' ') }}; do
+      grep -qF -- "$want" <<<"$live" || { echo "missing: $want"; exit 3; }
+    done
+    echo loaded
+  args: {executable: /bin/bash}
+  register: bg_ng_live
+  changed_when: false
+  check_mode: false
+  failed_when: bg_ng_live.rc != 0 or bg_ng_live.stdout_lines[-1] | default('') != 'loaded'
+  when: not ansible_check_mode

@@ -1,0 +1,32 @@
+# Managed by Ansible (roles/slinky). Home, projects and apps as static NFS volumes for the login
+# and slurmd pods (T87): the hosts' client options (nosuid, nodev, hard, NFS 4.2; ro for a
+# read-only share), never the local-path provisioner, kept if the claim goes. The required
+# shares (slinky_pod_shares); tasks/login.yml checks their exports before writing this.
+{% for s in slinky_pod_shares %}
+{% set ro = s.export == 'ro' %}
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: prace-{{ s.name }}
+  labels: {prace.fleet/share: {{ s.name }}}
+spec:
+  capacity: {storage: {{ s.size_g }}Gi}
+  accessModes: [{{ 'ReadOnlyMany' if ro else 'ReadWriteMany' }}]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ""
+  mountOptions: {{ (slinky_pod_mount_options + (['ro'] if ro else [])) | to_json }}
+  nfs: {server: {{ admin_ip }}, path: {{ s.path }}, readOnly: {{ ro | lower }}}
+  claimRef: {namespace: slurm, name: prace-{{ s.name }}}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: prace-{{ s.name }}
+  namespace: slurm
+spec:
+  accessModes: [{{ 'ReadOnlyMany' if ro else 'ReadWriteMany' }}]
+  storageClassName: ""
+  volumeName: prace-{{ s.name }}
+  resources: {requests: {storage: {{ s.size_g }}Gi}}
+{% endfor %}

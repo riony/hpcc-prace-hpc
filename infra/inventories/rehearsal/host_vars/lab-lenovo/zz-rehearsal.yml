@@ -1,0 +1,8 @@
+---
+# Loaded after fleet.yml (alphabetical): the CPU VM through the login VM, as on the real fleet.
+ansible_host: 10.90.10.21
+ansible_ssh_common_args: >-
+  -o StrictHostKeyChecking=yes -o UserKnownHostsFile={{ rehearsal_known_hosts }}
+  -o ProxyCommand="ssh -W %h:%p -p 2222 -o StrictHostKeyChecking=yes -o UserKnownHostsFile={{ rehearsal_known_hosts }} root@127.0.0.1"
+# The rehearsal VM is small: 4 vCPUs, ~2.6 GB.
+slurm_node: "CPUs=4 Boards=1 SocketsPerBoard=1 CoresPerSocket=4 ThreadsPerCore=1 RealMemory=1024"

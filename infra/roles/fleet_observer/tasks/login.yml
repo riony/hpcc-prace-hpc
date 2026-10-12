@@ -1,0 +1,102 @@
+---
+- name: Observer script (read-only; prints one JSON observation)
+  ansible.builtin.copy:
+    src: prace-fleet-observe.py
+    dest: /usr/local/sbin/prace-fleet-observe
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Drift-audit directory
+  ansible.builtin.file:
+    path: /etc/prace-audit
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Drift-audit canary (a deliberate change here is the audit's controlled drift test)
+  ansible.builtin.copy:
+    dest: /etc/prace-audit/canary
+    owner: root
+    group: root
+    mode: "0644"
+    content: "prace drift-audit canary (roles/fleet_observer)\n"
+
+- name: Private read-only D43 link observation endpoints (no new SSH credential)
+  ansible.builtin.template:
+    src: disabled-links.json.j2
+    dest: /etc/prace-audit/disabled-links.json
+    owner: root
+    group: root
+    mode: '0644'
+
+- name: The native workers' private read-only endpoints (T89; {} while every worker is a pod)
+  ansible.builtin.template:
+    src: native-workers.json.j2
+    dest: /etc/prace-audit/native-workers.json
+    owner: root
+    group: root
+    mode: '0644'
+
+- name: Observer account (no password, no groups; reachable only through its forced command)
+  ansible.builtin.user:
+    name: "{{ fleet_observer_user }}"
+    system: true
+    shell: /bin/sh
+    password: "!"
+    create_home: true
+    home: "{{ fleet_observer_home }}"
+
+- name: Observer .ssh
+  ansible.builtin.file:
+    path: "{{ fleet_observer_home }}/.ssh"
+    state: directory
+    owner: "{{ fleet_observer_user }}"
+    group: "{{ fleet_observer_user }}"
+    mode: "0700"
+
+- name: Observer keys (exclusive; each key runs only the observation, from mgmt-git01 only)
+  ansible.builtin.copy:
+    dest: "{{ fleet_observer_home }}/.ssh/authorized_keys"
+    owner: "{{ fleet_observer_user }}"
+    group: "{{ fleet_observer_user }}"
+    mode: "0600"
+    content: |
+      # Managed by Ansible (roles/fleet_observer)
+      {% for k in fleet_observer_keys %}
+      restrict,from="{{ fleet_observer_from }}",command="sudo -n /usr/local/sbin/prace-fleet-observe" {{ k }}
+      {% endfor %}
+
+- name: One sudo rule, this exact command without arguments
+  ansible.builtin.copy:
+    dest: /etc/sudoers.d/prace-observer
+    owner: root
+    group: root
+    mode: "0440"
+    validate: visudo -cf %s
+    content: |
+      # Managed by Ansible (roles/fleet_observer)
+      {{ fleet_observer_user }} ALL=(root) NOPASSWD: /usr/local/sbin/prace-fleet-observe ""
+
+- name: SELinux labels on the observer's .ssh
+  ansible.builtin.command: restorecon -R {{ fleet_observer_home }}/.ssh
+  register: fo_restorecon
+  changed_when: "'Relabeled' in fo_restorecon.stdout"
+
+- name: The observer runs as its account and returns a well-formed observation
+  ansible.builtin.shell: |
+    set -o pipefail
+    runuser -u {{ fleet_observer_user }} -- sudo -n /usr/local/sbin/prace-fleet-observe \
+      | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["schema"] == 1; print("ok", d["duration_s"], "s,", len(d["nodes"]), "nodes, errors:", d["errors"])'
+  register: fo_check
+  changed_when: false
+  check_mode: false
+  failed_when: fo_check.rc != 0 or not fo_check.stdout.startswith('ok')
+
+- name: The observer account can run nothing else through sudo
+  ansible.builtin.command: runuser -u {{ fleet_observer_user }} -- sudo -n /usr/bin/id
+  register: fo_neg
+  changed_when: false
+  check_mode: false
+  failed_when: fo_neg.rc == 0

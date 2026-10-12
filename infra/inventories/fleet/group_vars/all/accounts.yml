@@ -1,0 +1,73 @@
+---
+# Cluster accounts (roles/cluster_accounts), identical UIDs/GIDs on every node so Slurm
+# jobs and NFS/BeeGFS ownership line up. All passwords locked; login only with a key in
+# ssh_keys (none yet = no login). No account here may get sudo or an admin group, and no
+# deployment key (root/admin/labdeploy/controller) may appear here.
+# ID ranges: teammates 20001-20999 (team 20000), synthetic users 30001-30999
+# (synthetic 30000, projects 31001+), agents 40001-40999 (agents 40000).
+# Each user also gets a private group with GID = UID.
+# Slurm jobs run only in projects (the groups with GID 31001-31999; owner decision 30 Sep, like
+# PBS -P): a user in no project cannot run jobs. team, synthetic and agents are Unix groups only.
+
+cluster_groups:
+  - {name: team, gid: 20000}
+  - {name: synthetic, gid: 30000}
+  - {name: proj-alpha, gid: 31001}     # owns the protected marker in the permission scenario
+  - {name: proj-beta, gid: 31002}
+  - {name: proj-ops, gid: 31003}       # operators and acceptance probes: no scenario data (owner decision 30 Sep)
+  - {name: agents, gid: 40000}
+
+cluster_users:
+  # Teammates (placeholders named after their GitLab accounts; each adds a key via MR).
+  - {name: team-user01, uid: 20001, groups: [team, proj-ops], comment: "Teammate"}
+  - {name: team-user02, uid: 20002, groups: [team, proj-ops], comment: "Teammate", ssh_keys: ["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAID/t8u2pVoThNN8R8jM0onc26D4XazYX8xVoRU2QkF5K team-user02-gitlab-2", "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMyDxBS6nAC1t08Y/Knn/AKpnVl7l25ftiIxxiM6D9+o team-user02-gitlab-5"]}
+  - {name: team-user03, uid: 20003, groups: [team, proj-ops], comment: "Teammate", ssh_keys: ["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIE2TrN0O7wRxq0KgeRy4SESf/bwf3tXADVOF9STBN5VJ team-user03-gitlab-4", "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOoz0VDTlUxs71H4gdITsRg+0lzGAsHUavH3P3SIea6O team-user03-gitlab-6"]}
+  - {name: team-user04, uid: 20004, groups: [team, proj-ops], comment: "Teammate", ssh_keys: ["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILi3RzrVfcTchILir7mAkID21wudtIU2vRYbX28AHO3N team-user04-gitlab-3"]}
+
+  # Synthetic scenario users (PLAN "Scenarios"): owners and background workload.
+  # Keys of the synthetic and agent accounts below (owner, 6 Oct): one ed25519 key per account, generated
+  # by the operator; the private keys stay outside git (~/.config/prace-lab/synthetic-keys/) and the owner
+  # hands them to whoever runs that identity. Exception: syn-alice also takes teammates' own keys (8 Oct, below).
+  # syn-alice is also run by teammates with their own keys (owner decision, 8 Oct): exactly the keys
+  # registered for their accounts above, each `restrict,pty` (a shell or a command; no port, agent or X11
+  # forwarding). A session is attributed by the booking and by the key fingerprint sshd logs for each
+  # login (docs/runbooks/SYN-ALICE-SHARED-USE-2026-10-08.md). Delete a teammate's lines here to revoke.
+  - name: syn-alice
+    uid: 30001
+    groups: [synthetic, proj-alpha]
+    comment: "Synthetic - proj-alpha owner (protected marker)"
+    ssh_keys:
+      - "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBU8Dj51/ko1e4hOxc9XifCaJ06RKORjNA6bfMVoUN5q syn-alice-prace-20261006"
+      - "restrict,pty ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAID/t8u2pVoThNN8R8jM0onc26D4XazYX8xVoRU2QkF5K team-user02-gitlab-2"
+      - "restrict,pty ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMyDxBS6nAC1t08Y/Knn/AKpnVl7l25ftiIxxiM6D9+o team-user02-gitlab-5"
+      - "restrict,pty ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIE2TrN0O7wRxq0KgeRy4SESf/bwf3tXADVOF9STBN5VJ team-user03-gitlab-4"
+      - "restrict,pty ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOoz0VDTlUxs71H4gdITsRg+0lzGAsHUavH3P3SIea6O team-user03-gitlab-6"
+      - "restrict,pty ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILi3RzrVfcTchILir7mAkID21wudtIU2vRYbX28AHO3N team-user04-gitlab-3"
+  - {name: syn-bob, uid: 30002, groups: [synthetic, proj-beta], comment: "Synthetic - proj-beta member", ssh_keys: ["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIM9J0ebSYLNkKQMx+vwCCX1m1C8p3WWhnMi/6mAnUi6B syn-bob-prace-20261006"]}
+  - {name: syn-carol, uid: 30003, groups: [synthetic, proj-alpha], comment: "Synthetic - background jobs in proj-alpha", ssh_keys: ["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEwr5/AOiWjocS9qNEllQADGBwQgFsVlp+r+Hpmi/Tyi syn-carol-prace-20261006"]}
+  - {name: syn-dave, uid: 30004, groups: [synthetic, proj-beta], comment: "Synthetic - background jobs in proj-beta", ssh_keys: ["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKueTDIyfNsInjbeJTNh3IDsOuQxotvEMyLyUL/dEtfA syn-dave-prace-20261006"]}
+  # Benign file-ops smoke actor of Component 4's trace smoke (scenarios/file-ops-smoke, owner 6 Oct):
+  # proj-ops, so it never touches scenario data; its dedicated public key is declared below.
+  - {name: syn-smoke, uid: 30005, groups: [synthetic, proj-ops], comment: "Synthetic - file-ops smoke actor (Component 4)", ssh_keys: ["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAywRQlRge5bb8xIE+axw8J4eFh1X98OMIX9qQ1N9U/b syn-smoke-prace-20261006"]}
+  # Component 4's independent identities (owner, 6 Oct): the cluster tracer and the observer read what
+  # the actor did and must never be the actor. In proj-ops (every user is in a project, owner 30 Sep),
+  # which holds no scenario data; small homes (storage.yml), since they keep nothing.
+  - {name: syn-tracer, uid: 30006, groups: [synthetic, proj-ops], comment: "Synthetic - Component 4 cluster tracer", ssh_keys: ["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBoarmcvHyxEzeAkfWvepSi+ZD4qLf3PP2er8USVevKx syn-tracer-prace-20261006"]}
+  - {name: syn-observer, uid: 30007, groups: [synthetic, proj-ops], comment: "Synthetic - Component 4 observer", ssh_keys: ["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIO7Cayu4UdveqJ/NOCmhloxj0elW/6HMIKZWQKHNnhCy syn-observer-prace-20261006"]}
+
+  # Acceptance probes (tools/slinky-acceptance.sh; private key outside git, ~/.config/prace-lab).
+  # syn-revoked is absent on purpose: its retained home/key must not open a login.
+  # syn-nologin has no project on purpose: the policy acceptance shows it cannot run a job.
+  - {name: syn-probe, uid: 30091, groups: [synthetic, proj-ops], comment: "Synthetic - acceptance probe (key login)", ssh_keys: ["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJ0Wt63txkr3eLnzsKSLMXQLM9eoPat1iMKB2YYPkp8f prace-acceptance-probe"]}
+  - {name: syn-nologin, uid: 30092, groups: [synthetic], shell: /sbin/nologin, comment: "Synthetic - acceptance probe (nologin)", ssh_keys: ["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJ0Wt63txkr3eLnzsKSLMXQLM9eoPat1iMKB2YYPkp8f prace-acceptance-probe"]}
+  - {name: syn-revoked, uid: 30093, groups: [synthetic], state: absent, comment: "Synthetic - acceptance probe (revoked)"}
+
+  # Agent placeholders (user, 26 Sep: reconfigure/add/reinstall later as scenarios firm up).
+  # An agent runs with the privileges of an ordinary HPC user.
+  - {name: agent-perm01, uid: 40001, groups: [agents, proj-beta], comment: "Agent - cross-project permission scenario (T22/T23)", ssh_keys: ["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKuWo7jmGDo5XJF91ytqCPGM2LPKWL2NmkS6i97YF5GF agent-perm01-prace-20261006"]}
+  - {name: agent-cleanup01, uid: 40002, groups: [agents, proj-beta], comment: "Agent - job cleanup scenario (T24)", ssh_keys: ["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGBgDmJ4vpvFiOvgSZpiRoo7gZkztYrJbhAQZgih9QYh agent-cleanup01-prace-20261006"]}
+  - {name: agent-resource01, uid: 40003, groups: [agents, proj-beta], comment: "Agent - resource-policy scenario (T24 fallback)", ssh_keys: ["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEMqKOH7ZrQ4Am1azCqPKc+OOXrrpO8QZFOmF1BA2jfk agent-resource01-prace-20261006"]}
+  - {name: agent-team01, uid: 40011, groups: [agents, proj-beta], comment: "Agent team member 1 (T28)", ssh_keys: ["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEu+3fo903J9N/v05SvkVQEyDkxqNSss6GeOAs2i6Jag agent-team01-prace-20261006"]}
+  - {name: agent-team02, uid: 40012, groups: [agents, proj-beta], comment: "Agent team member 2 (T28)", ssh_keys: ["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINVgWNaJ5SQoUmb/cNsRsPcSCOYh8IF7jjnGDJVr+1xl agent-team02-prace-20261006"]}
+  - {name: agent-team03, uid: 40013, groups: [agents, proj-beta], comment: "Agent team member 3 (T28)", ssh_keys: ["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIa6Ygd869i+pfzFdCGeoy4VVlCedZ3MQjIzCUHpsFUg agent-team03-prace-20261006"]}
+  - {name: agent-spare01, uid: 40091, groups: [agents, proj-beta], comment: "Agent - spare placeholder", ssh_keys: ["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGYc2wtO1tKuX3+OmrsLHGVHUm8SMmfrHzWYvVXdK/FP agent-spare01-prace-20261006"]}

@@ -1,0 +1,4 @@
+# Public key of the lab deploy runner on mgmt-git01 (roles/gitlab_lab_runner generated it;
+# the private key never leaves the VM). roles/lab_deploy_key authorizes it per host with a
+# from= restriction (group_vars lab_hosts / private_nodes).
+lab_deploy_pubkey: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFjUCTG8+iytEgNMNvRl9qCDKYsd9YuhiSGflprpVvow labdeploy@mgmt-git01"

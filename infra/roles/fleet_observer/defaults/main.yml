@@ -1,0 +1,11 @@
+---
+# fleet_observer: the READ-ONLY observation entrypoint on the login node for the off-node
+# monitor and the scheduled drift audit (both on mgmt-git01). Each key may run exactly one command.
+fleet_observer_user: prace-observer
+# Local disk, not the exported /home (D39 storage step): over NFS any client root could plant keys.
+fleet_observer_home: "{{ storage_local_home_root | default('/home') }}/{{ fleet_observer_user }}"
+fleet_observer_from: "198.51.100.125"     # mgmt-git01 as the login node sees it (campus NAT)
+fleet_observer_keys: []                   # public keys generated on mgmt-git01 (roles/fleet_monitor)
+# T89: a native worker's read-only observation (files/prace-native-observe.py), on its private
+# address and a privileged port; only the login node's private address is admitted.
+fleet_observer_native_port: 918

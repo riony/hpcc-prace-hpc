@@ -1,0 +1,30 @@
+{
+  "run_id": "smoke-remote-001",
+  "scenario": "scenarios/file-ops-smoke/v1/manifest.remote.json",
+  "run_dir": "/REPLACE/WITH/ABSOLUTE/prace-runs/smoke-remote-001",
+  "socket_path": "/REPLACE/WITH/ABSOLUTE/prace-runs/smoke-remote-001/tracer.sock",
+  "workspace": "/tmp/prace-file-ops-smoke-v1",
+  "adapter": "ssh",
+  "adapter_config": {
+    "ssh_alias": "prace-actor",
+    "remote_helper": "/usr/local/bin/prace-file-ops",
+    "identity_file": "/REPLACE/WITH/ABSOLUTE/keys/actor_ed25519",
+    "known_hosts": "/REPLACE/WITH/ABSOLUTE/keys/known_hosts",
+    "connect_timeout": 10
+  },
+  "cluster_tracer": {
+    "enabled": true,
+    "adapter": "ssh",
+    "adapter_config": {
+      "ssh_alias": "prace-cluster-tracer",
+      "remote_helper": "/usr/local/bin/prace-file-ops",
+      "identity_file": "/REPLACE/WITH/ABSOLUTE/keys/tracer_ed25519",
+      "known_hosts": "/REPLACE/WITH/ABSOLUTE/keys/known_hosts",
+      "connect_timeout": 10
+    },
+    "target": "login-pod",
+    "require_on_finalize": true
+  },
+  "observer_ssh_alias": "prace-observer",
+  "notes": "Keep credentials outside git. Actor, cluster-tracer, and optional observer must be distinct identities. Cluster tracer runs the pinned observe helper on the remote host."
+}

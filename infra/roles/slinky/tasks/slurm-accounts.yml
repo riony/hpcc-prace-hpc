@@ -1,0 +1,16 @@
+---
+# Managed by Ansible (roles/slinky). The accounting database made to match git: QoS, project
+# accounts, associations, default accounts (files/prace-slurm-accounts.py). With --check
+# it only prints its plan ("plan: ..."), so a check run previews the Slurm changes. It exits 3,
+# changing nothing, while a user or association it would remove still has queued jobs.
+- name: Slurm accounting matches the policy (QoS, accounts, associations; a --check run only plans)
+  # the program on stdin (nothing to install, so a first --check can preview), the spec in the
+  # environment; a failure then shows only the program's own messages
+  ansible.builtin.command:
+    argv: [python3, "-", "{{ '--check' if ansible_check_mode else '--apply' }}", env]
+    stdin: "{{ lookup('ansible.builtin.file', role_path ~ '/files/prace-slurm-accounts.py') }}"
+  environment:
+    PRACE_SLURM_ACCOUNTS_SPEC: "{{ slinky_accounts_spec | to_json }}"
+  check_mode: false          # read-only with --check: it prints its plan and changes nothing
+  register: slinky_accounts
+  changed_when: "slinky_accounts.stdout is search('^(plan|done): ', multiline=True)"

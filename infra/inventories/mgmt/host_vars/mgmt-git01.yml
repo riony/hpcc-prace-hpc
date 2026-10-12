@@ -1,0 +1,89 @@
+# mgmt-git01 :  project management / GitLab VM (selected by the user 2026-09-25).
+# Sources: live read-only inspection 2026-09-25 (evidence/2026-09-25/git01-setup/).
+
+# Reached only via a cluster login node: the VM's 198.18.192.0/19 network is not
+# routed from controller or from .205 (the VM itself can reach .205:22 and the internet).
+ansible_host: 198.18.202.16
+ansible_user: admin                # key login; sudo needs a password -> converge with -e ansible_user=root
+ansible_ssh_common_args: '-o ProxyJump=team-user01@198.51.100.13'
+
+timezone: Asia/Singapore
+mgmt_hostname: mgmt-git01
+mgmt_break_glass_user: admin
+mgmt_controller_pubkey: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKIr8nQ1dyNNBWffSmen+KyOljDhcJZDMb4+F9XU7h5x operator@controller"
+
+# Personal accounts use the local- prefix (user decision 2026-09-25): cannot collide
+# with AD first.last names at the post-hackathon Centrify join. Add teammates here.
+mgmt_admins:
+  - name: local-team-user01
+    # one key per line: controller, then team-user01 on the HPC login nodes h001 (.13) and
+    # cluster-hn2 (.7, key generated on g16). Not added: .7's purpose-specific id_rsa_dsv4.
+    pubkey: |
+      ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKIr8nQ1dyNNBWffSmen+KyOljDhcJZDMb4+F9XU7h5x operator@controller
+      ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIHVUu0g216F+USIFCQvN8JD2zkJj1hFETNgVNmWZpNh team-user01@lab-h001
+      ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIBiIvf5rBpVUBNd/pd4sWiMPLdqfprAmQTOdPhRZcgL team-user01@cluster-g16
+
+# edwin (the VM's builder; access confirmed by the user) logs in with a password and
+# has no key yet. Remove from this list once edwin has a key.
+sshd_password_users:
+  - edwin
+
+gitlab_data_dir: /home/gitlab-data
+
+# Firewall: SSH plus HTTPS for GitLab (host_base pins the zone to exactly this list).
+host_base_fw_services: [ssh, https]
+
+# GitLab (roles/gitlab). Name/certificate from Tailscale; also reachable from the
+# campus side via the h001 route (SOCKS proxy + hosts entry for this name).
+gitlab_fqdn: mgmt-git01.example-tailnet.ts.net
+gitlab_version: "19.4.1-ce.0.el9"
+# Serve the read-only fleet dashboard at /prace-dash/ (roles/fleet_dashboard). The first run with this
+# reconfigures GitLab once; check first that no GitLab group or user is named prace-dash.
+gitlab_prace_dash: true
+
+hardware:
+  platform: VMware VM
+  vcpus: 8                         # Xeon Platinum 8358
+  ram_gib: 31
+  disk: "1 TiB; LVM rl: root 70G xfs, home 936.7G xfs, swap 15.7G; VG free 0"
+network:
+  iface: ens34
+  address: 198.18.202.16/19
+  gateway: 198.18.200.1
+  dns: [192.0.2.53, 192.0.2.53]
+tailscale:                         # installed and joined by the user 2026-09-25 (not yet managed by this role)
+  name: mgmt-git01.example-tailnet.ts.net
+  ipv4: 198.51.100.109
+  settings: "no --ssh, no accept-routes, no exit node; MagicDNS on (non-ts.net lookups still go to campus DNS 192.0.2.53/.7)"
+  tag: "tag:hpcc-mgmt"             # applied 2026-09-25; policy: VM cannot initiate into the tailnet; shared users 22/443 only
+  key_expiry: 2027-03-24           # still set after tagging (console: Machines > mgmt-git01 > Disable key expiry, if wanted)
+ssh_host_key_ed25519: "SHA256:z1Vfr/83Xo/qqnrA0BAiD2Mv/JnS74/7LAp3wOGGJ+0"
+# Decisions (user, 2026-09-25): joins the HPC Centrify zone only AFTER the hackathon;
+# /home stays local (no NFS home); teammates use GitLab, not shells; agents get no
+# shell/sudo here; 'admin' is break-glass; personal accounts are local-<person>; edwin and the team-user01@cluster-g16 root key stay.
+
+# Lab deploy runner (roles/gitlab_lab_runner). Host keys copied from controller's verified
+# known_hosts (hashed hostnames): .205, Lenovo 10.88.0.2, g005 10.88.0.3.
+lab_runner_known_hosts:
+  - "git.example.invalid ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDNCYQVeigjij8QjUSg0H8E7zk0oUS1dvfBl/SjGPB5E"
+  - "git.example.invalid ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPiR2ietmA6KRyBicyotz14242wCcUsFpr/yeJA3zt/l"
+  - "git.example.invalid ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEXZUqDWLF18102Pp1M5glYeyKURBxwD7rhFI139RfMv"
+  - "git.example.invalid ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIA7KePSWvfUVAuvtZthYY8hCZJtFS4kk4Y7tkEon6bv2"
+  - "git.example.invalid ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHYaZtz0DsqBQOe4TWZLB0ZQ3X7p8JTLAgApwI0NPpw1"
+  - "git.example.invalid ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILMMddnQ3DW/ApITejmoq8pwtOA05TtA06RwQQ72r8bh"
+  - "git.example.invalid ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIsE8EP0Bu7pWnI2Ihfkbks0E1bsz5cOH2TJmdUVylCb"
+  - "git.example.invalid ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGqWQgGaPlvVtQCTu5FqoF9+QYw32jgdHk5b7IcJSA0Y"
+  - "git.example.invalid ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMJngnUo6ahZWVad0lb01C8LAtMLwwEcVYjTWaXTkDjF"
+
+# Outgoing email (owner decision 2026-09-26): the campus relay refuses external recipients
+# (550 5.7.1 from h001), so GitLab sends through Gmail as the owner's account; the owner
+# accepted that its app password sits (encrypted) on this VM. The owner stores it with
+# gitlab-rake gitlab:smtp:secret:write before email is enabled here.
+gitlab_smtp_enable: true
+gitlab_email_from: contributor@example.org
+gitlab_pipeline_email_recipients:
+  hpcc/prace-hackathon: [contributor@example.org]
+
+# Off-node fleet monitor (roles/fleet_monitor). Enabled once the login node authorized its key
+# (inventories/fleet group_vars/all/monitoring.yml), 28 Sep.
+fleet_monitor_enable: true

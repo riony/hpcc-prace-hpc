@@ -1,0 +1,17 @@
+# Managed by Ansible (roles/k3s). A compute node: runs Slurm pods only (taint below).
+server: https://{{ k3s_server_ip }}:6443
+token: {{ k3s_token }}
+node-name: {{ inventory_hostname }}
+node-ip: {{ admin_ip }}
+flannel-iface: {{ k3s_iface[0] }}
+selinux: true
+node-label:
+  - prace.fleet/role={{ fleet_role }}
+node-taint:
+  - {{ k3s_worker_taint }}
+kubelet-arg:
+  - system-reserved={{ k3s_system_reserved }}
+# NodePorts only on the admin network: kube-proxy rewrites NodePort traffic before firewalld's
+# input zone sees it, so the campus zone alone does not keep them private.
+kube-proxy-arg:
+  - nodeport-addresses={{ admin_network }}

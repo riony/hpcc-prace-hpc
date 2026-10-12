@@ -1,0 +1,7 @@
+---
+# host_base on compute nodes: time from the login node (the G8052 needs ~30 s after link-up,
+# hence the short polling), packages from the fleet repository.
+chrony_servers: ["{{ hostvars[groups['login'][0]].admin_ip }}"]
+chrony_server_opts: "minpoll 4 maxpoll 6"
+host_base_fw_zone: public
+host_base_fw_services: [ssh]

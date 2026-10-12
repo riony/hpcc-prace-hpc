@@ -1,0 +1,161 @@
+---
+# BeeGFS disk preparation (D33; storage plan section 6, MR-B): return the two data NVMes of ONE
+# GPU node to blank, with no partition table, no signature, no LVM metadata and no stale UEFI
+# entry. It is standalone and armed. It is NOT part of fleet.yml, and no role runs it. It creates
+# nothing (no GPT, mkfs, fstab or BeeGFS): that is the BeeGFS step.
+#
+# One node per run, g005 first (already blank: a verified no-op), then g003, then g004, each in
+# its own cluster lease, taken for that node with the window tool, all from the controller:
+#   ID=$(infra/tools/slurm-window.py lease-take --label nvme-wipe-<node> | tail -1)
+#   [[ $ID =~ ^[0-9a-f]{16}$ ]] || echo 'STOP: no lease'
+#   cd infra && tools/run-ansible.sh -i inventories/fleet playbooks/beegfs-disk-wipe.yml -e fleet_armed=true \
+#     -e fleet_lease_id=$ID --limit <node> -e nvme_wipe_confirm=<node>:<serial1>,<serial2>
+#   cd .. && infra/tools/slurm-window.py lease-release --lease-id $ID
+# (<node> is the inventory name, e.g. lab-g003; the serials exactly as nvme_serials in its
+# host_vars, in that order). The lease must be that node's wipe lease (label=nvme-wipe-<node>):
+# another operation's lease id is refused. Add --check for a preview: every read-only check runs
+# and the plan is printed, then the run stops before any change. A failed run leaves the node
+# cordoned and says what is left; after fixing the cause, re-run the same command: once the
+# disks are blank it finishes the recorded run (tasks/nvme-wipe.yml).
+#
+# Gates, in order. The first four contact no host:
+#  1. armed: the host pattern is empty unless -e fleet_armed=true (as in fleet.yml);
+#  2. no tag filtering (every check must run);
+#  3. a GPU node with a complete record in host_vars (nvme_serials, nvme_euis, os_disk);
+#  4. confirmation: nvme_wipe_confirm must equal <inventory_hostname>:<nvme_serials joined by ','>.
+#     Other hosts of the run are skipped with a message; a confirmation that names no host of
+#     the run fails the run;
+#  5. the cluster lease must be held, by -e fleet_lease_id, and be this node's wipe lease;
+#  6. read-only inspection (tools/nvme-wipe-inspect.py): each NVMe resolved by serial AND EUI,
+#     the pre-state exactly blank or the known 'rl' layout, anything else refused.
+# Only then, and only for the 'rl' layout (or to finish an earlier run that did not), the node
+# is cordoned and the disks are wiped (see tasks/nvme-wipe.yml). --start-at-task cannot skip the checks: every change needs this run's
+# confirmation, lease result and plan (nw_gates_ok, nw_plan).
+- name: Arming gate (clear message)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: "Refuse unless explicitly armed"
+      ansible.builtin.assert:
+        that: fleet_armed | default(false) | bool
+        fail_msg: "Not armed: pass -e fleet_armed=true"
+        quiet: true
+      tags: [always]
+    - name: No tag filtering (every check of the wipe must run)
+      ansible.builtin.assert:
+        that: ansible_run_tags | list == ['all'] and ansible_skip_tags | list == []
+        fail_msg: "beegfs-disk-wipe.yml takes no --tags/--skip-tags"
+        quiet: true
+      tags: [always]
+
+- name: NVMe wipe for BeeGFS (one GPU node at a time)
+  hosts: "{{ 'gpu' if (fleet_armed | default(false) | bool) else 'nvme_wipe_not_armed_no_hosts' }}"
+  serial: 1
+  any_errors_fatal: true
+  gather_facts: false
+  vars:
+    # Facts of the disks (node facts and host_vars, 28 Sep).
+    nvme_wipe_model: MO001600KWVNB
+    nvme_wipe_size: 1600321314816
+    nvme_wipe_legacy_vg: rl                        # the old OS on g003/g004: VG rl on both NVMes
+    nvme_wipe_legacy_lvs: [home, root, swap]
+    # Where things are.
+    nvme_wipe_node_dir: /var/lib/prace-nvme-wipe    # this run's records and inspector, on the node
+    nvme_wipe_evidence_root: "{{ (playbook_dir ~ '/../../evidence') | realpath }}"
+    nvme_wipe_python: /usr/bin/python3
+    nvme_wipe_inspector: "{{ playbook_dir }}/../tools/nvme-wipe-inspect.py"   # copied to the node for each run
+    nvme_wipe_reread_retries: 5                    # blockdev --rereadpt while the kernel lists old partitions
+    nvme_wipe_reread_delay: 3
+    nvme_wipe_kubectl: [/usr/local/bin/k3s, kubectl]                   # on the login node
+    nvme_wipe_worker_check: /usr/local/sbin/prace-slinky-worker-check   # on the login node
+    nvme_wipe_worker_retries: 20                   # the check after the uncordon, every delay seconds
+    nvme_wipe_worker_delay: 15
+    nw_expected_confirm: "{{ inventory_hostname }}:{{ nvme_serials | default([]) | join(',') }}"
+    nw_confirm: "{{ nvme_wipe_confirm | default('') | string }}"
+    nw_confirm_host: "{{ nw_confirm.split(':')[0] }}"
+    # tasks/nvme-wipe.yml asserts this first and every change there is conditional on it, evaluated
+    # at that task: the confirmation names this host, and this run read the lease on the login node
+    # and holds it. A run started past the gate tasks below (--start-at-task) has no lease result.
+    nw_lease_label: "label=nvme-wipe-{{ inventory_hostname }} "
+    nw_lease_holder: " holder=maint "                # the window tool's lease (Session B review N-1)
+    nw_gates_ok: >-
+      {{ nw_confirm == nw_expected_confirm and fleet_lease is defined and fleet_lease.rc | default(1) == 0
+         and fleet_lease_id | default('') | length > 0
+         and ('id=' ~ fleet_lease_id | default('') ~ ' ') in (fleet_lease.stdout | default('') ~ ' ')
+         and nw_lease_label in (' ' ~ fleet_lease.stdout | default('') ~ ' ')
+         and nw_lease_holder in (' ' ~ fleet_lease.stdout | default('') ~ ' ') }}
+  tasks:
+    - name: Armed (checked again before any connection)
+      ansible.builtin.assert:
+        that: fleet_armed | default(false) | bool
+        fail_msg: "Not armed: pass -e fleet_armed=true"
+        quiet: true
+
+    # Twice: an always-tagged copy refuses --tags X (with --limit the first play is skipped), the
+    # untagged copy refuses --skip-tags always.
+    - name: No tag filtering (checked again inside the play, --tags)
+      ansible.builtin.assert:
+        that: ansible_run_tags | list == ['all'] and ansible_skip_tags | list == []
+        fail_msg: "beegfs-disk-wipe.yml takes no --tags/--skip-tags"
+        quiet: true
+      tags: [always]
+
+    - name: No tag filtering (checked again inside the play, --skip-tags)
+      ansible.builtin.assert:
+        that: ansible_run_tags | list == ['all'] and ansible_skip_tags | list == []
+        fail_msg: "beegfs-disk-wipe.yml takes no --tags/--skip-tags"
+        quiet: true
+
+    - name: A GPU node with a complete NVMe record in host_vars
+      ansible.builtin.assert:
+        that:
+          - fleet_role | default('') == 'gpu' and inventory_hostname in groups['gpu']
+          - nvme_serials | default([]) | length == 2 and nvme_serials | unique | length == 2
+          - nvme_serials | select('match', '^[A-Za-z0-9_-]{4,40}$') | list | length == 2
+          - nvme_euis | default([]) | length == 2 and nvme_euis | unique | length == 2
+          - nvme_euis | select('match', '^eui\.[0-9a-f]{16}([0-9a-f]{16})?$') | list | length == 2
+          - os_disk.kind | default('') == 'scsi_wwn' and os_disk.wwn | default('') is match('^[0-9a-f]{32}$')
+        fail_msg: "{{ inventory_hostname }}: host_vars need fleet_role gpu, two nvme_serials, two nvme_euis and a scsi_wwn os_disk"
+        quiet: true
+
+    - name: The confirmation names a GPU node of this run, with its serials in host_vars order
+      ansible.builtin.assert:
+        that:
+          - nw_confirm_host in ansible_play_hosts_all
+          - nw_confirm == nw_confirm_host ~ ':' ~ (hostvars[nw_confirm_host].nvme_serials | default([]) | join(','))
+        fail_msg: >-
+          Nothing done: nvme_wipe_confirm={{ nw_confirm | to_json }} names no host of this run with its
+          serials. Pass -e nvme_wipe_confirm=<node>:<serial1>,<serial2> with the serials exactly as
+          nvme_serials in that node's host_vars, in that order.
+        quiet: true
+
+    - name: Not confirmed for this host (skipped; nothing read or changed here)
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: SKIPPED, nvme_wipe_confirm does not name this host ({{ nw_expected_confirm }} would)"
+      when: nw_confirm != nw_expected_confirm
+
+    - name: End this host when it is not the confirmed one
+      ansible.builtin.meta: end_host
+      when: nw_confirm != nw_expected_confirm
+
+    - name: Cluster lease (no other operation may hold it)
+      ansible.builtin.include_tasks: tasks/cluster-lease-check.yml
+
+    - name: The wipe runs inside a lease held by this operator
+      ansible.builtin.assert:
+        that:
+          - fleet_lease.rc == 0
+          - fleet_lease_id | default('') | length > 0
+          - ('id=' ~ fleet_lease_id ~ ' ') in (fleet_lease.stdout ~ ' ')
+          - nw_lease_label in (' ' ~ fleet_lease.stdout ~ ' ')
+          - nw_lease_holder in (' ' ~ fleet_lease.stdout ~ ' ')
+        fail_msg: >-
+          Take this node's wipe lease first (slurm-window.py lease-take --label nvme-wipe-{{ inventory_hostname }})
+          and pass its id (-e fleet_lease_id=<id>); see the header of playbooks/beegfs-disk-wipe.yml.
+          Lease now: {{ fleet_lease.stdout | default('none') }}
+        quiet: true
+
+
+    - name: Inspect, then (known 'rl' layout only) cordon and wipe
+      ansible.builtin.include_tasks: tasks/nvme-wipe.yml

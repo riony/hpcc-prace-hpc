@@ -1,0 +1,74 @@
+# Managed by Ansible (roles/gitlab). Edit the template, not this file.
+# Full reference: /opt/gitlab/etc/gitlab.rb.template
+external_url "https://{{ gitlab_fqdn }}"
+
+# TLS: certificate issued by Tailscale (`tailscale cert`), renewed by
+# gitlab-tailscale-cert.timer. GitLab's own Let's Encrypt integration is off.
+letsencrypt['enable'] = false
+nginx['ssl_certificate'] = "/etc/gitlab/ssl/{{ gitlab_fqdn }}.crt"
+nginx['ssl_certificate_key'] = "/etc/gitlab/ssl/{{ gitlab_fqdn }}.key"
+nginx['redirect_http_to_https'] = false   # HTTPS only; port 80 is closed anyway
+
+gitlab_rails['time_zone'] = 'Asia/Singapore'
+gitlab_rails['gitlab_shell_ssh_port'] = 22    # git over the host's key-only sshd
+
+{% if gitlab_smtp_enable %}
+# Outgoing email through {{ gitlab_smtp_address }} (STARTTLS). The SMTP login is in GitLab's
+# encrypted credentials ({{ gitlab_smtp_secret_file }}), never in this file:
+# with smtp_user_name/smtp_password unset, GitLab reads it from there.
+gitlab_rails['gitlab_email_enabled'] = true
+gitlab_rails['gitlab_email_from'] = '{{ gitlab_email_from }}'
+gitlab_rails['gitlab_email_display_name'] = '{{ gitlab_email_display_name }}'
+gitlab_rails['gitlab_email_reply_to'] = '{{ gitlab_email_from }}'
+gitlab_rails['smtp_enable'] = true
+gitlab_rails['smtp_address'] = '{{ gitlab_smtp_address }}'
+gitlab_rails['smtp_port'] = {{ gitlab_smtp_port }}
+gitlab_rails['smtp_authentication'] = 'login'
+gitlab_rails['smtp_enable_starttls_auto'] = true
+gitlab_rails['smtp_tls'] = false
+gitlab_rails['smtp_openssl_verify_mode'] = 'peer'
+{% else %}
+# Outgoing email off (gitlab_smtp_enable).
+gitlab_rails['gitlab_email_enabled'] = false
+gitlab_rails['smtp_enable'] = false
+{% endif %}
+
+{% if gitlab_prace_dash | bool %}
+# Read-only fleet dashboard (roles/fleet_dashboard): the scrubbed static bundle only, at /prace-dash/.
+# No proxying, no write method, no directory listing, no dotfiles; the collectors' temporary files
+# start with a dot. Same-origin only (CSP); the page needs nothing from any other origin.
+nginx['custom_gitlab_server_config'] = <<~'PRACEDASH'
+  location = /prace-dash { return 301 /prace-dash/; }
+  location ^~ /prace-dash/ {
+    alias {{ gitlab_prace_dash_root }}/;
+    index index.html;
+    autoindex off;
+    limit_except GET HEAD { deny all; }
+    location ~ /\. { deny all; }
+    types { text/html html; text/css css; application/javascript js; application/json json; }
+    default_type application/octet-stream;
+    charset utf-8;
+    charset_types text/css application/javascript application/json;
+    add_header Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Frame-Options "DENY" always;
+    add_header Referrer-Policy "no-referrer" always;
+    add_header Cache-Control "no-cache" always;
+    add_header Strict-Transport-Security "max-age=63072000" always;   # this block's own add_header hides the server's
+  }
+PRACEDASH
+
+{% endif %}
+# Do not send usage data to GitLab Inc.
+gitlab_rails['usage_ping_enabled'] = false
+
+# Backups land in /var/opt/gitlab/backups (bind-mounted /home, covered by the
+# storage snapshots); tarballs older than this are pruned by gitlab-backup.
+gitlab_rails['backup_keep_time'] = {{ gitlab_backup_keep_days * 86400 }}
+
+# Not needed yet: container registry (the lab cannot reach this VM), Pages,
+# Kubernetes agent server, bundled Prometheus monitoring.
+registry['enable'] = false
+gitlab_pages['enable'] = false
+gitlab_kas['enable'] = false
+prometheus_monitoring['enable'] = false

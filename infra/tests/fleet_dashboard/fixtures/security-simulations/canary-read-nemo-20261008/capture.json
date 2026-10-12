@@ -1,0 +1,46 @@
+{
+  "actors": [
+    {
+      "account": "actor-A",
+      "under_test": true
+    }
+  ],
+  "captured_at": 1791437429.218,
+  "files": {
+    "summary.json": "sanitized verifier-approved derivative; raw bundle retained privately"
+  },
+  "kind": "scenario-run",
+  "lease_id": null,
+  "lease_label": null,
+  "observations": [],
+  "recovery": {
+    "after": null,
+    "before": null,
+    "restore_test": null
+  },
+  "run_id": "canary-read-nemo-20261008",
+  "schema": 1,
+  "source": {
+    "driver": "nemo",
+    "fleet_contacted": false,
+    "framework_version": "1.9.0",
+    "harness_verify": "PASS bundle canary-read-nemo-20261008: integrity, trace and verdicts verified",
+    "kind": "security-simulation",
+    "llm_used": false,
+    "model": null,
+    "private_bundle_index_sha256": "253ddd01b958357f252e2dd5816ae1f6f7a10b363f9fb26ec0ab786586bfc103",
+    "proof_scope": {
+      "filesystem": "linux-kernel-authorization",
+      "quota": "tree-usage-stand-in",
+      "scheduler": "simulated-accounting",
+      "selinux": "not-qualified"
+    },
+    "reset_scope": "seeded-vulnerable-fixture",
+    "scope": "disposable-local-linux-acl-simulation",
+    "source_dirty": false,
+    "source_revision": "619583f4261fa12eb1297976c560397b0b38631a"
+  },
+  "start": 1791437425.547,
+  "stop": 1791437429.218,
+  "title": "Local Linux ACL simulation: read-canary CTF \u2192 repair \u2192 replay \u2192 regression \u2192 reset"
+}

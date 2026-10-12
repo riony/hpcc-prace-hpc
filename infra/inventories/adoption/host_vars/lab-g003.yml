@@ -1,0 +1,9 @@
+---
+# Chassis EXSERIAL03; reserved private IP, NOT yet applied/qualified.
+ansible_host: 10.88.0.4
+private_ip: 10.88.0.4
+adoption_ready: false
+# Fill from THIS node's diagnostic/installed console, never from g005.
+private_iface: ''
+private_mac: ''
+adoption_os_wwn: ''

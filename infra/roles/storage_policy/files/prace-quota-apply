@@ -1,0 +1,314 @@
+#!/usr/bin/python3
+"""Apply the declared XFS quotas (roles/storage_policy) and report only differences.
+
+    prace-quota-apply [--check] [--config PATH]
+
+Reads /etc/prace-storage/quotas.json (rendered from inventory storage.yml + accounts.yml):
+  {"home": {"path": "/home", "grace_s": N, "default": {...}, "users": [{"uid": U, "name": ..., limits}]} | null,
+   "projects": {"path": "/projects", "grace_s": N, "projects": [{"id": I, "name": ..., "dir": ..., limits}]} | null}
+limits = bsoft/bhard (xfs_quota sizes: 18g, 4608m, ...) and isoft/ihard (inodes).
+The /home default limit is XFS's default quota (ID 0 record; root itself is never limited).
+Project directories are tagged (project -s) only when this helper's own NUL-safe walk (the
+FS_IOC_FSGETXATTR ioctl on every directory and regular file) finds an entry without the
+project ID or a directory without project inheritance; the same walk proves the result, so no
+path-bearing xfs_quota output is ever parsed (a file name may contain a newline).
+/home and /projects are planned, applied and read back independently: a problem in one does
+not block the other (the exit status still reports it).
+Each path must be an XFS mountpoint with that quota's accounting and enforcement on.
+xfs_quota exits 0 after most failures (non-XFS path, quota off, a refused setter), so any
+diagnostic on its stderr is an error, except for project -s (its path-bearing output is
+logged; the walk decides). After
+applying, everything is observed again and must equal the declaration (limits, grace times,
+project tags); what still differs is printed.
+Prints one "CHANGED ..." line per change (--check: "WOULD ..." and applies nothing). Exit 0;
+1 on any failure; 3 with --check when the declaration does not exist yet (a first preview).
+Never removes a limit that is not declared.
+"""
+import errno
+import fcntl
+import json
+import os
+import re
+import stat
+import struct
+import subprocess
+import sys
+
+CONFIG = "/etc/prace-storage/quotas.json"
+UNITS = {"k": 1, "m": 1024, "g": 1024 ** 2, "t": 1024 ** 3}
+QUOTA_NAME = {"u": "User", "p": "Project"}
+FS_IOC_FSGETXATTR = 0x801C581F           # _IOR('X', 31, struct fsxattr), 28 bytes
+FS_XFLAG_PROJINHERIT = 0x00000200
+
+
+class NoDeclaration(Exception):
+    pass
+
+
+def kib(size):
+    m = re.fullmatch(r"(\d+)([kmgt]?)", str(size).lower())
+    if not m:
+        raise ValueError(f"bad size {size!r}")
+    return int(m.group(1)) * UNITS[m.group(2) or "k"]
+
+
+def xq(path, command):
+    r = subprocess.run(["xfs_quota", "-x", "-c", command, path], capture_output=True, text=True)
+    diag = [l for l in r.stderr.splitlines() if l.strip()]
+    if command.startswith("project -s "):
+        # Names of skipped special files, possibly split by newlines: logged; the walk decides.
+        for l in diag:
+            print(f"  xfs_quota ({command}): {l!r}")
+        diag = []
+    if r.returncode or diag:
+        raise RuntimeError(f"xfs_quota -c {command!r} {path}: rc {r.returncode}: "
+                           f"{' | '.join(diag) or r.stdout.strip() or 'no output'}")
+    return r.stdout
+
+
+def fsxattr(path, is_dir):
+    """(project id, inherit flag) of a directory or regular file; None if it vanished."""
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | (os.O_DIRECTORY if is_dir else 0)
+    try:
+        fd = os.open(path, flags)
+    except FileNotFoundError:
+        return None
+    try:
+        buf = fcntl.ioctl(fd, FS_IOC_FSGETXATTR, bytes(28))
+    finally:
+        os.close(fd)
+    xflags, _, _, projid = struct.unpack("IIII", buf[:16])
+    return projid, bool(xflags & FS_XFLAG_PROJINHERIT)
+
+
+def untagged(top, projid):
+    """(entries not in project projid, first example): directories must also inherit it.
+    Symlinks and special files are skipped (they cannot be opened safely to tag)."""
+    bad, first = 0, None
+
+    def raise_error(err):
+        raise err
+
+    for dirpath, dirnames, filenames in os.walk(top, onerror=raise_error):
+        for name in [None] + dirnames + filenames:
+            path = dirpath if name is None else os.path.join(dirpath, name)
+            if name is not None and name in dirnames:
+                continue                       # visited as its own dirpath
+            try:
+                mode = os.lstat(path).st_mode
+            except FileNotFoundError:
+                continue
+            if not (stat.S_ISDIR(mode) or stat.S_ISREG(mode)):
+                continue
+            got = fsxattr(path, stat.S_ISDIR(mode))
+            if got is None:
+                continue
+            if got[0] != projid or (stat.S_ISDIR(mode) and not got[1]):
+                bad += 1
+                first = first or f"{path!r} (project {got[0]}, inherit {got[1]})"
+    return bad, first
+
+
+def fstype(path):
+    """The filesystem mounted exactly at path, or None when nothing is mounted there (findmnt's
+    "not found": exit 1, no output). Any other failure raises: a failed observation is not an
+    absent share."""
+    r = subprocess.run(["findmnt", "-no", "FSTYPE", "--mountpoint", path], capture_output=True, text=True)
+    if r.returncode == 0 and r.stdout.strip() and not r.stderr.strip():
+        return r.stdout.strip()
+    if r.returncode == 1 and not r.stdout.strip() and not r.stderr.strip():
+        return None
+    raise RuntimeError(f"findmnt --mountpoint {path}: rc {r.returncode}: {r.stderr.strip() or r.stdout.strip() or 'no output'}")
+
+
+def state(path, kind):
+    """(accounting and enforcement on, blocks grace, inodes grace) from state -<kind>."""
+    lines = xq(path, f"state -{kind}").splitlines()
+    head = f"{QUOTA_NAME[kind]} quota state on"
+    for i, line in enumerate(lines):
+        if line.startswith(head):
+            block = " ".join(lines[i + 1:i + 3])
+            rest = "\n".join(lines[i + 1:])
+            b = re.search(r"^Blocks grace time: \[([^\]]+)\]", rest, re.M)
+            n = re.search(r"^Inodes grace time: \[([^\]]+)\]", rest, re.M)
+            if not (b and n):
+                raise RuntimeError(f"state -{kind} {path}: no grace times in {rest!r}")
+            return "Accounting: ON" in block and "Enforcement: ON" in block, b.group(1), n.group(1)
+    raise RuntimeError(f"state -{kind} {path}: no '{head}' section")
+
+
+def require(path, kind):
+    """The grace times, once path is an XFS mountpoint with <kind> accounting+enforcement on."""
+    fs = fstype(path)
+    if fs != "xfs":
+        raise RuntimeError(f"{path} is not an XFS mountpoint (found {fs or 'no mount'})")
+    on, b, i = state(path, kind)
+    if not on:
+        raise RuntimeError(f"{path}: {QUOTA_NAME[kind].lower()} quota accounting/enforcement not on")
+    return b, i
+
+
+def report(path, kind):
+    """{id: (bsoft, bhard, isoft, ihard)} in KiB / inodes, from report -<kind> -n -N -b -i."""
+    rows = {}
+    for line in xq(path, f"report -{kind} -n -N -b -i").splitlines():
+        f = line.split()
+        if not f or not f[0].startswith("#"):
+            continue
+        # "#ID used soft hard warn/grace [grace]  used soft hard warn/grace [grace]"
+        nums = [x for x in f[1:] if re.fullmatch(r"\d+", x)]
+        if not re.fullmatch(r"#\d+", f[0]) or len(nums) < 8:
+            raise RuntimeError(f"report -{kind} {path}: malformed row {line.strip()!r}")
+        rows[int(f[0][1:])] = (int(nums[1]), int(nums[2]), int(nums[5]), int(nums[6]))
+    if not rows:
+        # A filesystem with quotas on always has a record for its root directory's owner/project.
+        raise RuntimeError(f"report -{kind} {path}: no #<id> rows")
+    return rows
+
+
+def want(limits):
+    return (kib(limits["bsoft"]), kib(limits["bhard"]), int(limits["isoft"]), int(limits["ihard"]))
+
+
+def limit_cmd(kind, limits, target):
+    return (f"limit -{kind} bsoft={limits['bsoft']} bhard={limits['bhard']} "
+            f"isoft={limits['isoft']} ihard={limits['ihard']} {target}")
+
+
+def days_text(seconds):
+    """Grace as `state` prints it; only whole days can be compared."""
+    days, rem = divmod(int(seconds), 86400)
+    if rem or days < 1:
+        raise ValueError(f"grace {seconds}s is not a whole number of days")
+    return "1 day" if days == 1 else f"{days} days"
+
+
+def shown(limits):
+    return "no record" if limits is None else "bsoft={}k bhard={}k isoft={} ihard={}".format(*limits)
+
+
+def check_project_dir(p):
+    if not os.path.isdir(p["dir"]) or os.path.islink(p["dir"]):
+        raise RuntimeError(f"project {p['name']}: {p['dir']} is not a directory")
+
+
+def plan_home(home):
+    """One (path, command, what, have/want) per difference from the /home declaration."""
+    actions = []
+    path = home["path"]
+    b, i = require(path, "u")
+    current = report(path, "u")
+    if 0 not in current:
+        raise RuntimeError(f"report -u {path}: no #0 (default quota) record")
+    if current[0] != want(home["default"]):
+        actions.append((path, limit_cmd("u", home["default"], "-d"), "default user quota",
+                        f"have {shown(current[0])}, want {shown(want(home['default']))}"))
+    for u in home["users"]:
+        if current.get(u["uid"]) != want(u):
+            actions.append((path, limit_cmd("u", u, str(u["uid"])), f"user {u['name']} ({u['uid']})",
+                            f"have {shown(current.get(u['uid']))}, want {shown(want(u))}"))
+    target = days_text(home["grace_s"])
+    if b != target or i != target:
+        have = f"have blocks [{b}] inodes [{i}], want [{target}]"
+        actions.append((path, f"timer -u -b {home['grace_s']}", "user block grace", have))
+        actions.append((path, f"timer -u -i {home['grace_s']}", "user inode grace", have))
+    return actions
+
+
+def plan_projects(proj):
+    """Same for /projects: directory tags (own walk), limits, grace."""
+    actions = []
+    path = proj["path"]
+    b, i = require(path, "p")
+    for p in proj["projects"]:
+        check_project_dir(p)
+        bad, first = untagged(p["dir"], p["id"])
+        if bad:
+            actions.append((path, f"project -s {p['name']}", f"project {p['name']} directory tag",
+                            f"{bad} entr{'y' if bad == 1 else 'ies'} not in project {p['id']}, first: {first}"))
+    current = report(path, "p")
+    for p in proj["projects"]:
+        if current.get(p["id"]) != want(p):
+            actions.append((path, limit_cmd("p", p, str(p["id"])), f"project {p['name']} ({p['id']})",
+                            f"have {shown(current.get(p['id']))}, want {shown(want(p))}"))
+    target = days_text(proj["grace_s"])
+    if b != target or i != target:
+        have = f"have blocks [{b}] inodes [{i}], want [{target}]"
+        actions.append((path, f"timer -p -b {proj['grace_s']}", "project block grace", have))
+        actions.append((path, f"timer -p -i {proj['grace_s']}", "project inode grace", have))
+    return actions
+
+
+def plan(cfg):
+    """All sections (kept for callers that want one list)."""
+    return ((plan_home(cfg["home"]) if cfg.get("home") else [])
+            + (plan_projects(cfg["projects"]) if cfg.get("projects") else []))
+
+
+def apply(check, config=CONFIG):
+    try:
+        with open(config) as f:
+            cfg = json.load(f)
+    except FileNotFoundError:
+        if check:
+            raise NoDeclaration(config)
+        raise
+    errors, any_action = [], False
+    for name, planner in (("home", plan_home), ("projects", plan_projects)):
+        if not cfg.get(name):
+            continue
+        try:
+            if check and fstype(cfg[name]["path"]) is None:
+                # Only a verified absent share (nothing mounted there yet, e.g. before the
+                # preparation window) previews as "would apply"; another filesystem or a failed
+                # observation is an error, as when applying.
+                print(f"WOULD apply every declared {name} quota once {cfg[name]['path']} is mounted from its LV")
+                any_action = True
+                continue
+            actions = planner(cfg[name])
+            any_action = any_action or bool(actions)
+            for path, command, what, have in actions:
+                if check:
+                    print(f"WOULD {what}: xfs_quota -x -c '{command}' {path} ({have})")
+                else:
+                    xq(path, command)
+                    print(f"CHANGED {what}: {command}")
+            if actions and not check:
+                left = planner(cfg[name])      # read back: every setter must now show the declaration
+                for path, command, what, have in left:
+                    print(f"STILL DIFFERS {what} on {path}: {have}")
+                if left:
+                    raise RuntimeError(f"{len(left)} difference(s) remain after applying")
+        except (OSError, ValueError, RuntimeError, KeyError, TypeError, AttributeError) as err:
+            print(f"prace-quota-apply: {name}: {err}", file=sys.stderr)
+            errors.append(name)
+    if not any_action and not errors:
+        print("quotas match the declaration")
+    if errors:
+        raise RuntimeError(f"failed: {', '.join(errors)}")
+
+
+def main(argv):
+    args, config, check = list(argv), CONFIG, False
+    while args:
+        a = args.pop(0)
+        if a == "--check":
+            check = True
+        elif a == "--config" and args:
+            config = args.pop(0)
+        else:
+            print(__doc__.strip(), file=sys.stderr)
+            return 2
+    try:
+        apply(check, config)
+    except NoDeclaration:
+        print(f"prace-quota-apply: no declaration yet ({config}); nothing to preview")
+        return 3
+    except (OSError, ValueError, RuntimeError, KeyError, TypeError, AttributeError) as err:
+        print(f"prace-quota-apply: {err}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -1,0 +1,59 @@
+---
+# The shared job environment (T88; D42: core modules, CPU, GPU and two-node TCP MPI workflows).
+# The images already have Lmod 8.7.65, GCC 11.5 C/Fortran (no C++), OpenMPI 4.1.1 (UCX 1.19,
+# PMIx 3.2.3) and Python 3.9; GPU pods have the host's CUDA 12.9 (roles/slinky slinky_cuda_path).
+# Only the gaps are added: a C++ compiler unpacked into /apps, four modulefiles, examples, and the
+# profile snippet that puts /apps/modulefiles on MODULEPATH (the pods get it from the chart).
+# /apps is the login node's own LV, exported read-only (storage.yml): this role writes there only on
+# the login node, and only while /apps is mounted from that LV.
+apps_env_root: /apps
+apps_env_sw: "{{ apps_env_root }}/sw"
+apps_env_modulefiles: "{{ apps_env_root }}/modulefiles"
+apps_env_examples: "{{ apps_env_root }}/examples"
+# Every reviewed example file with its deployed mode: job scripts 0755, sources and the page 0644. Explicit,
+# because copy's `mode: preserve` followed the controller checkout: under a umask of 002 the examples
+# deployed group-writable (0775/0664), which a strict operator-ownership check rightly refuses. A file
+# added to files/examples without an entry here fails test-apps-env.py.
+apps_env_example_files:
+  README.md: "0644"
+  array.sh: "0755"
+  batch.sh: "0755"
+  gpu.sh: "0755"
+  hello.c: "0644"
+  hello.py: "0644"
+  hello_threads.cpp: "0644"
+  mpi_hello.c: "0644"
+  python.sh: "0755"
+  vector_add.cu: "0644"
+# Written only while the apps share is declared and not deferred (storage.yml); otherwise nothing
+apps_env_enabled: >-
+  {{ (storage_enable | default(true) | bool) and 'apps' not in (storage_defer | default([]))
+     and (storage_lvs | default([]) | selectattr('name', 'equalto', 'apps') | list | length > 0) }}
+# What /apps must be mounted from before anything is written ("" = any mount: the slurm bench's bind)
+apps_env_device: "/dev/mapper/{{ storage_vg | default('hpe_vg') }}-apps"
+apps_env_packages_dir: "{{ fleet_repo_dir | default('/srv/fleet-repo') }}/packages"
+# GCC with C++: the image's own version, unpacked (never installed) from these exact RPMs. Proven
+# relocatable in the unchanged slurmd image on 29 Sep for C++ with threads and OpenMPI mpicxx, but
+# only with libstdc++ in the set (the tree's libstdc++.so links to it). roles/fleet_repo downloads
+# them (tag apps_repo); a missing or different file stops the role (files/prace-apps-unpack.sh).
+apps_env_gcc:
+  module: "11.5"
+  version: 11.5.0-14.el9
+  rpms:
+    - {file: gcc-11.5.0-14.el9.x86_64.rpm, sha256: 0e4d6f4d055b8e3bf99d20319f934db15ade3f37c6e56512150af5022cfc16ee}
+    - {file: gcc-c++-11.5.0-14.el9.x86_64.rpm, sha256: df2be167c80052b729de2d439185c917dffe78d8f1b627619c6633a2f09b1161}
+    - {file: cpp-11.5.0-14.el9.x86_64.rpm, sha256: fea4e62dcf15758a9a05a09efa86198912e92e1decf54275beaa0aaa434ce1f1}
+    - {file: libstdc++-11.5.0-14.el9.x86_64.rpm, sha256: 6080972cc2696fede7a0538f0ecfb4d98c2dbb826cfa076d052e5c71034e447c}
+    - {file: libstdc++-devel-11.5.0-14.el9.x86_64.rpm, sha256: d0e7fedc403cdb51ea9b94b531b6a2365b8a2cb51bb2b9f74b9dd835605c2ee1}
+# Host-mounted in the GPU pods only; the module refuses with a message elsewhere. No CUDA unpack.
+apps_env_cuda: {module: "12.9", path: "{{ slinky_cuda_path | default('/usr/local/cuda-12.9') }}"}
+apps_env_openmpi: {module: "4.1", prefix: /usr/lib64/openmpi}
+apps_env_python: {module: "3.9", bin: /usr/bin/python3.9}
+# MPI over TCP on the pod network (no hostNetwork; the InfiniBand ring is deferred, D42): the
+# examples force ob1/tcp on this range, never an RDMA or UCX transport.
+apps_env_mpi_subnet: "{{ k3s_cluster_cidr | default('10.42.0.0/16') }}"
+# The profile snippet (files/prace-apps-profile.sh). Sorted after Lmod's own script, which defines
+# `module` (/etc/profile.d/modules.sh in the images; z00_lmod.sh where Lmod comes from EPEL). The
+# chart mounts the same file into the login and slurmd pods; a native worker (T89,
+# slurm_native_workers) gets it as a host file. Nothing else on a native worker.
+apps_env_profile: "/etc/profile.d/{{ slinky_apps_profile | default('z01-prace-apps.sh') }}"

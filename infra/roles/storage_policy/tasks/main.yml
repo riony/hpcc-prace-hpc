@@ -1,0 +1,129 @@
+---
+# storage_policy (D39 storage step): project directories and XFS quotas on the login node.
+# Runs after cluster_accounts (groups exist) and login_storage (shares mounted with quotas on).
+# Project directory = /projects/<group>: root:<group> 2770 (setgid), its ACL managed exactly
+# (default ACL so new files stay group-writable whatever the umask; no named grants); XFS
+# project ID = the group's GID.
+- name: Project groups exist in accounts.yml with GIDs in the project range
+  ansible.builtin.assert:
+    that:
+      - cluster_groups | selectattr('name', 'equalto', item.name) | list | length == 1
+      - (cluster_groups | selectattr('name', 'equalto', item.name) | first).gid is ge 31001
+      - (cluster_groups | selectattr('name', 'equalto', item.name) | first).gid is le 31999
+    fail_msg: "project {{ item.name }} has no group in accounts.yml's 31001-31999 range"
+    quiet: true
+  loop: "{{ storage_projects }}"
+  loop_control: {label: "{{ item.name }}"}
+
+- name: Quota helper
+  ansible.builtin.copy:
+    src: prace-quota-apply
+    dest: /usr/local/sbin/prace-quota-apply
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Project directories
+  when: "'projects' not in storage_defer"
+  block:
+    - name: XFS project map (path) for the declared projects
+      ansible.builtin.copy:
+        dest: /etc/projects
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          {% for p in storage_projects %}
+          {{ (cluster_groups | selectattr('name', 'equalto', p.name) | first).gid }}:/projects/{{ p.name }}
+          {% endfor %}
+
+    - name: XFS project names
+      ansible.builtin.copy:
+        dest: /etc/projid
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          {% for p in storage_projects %}
+          {{ p.name }}:{{ (cluster_groups | selectattr('name', 'equalto', p.name) | first).gid }}
+          {% endfor %}
+
+    - name: /projects/<group>, setgid, group-owned
+      ansible.builtin.file:
+        path: "/projects/{{ item.name }}"
+        state: directory
+        owner: root
+        group: "{{ item.name }}"
+        mode: "2770"
+      loop: "{{ storage_projects }}"
+      loop_control: {label: "{{ item.name }}"}
+
+    - name: Project directories present (check mode may not have created them yet)
+      ansible.builtin.stat:
+        path: "/projects/{{ item.name }}"
+      register: sp_dirs
+      loop: "{{ storage_projects }}"
+      loop_control: {label: "{{ item.name }}"}
+
+    # The root's whole ACL (access + default) is reconciled, so an outsider's existing named
+    # grant is removed rather than kept; the old ACL is printed. Not recursive: ACLs users set
+    # below the root are theirs. The role's own copy runs, so check mode previews it too.
+    - name: Project root ACL exactly group rwx, nothing for others, same default (no named grants)
+      ansible.builtin.script: "prace-project-acl{{ ' --check' if ansible_check_mode else '' }} /projects/{{ item.name }}"
+      register: sp_acl
+      changed_when: "'CHANGED ' in sp_acl.stdout or 'WOULD ' in sp_acl.stdout"
+      check_mode: false          # --check previews without changing anything
+      loop: "{{ storage_projects }}"
+      loop_control: {label: "{{ item.name }}"}
+      when: >-
+        not ansible_check_mode or
+        (sp_dirs.results | selectattr('item.name', 'equalto', item.name) | first).stat.exists
+
+    - name: Project root ACLs reconciled (or that would be), with the ACL they had
+      ansible.builtin.debug:
+        msg: "{{ item.stdout_lines }}"
+      loop: "{{ sp_acl.results | selectattr('changed', 'defined') | selectattr('changed') | list }}"
+      loop_control: {label: "{{ item.item.name }}"}
+
+- name: Declared quotas
+  ansible.builtin.file:
+    path: /etc/prace-storage
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Quota declaration
+  ansible.builtin.template:
+    src: quotas.json.j2
+    dest: /etc/prace-storage/quotas.json
+    owner: root
+    group: root
+    mode: "0644"
+
+# The role's own copy: in check mode the installed helper may be missing or older.
+# The preview must see the declaration this run would install, not the one already there.
+- name: Quota declaration to preview (check mode; a scratch file under /run)
+  ansible.builtin.template:
+    src: quotas.json.j2
+    dest: /run/prace-storage-quotas.preview.json
+    owner: root
+    group: root
+    mode: "0600"
+  check_mode: false
+  changed_when: false
+  when: ansible_check_mode
+
+- name: Quotas (check)
+  ansible.builtin.script: prace-quota-apply --check --config /run/prace-storage-quotas.preview.json
+  register: sp_check
+  changed_when: "'WOULD ' in sp_check.stdout"
+  failed_when: sp_check.rc not in [0, 3]      # 3 = no declaration yet (first preview); others are errors
+  check_mode: false
+  when: ansible_check_mode
+
+- name: Quotas (apply differences only)
+  ansible.builtin.command: /usr/local/sbin/prace-quota-apply
+  register: sp_apply
+  changed_when: "'CHANGED ' in sp_apply.stdout"
+  when: not ansible_check_mode

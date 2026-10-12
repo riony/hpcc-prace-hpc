@@ -1,0 +1,117 @@
+---
+# The way back, on every link (ib_fabric_links does not narrow it): everything this role made, by
+# its own names, and each ring port reset to INIT, because an ACTIVE port keeps carrying verbs RDMA
+# without a subnet manager. Run it on every GPU node; a port whose link's manager still runs on a node
+# left out would be activated again, so the way back refuses --limit (tasks/gates.yml). Packages stay installed (inert); the stock
+# opensm.service stays masked; OpenSM's logs stay as evidence. rdma-core itself loads ib_umad and
+# ib_ipoib at every boot, with or without this role's module list.
+- name: Gated
+  ansible.builtin.include_tasks: gated.yml
+
+- name: The way back (a run started past the gates skips everything here)
+  when: ibf_gate_ok | bool
+  block:
+    - name: This node's OpenSM instances (any state)
+      ansible.builtin.command:
+        argv: [systemctl, list-units, --all, --type=service, --plain, --no-legend, 'prace-opensm@*']
+      register: ibf_units
+      changed_when: false
+      check_mode: false
+
+    - name: Each stopped and disabled unless already inactive and disabled (one in auto-restart is stopped too)
+      ansible.builtin.shell: |
+        set -eu
+        u={{ item | quote }}
+        if [ "$(systemctl is-active "$u" 2>/dev/null || true)" != inactive ] || [ "$(systemctl is-enabled "$u" 2>/dev/null || true)" = enabled ]; then
+          systemctl disable --now "$u"; echo "stopped $u"
+        fi
+      register: ibf_stop
+      changed_when: ibf_stop.stdout | length > 0
+      loop: "{{ ibf_units.stdout_lines | map('split') | map('first') | select('match', 'prace-opensm@[a-z0-9-]+[.]service$') | list }}"
+      when: not ansible_check_mode
+
+    - name: This role's OpenSM files
+      ansible.builtin.find:
+        paths: ["{{ ib_fabric_root }}etc/rdma"]
+        patterns: ["prace-opensm-*.conf", "prace-opensm-*.partitions", "prace-opensm-*.peer"]
+      register: ibf_sm_files
+
+    - name: Removed (configurations, partitions, the instance unit, the instance caches)
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop: >-
+        {{ ibf_sm_files.files | map(attribute='path') | list + [ib_fabric_root ~ 'etc/systemd/system/prace-opensm@.service',
+                                                                 ib_fabric_root ~ 'usr/libexec/prace-opensm-peer-check']
+           + (ring_links | default([]) | map(attribute='name') | map('regex_replace', '^', ib_fabric_root ~ 'var/cache/opensm/') | list) }}
+      register: ibf_sm_removed
+
+    - name: systemd forgets the unit
+      ansible.builtin.command: systemctl daemon-reload
+      when: ibf_sm_removed is changed and not ansible_check_mode
+
+    - name: This role's IPoIB connections
+      ansible.builtin.command:
+        argv: [nmcli, -g, NAME, connection, show]
+      register: ibf_conns
+      changed_when: false
+      check_mode: false
+
+    - name: Each deleted (address removed, device left to NetworkManager)
+      ansible.builtin.command:
+        argv: [nmcli, connection, delete, id, "{{ item }}"]
+      loop: "{{ ibf_conns.stdout_lines | select('match', 'prace-ring-[a-z0-9-]+$') | list }}"
+      when: not ansible_check_mode
+
+    - name: Their keyfiles
+      ansible.builtin.find:
+        paths: ["{{ ib_fabric_root }}etc/NetworkManager/system-connections"]
+        patterns: ["prace-ring-*.nmconnection"]
+      register: ibf_nm_files
+
+    - name: Removed
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop: "{{ ibf_nm_files.files | map(attribute='path') | list }}"
+
+    - name: The ring zone
+      ansible.builtin.file:
+        path: "{{ ib_fabric_root }}etc/firewalld/zones/{{ ib_fabric_zone }}.xml"
+        state: absent
+      register: ibf_zone_removed
+
+    - name: firewalld forgets it
+      ansible.builtin.command: firewall-cmd --reload
+      when: ibf_zone_removed is changed and not ansible_check_mode
+
+    - name: The role's module list
+      ansible.builtin.file:
+        path: "{{ ib_fabric_root }}etc/modules-load.d/prace-ib-fabric.conf"
+        state: absent
+
+    - name: Report (which ring ports are still ACTIVE)
+      ansible.builtin.include_tasks: report.yml
+
+    - name: Each ACTIVE ring port reset; with no subnet manager its link retrains to INIT (ibportstate, local port)
+      ansible.builtin.command:
+        argv: [ibportstate, -C, "{{ item.ca }}", -P, "{{ item.port }}", -D, "0", "{{ item.port }}", reset]
+      loop: >-
+        {{ ibf_now.ports | selectattr('guid', 'in', ib_ring_ports | default([]) | map(attribute='guid') | list)
+           | selectattr('state', 'equalto', 4) | list }}
+      loop_control: {label: "{{ item.ca }}/{{ item.port }} {{ item.guid }}"}
+      when: not ansible_check_mode
+
+    - name: Wait until every ring port of this node has retrained (LinkUp, INIT or ARMED; never ACTIVE or left Disabled)
+      ansible.builtin.script:
+        cmd: prace-ib-ports.py
+        executable: "{{ ib_fabric_helper_python }}"
+      register: ibf_wait
+      changed_when: false
+      until: >-
+        (ibf_wait.stdout | from_json).ports | selectattr('guid', 'in', ib_ring_ports | default([]) | map(attribute='guid') | list)
+          | selectattr('phys', 'equalto', 5) | selectattr('state', 'in', [2, 3]) | list | length
+        == ib_ring_ports | default([]) | length
+      retries: "{{ ib_fabric_active_retries }}"
+      delay: "{{ ib_fabric_active_delay }}"
+      when: not ansible_check_mode

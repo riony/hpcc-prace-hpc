@@ -1,0 +1,85 @@
+---
+# Read-only, before any change: the cabling, cards and daemons still match the plan. A present run
+# refuses on any doubt; the way back (absent) only warns, so it can always run.
+- name: Gated
+  ansible.builtin.include_tasks: gated.yml
+
+- name: Report (each linked port's neighbour is read now)
+  ansible.builtin.include_tasks: report.yml
+
+- name: Present only
+  when: ib_fabric_state == 'present'
+  block:
+    - name: Every ring port of this stage is here, on its PCI function, InfiniBand and linked (LinkUp)
+      ansible.builtin.assert:
+        that: >-
+          ibf_now.ports | selectattr('guid', 'equalto', item.guid) | selectattr('pci', 'equalto', item.pci)
+                        | selectattr('phys', 'equalto', 5) | list | length == 1
+        fail_msg: >-
+          {{ inventory_hostname }} {{ item.link }}: port {{ item.guid }} at {{ item.pci }} is not here and linked
+          ({{ ibf_now.ports | selectattr('guid', 'equalto', item.guid) | list }}).
+        quiet: true
+      loop: "{{ ibf_host.ports }}"
+      loop_control: {label: "{{ item.link }} {{ item.guid }}"}
+
+    - name: Each one's neighbour, read now, is the planned other end (a moved cable needs a new peer map)
+      ansible.builtin.assert:
+        that:
+          - (ibf_port.peer | default({}, true)).rc | default(1) == 0
+          - (ibf_port.peer | default({}, true)).port_guid | default('') == item.peer_guid
+          - "'channel adapter' in ((ibf_port.peer | default({}, true)).type | default('') | string | lower)"
+        fail_msg: >-
+          {{ inventory_hostname }} {{ item.link }} ({{ item.guid }}): its neighbour now is
+          {{ ibf_port.peer | default('unknown') }}, planned {{ item.peer_host }}'s {{ item.peer_guid }}.
+          Nothing is started on a cable that is not the mapped one (infiniband-diags must be installed: the
+          mapping window installs it).
+        quiet: true
+      vars:
+        ibf_port: "{{ ibf_now.ports | selectattr('guid', 'equalto', item.guid) | first }}"
+      loop: "{{ ibf_host.ports }}"
+      loop_control: {label: "{{ item.link }} {{ item.guid }}"}
+
+- name: Ports outside the ring and other subnet managers now
+  ansible.builtin.set_fact:
+    ibf_outside: >-
+      {{ ibf_now.ports | rejectattr('guid', 'in', ib_ring_ports | default([]) | map(attribute='guid') | list) | list }}
+    ibf_sm_doubt: >-
+      {{ ibf_now.stock_opensm == 'active' or ibf_now.opensm_procs != ibf_now.opensm_units | length
+         or (ib_fabric_state == 'present'
+             and ibf_now.opensm_units | difference(ibf_plan.full_sm_units.get(inventory_hostname, [])) | length > 0) }}
+
+- name: No port outside the ring is linked or addressed (an outside fabric must never get a subnet manager or IPoIB)
+  ansible.builtin.assert:
+    that:
+      - ibf_outside | selectattr('phys', 'equalto', 5) | list | length == 0
+      - ibf_outside | selectattr('phys', 'in', [1, 2, 3, 4, 5, 6, 7]) | list | length == ibf_outside | length
+      - ibf_outside | selectattr('ipv4') | list | length == 0
+      - ibf_now.ports | selectattr('ipv4', 'none') | list | length == 0
+    fail_msg: >-
+      {{ inventory_hostname }}: a port outside the ring is linked or addressed, or its physical state/addresses could not be read:
+      {{ ibf_outside | selectattr('phys', 'equalto', 5) | list + ibf_now.ports | selectattr('ipv4', 'none') | list }}.
+      Unplug it (or record why) before any fabric change.
+    quiet: true
+  when: ib_fabric_state == 'present'
+
+- name: No subnet manager but this role's (the stock opensm.service binds the first port it finds)
+  ansible.builtin.assert:
+    that: not ibf_sm_doubt | bool
+    fail_msg: >-
+      {{ inventory_hostname }}: stock opensm {{ ibf_now.stock_opensm }}, {{ ibf_now.opensm_procs }} opensm processes,
+      units {{ ibf_now.opensm_units }}; this node manages {{ (ibf_plan.full_sm_units | default({})).get(inventory_hostname, []) }}
+    quiet: true
+  when: ib_fabric_state == 'present'
+
+- name: The way back goes ahead regardless (warning)
+  ansible.builtin.debug:
+    msg: >-
+      WARNING {{ inventory_hostname }}: outside ports linked or addressed
+      {{ ibf_outside | selectattr('phys', 'equalto', 5) | list | map(attribute='guid') | list }};
+      opensm: stock {{ ibf_now.stock_opensm }}, {{ ibf_now.opensm_procs }} processes, units {{ ibf_now.opensm_units }}
+  when: >-
+    ib_fabric_state == 'absent' and (ibf_sm_doubt | bool or ibf_outside | selectattr('phys', 'equalto', 5) | list | length > 0)
+
+- name: Packages (read-only; every node of the stage before any change)
+  ansible.builtin.include_tasks: packages-check.yml
+  when: ib_fabric_state == 'present' and (ibf_host.ports | length > 0 or ibf_host.sm | length > 0)

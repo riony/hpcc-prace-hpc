@@ -1,0 +1,462 @@
+---
+# Managed by Ansible (roles/fleet_repo). Server on the login node, client everywhere else.
+- name: Server side (login node)
+  when: fleet_role == 'login'
+  block:
+    - name: EPEL (Rocky extras) and the tools to build and serve a repository
+      ansible.builtin.dnf:
+        name: [epel-release, httpd, createrepo_c, dnf-plugins-core, policycoreutils-python-utils]
+        state: present
+
+    - name: OpenHPC 3 release package, verified by its pinned hash
+      ansible.builtin.get_url:
+        url: "{{ fleet_ohpc_release_url }}"
+        dest: /var/tmp/ohpc-release.rpm
+        checksum: "sha256:{{ fleet_ohpc_release_sha256 }}"
+        mode: "0644"
+
+    - name: Install it (its own signature cannot be checked before its key exists; the hash was)
+      ansible.builtin.dnf:
+        name: /var/tmp/ohpc-release.rpm
+        state: present
+        disable_gpg_check: true
+
+    - name: Import the signing keys, each only if its fingerprint matches
+      ansible.builtin.rpm_key:
+        key: "/etc/pki/rpm-gpg/{{ item.file }}"
+        fingerprint: "{{ item.fingerprint }}"
+        state: present
+      loop: "{{ fleet_repo_keys }}"
+      loop_control: {label: "{{ item.file }}"}
+
+    - name: "Repository directories (SELinux: served by httpd)"
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop: ["{{ fleet_repo_dir }}", "{{ fleet_repo_dir }}/packages", "{{ fleet_repo_dir }}/keys"]
+
+    - name: SELinux label for the repository tree (added only if not already a local rule)
+      ansible.builtin.shell: |
+        spec='{{ fleet_repo_dir }}(/.*)?'
+        if semanage fcontext -l -C | grep -qF "$spec"; then echo present
+        else semanage fcontext -a -t httpd_sys_content_t "$spec" && echo added; fi
+      register: fr_fc
+      changed_when: "'added' in fr_fc.stdout"
+
+    - name: What to carry - every package of a fresh compute install, plus the cluster packages
+      ansible.builtin.set_fact:
+        fleet_repo_download: "{{ (lookup('ansible.builtin.file', 'compute-baseline.txt').splitlines()
+                                  | reject('match', '^#') | select | list) + fleet_repo_packages }}"
+
+    - name: Download the package closure (signed RPMs; missing names fail the run)
+      ansible.builtin.command:
+        argv: "{{ ['dnf', '-y', '--enablerepo=crb', 'download', '--resolve', '--alldeps', '--arch=x86_64,noarch', '--destdir',
+                   fleet_repo_dir ~ '/packages'] + fleet_repo_download }}"
+      register: fr_dl
+      # dnf prints "[SKIPPED] <file>: Already downloaded" for every package it already has.
+      changed_when: fr_dl.stdout_lines | select('search', '\\.rpm') | reject('search', 'Already downloaded') | list | length > 0
+      when: not ansible_check_mode
+
+    - name: Verify every downloaded RPM's signature
+      ansible.builtin.shell: >-
+        rpm -K --nodigest {{ fleet_repo_dir }}/packages/*.rpm | grep -v ': signatures OK$' || true
+      register: fr_sig
+      changed_when: false
+      failed_when: fr_sig.stdout | length > 0
+      when: not ansible_check_mode
+
+    - name: Repository metadata
+      ansible.builtin.command: createrepo_c --update {{ fleet_repo_dir }}
+      changed_when: fr_dl is changed
+      when: not ansible_check_mode
+
+    - name: Signing keys for the clients (public keys only)
+      ansible.builtin.copy:
+        src: "/etc/pki/rpm-gpg/{{ item }}"
+        dest: "{{ fleet_repo_dir }}/keys/{{ item }}"
+        remote_src: true
+        mode: "0644"
+      loop: "{{ fleet_repo_keys | map(attribute='file') | list }}"
+
+    - name: Apply SELinux labels
+      ansible.builtin.command: restorecon -R {{ fleet_repo_dir }}
+      register: fr_rc
+      changed_when: fr_rc.stdout | length > 0
+
+    - name: httpd serves the repository on the private address only
+      ansible.builtin.copy:
+        dest: /etc/httpd/conf.d/fleet-repo.conf
+        mode: "0644"
+        content: |
+          # Managed by Ansible (roles/fleet_repo): private network only.
+          Listen {{ admin_ip }}:80
+          Alias /fleet-repo {{ fleet_repo_dir }}
+          <Directory {{ fleet_repo_dir }}>
+            Options Indexes
+            Require ip {{ admin_network }}
+          </Directory>
+      notify: restart httpd
+
+    - name: Stock httpd must not listen on every address
+      ansible.builtin.lineinfile:
+        path: /etc/httpd/conf/httpd.conf
+        regexp: '^Listen 80$'
+        line: '#Listen 80   # disabled by roles/fleet_repo (private address only)'
+      notify: restart httpd
+
+    - name: httpd running
+      ansible.builtin.systemd:
+        name: httpd
+        state: started
+        enabled: true
+
+# NVIDIA packages for the GPU nodes: a separate step (tag gpu_repo) that downloads only the pinned
+# GPU set and its dependencies, so it never takes a fresh snapshot of everything else.
+- name: NVIDIA packages (login node)
+  when: fleet_role == 'login'
+  tags: [gpu_repo]
+  block:
+    - name: NVIDIA signing keys (fetched, then imported only if the fingerprint matches)
+      ansible.builtin.get_url:
+        url: "{{ item.key_url }}"
+        dest: "/etc/pki/rpm-gpg/{{ item.key }}"
+        mode: "0644"
+      loop: "{{ fleet_repo_nvidia_repos }}"
+      loop_control: {label: "{{ item.key }}"}
+    - name: Import them (fingerprint-checked)
+      ansible.builtin.rpm_key:
+        key: "/etc/pki/rpm-gpg/{{ item.key }}"
+        fingerprint: "{{ item.fingerprint }}"
+        state: present
+      loop: "{{ fleet_repo_nvidia_repos }}"
+      loop_control: {label: "{{ item.key }}"}
+    - name: NVIDIA repositories, disabled by default (enabled only for this download)
+      ansible.builtin.copy:
+        dest: "/etc/yum.repos.d/{{ item.name }}.repo"
+        mode: "0644"
+        content: |
+          # Managed by Ansible (roles/fleet_repo): used only to download pinned GPU packages.
+          [{{ item.name }}]
+          name={{ item.name }}
+          baseurl={{ item.baseurl }}
+          enabled=0
+          gpgcheck=1
+          gpgkey=file:///etc/pki/rpm-gpg/{{ item.key }}
+          module_hotfixes=1
+      loop: "{{ fleet_repo_nvidia_repos }}"
+      loop_control: {label: "{{ item.name }}"}
+    - name: Download the pinned GPU set and its dependencies
+      ansible.builtin.command:
+        argv: "{{ ['dnf', '-y', '--enablerepo=crb,' ~ (fleet_repo_nvidia_repos | map(attribute='name') | join(',')),
+                   'download', '--resolve', '--alldeps', '--arch=x86_64,noarch', '--destdir', fleet_repo_dir ~ '/packages',
+                   'kernel-devel-' ~ nvidia_kernel, 'kernel-devel-matched-' ~ nvidia_kernel]
+                 + nvidia_build_packages + nvidia_gpu_packages }}"
+      register: fr_gpu_dl
+      changed_when: fr_gpu_dl.stdout_lines | select('search', '\\.rpm') | reject('search', 'Already downloaded') | list | length > 0
+      when: not ansible_check_mode
+    - name: Verify every RPM's signature (NVIDIA keys included)
+      ansible.builtin.shell: >-
+        rpm -K --nodigest {{ fleet_repo_dir }}/packages/*.rpm | grep -v ': signatures OK$' || true
+      register: fr_gpu_sig
+      changed_when: false
+      failed_when: fr_gpu_sig.stdout | length > 0
+      when: not ansible_check_mode
+    - name: Repository metadata
+      ansible.builtin.command: createrepo_c --update {{ fleet_repo_dir }}
+      changed_when: fr_gpu_dl is changed
+      when: not ansible_check_mode
+    - name: NVIDIA public keys for the GPU nodes
+      ansible.builtin.copy:
+        src: "/etc/pki/rpm-gpg/{{ item.key }}"
+        dest: "{{ fleet_repo_dir }}/keys/{{ item.key }}"
+        remote_src: true
+        mode: "0644"
+      loop: "{{ fleet_repo_nvidia_repos }}"
+      loop_control: {label: "{{ item.key }}"}
+    - name: SELinux labels for the new files
+      ansible.builtin.command: restorecon -R {{ fleet_repo_dir }}
+      register: fr_gpu_rc
+      changed_when: fr_gpu_rc.stdout | length > 0
+
+# The job environment's GCC set (T88): exact files only, its own step (tag apps_repo), so it never
+# takes a fresh snapshot of everything else. Superseded files may need the Rocky vault.
+- name: Job environment packages (login node)
+  when: fleet_role == 'login'
+  tags: [apps_repo]
+  block:
+    - name: Download the exact GCC set (no dependencies; a missing version fails the run)
+      ansible.builtin.command:
+        argv: "{{ ['dnf', '-y', 'download', '--arch=x86_64', '--destdir', fleet_repo_dir ~ '/packages'] + fleet_repo_apps_packages }}"
+      register: fr_apps_dl
+      changed_when: fr_apps_dl.stdout_lines | select('search', '\\.rpm') | reject('search', 'Already downloaded') | list | length > 0
+      when: not ansible_check_mode
+    # A loop, not regex_replace with a backreference: on 4 Oct the pinned Ansible kept '\\1' literal and
+    # rpm -K was given five copies of packages/\\1.rpm (it failed closed). A missing file fails too.
+    - name: Verify their signatures
+      ansible.builtin.shell: >-
+        rpm -K --nodigest{% for p in fleet_repo_apps_packages %} {{ fleet_repo_dir }}/packages/{{ p }}.rpm{% endfor %} 2>&1
+        | grep -v ': signatures OK$' || true
+      register: fr_apps_sig
+      changed_when: false
+      failed_when: fr_apps_sig.stdout | length > 0
+      when: not ansible_check_mode
+    - name: Repository metadata
+      ansible.builtin.command: createrepo_c --update {{ fleet_repo_dir }}
+      changed_when: fr_apps_dl is changed
+      when: not ansible_check_mode
+    - name: SELinux labels for the new files
+      ansible.builtin.command: restorecon -R {{ fleet_repo_dir }}
+      register: fr_apps_rc
+      changed_when: fr_apps_rc.stdout | length > 0
+
+# Deferred packages (D42, roles/apptainer): exact files only, their own step, run only on request
+# (--tags extra_repo, or the role's tag repo; never in a full converge). The signature check names
+# each file in a loop (the 4 Oct apps_repo lesson: no regex_replace).
+- name: Deferred packages (login node)
+  when: fleet_role == 'login'
+  tags: [extra_repo, never]
+  block:
+    - name: Download the exact files (no dependency resolution; a missing version fails the run)
+      ansible.builtin.command:
+        argv: "{{ ['dnf', '-y', 'download', '--arch=x86_64', '--destdir', fleet_repo_dir ~ '/packages']
+                  + (fleet_repo_extra_packages | map(attribute='nevra') | list) }}"
+      register: fr_extra_dl
+      changed_when: fr_extra_dl.stdout_lines | select('search', '\\.rpm') | reject('search', 'Already downloaded') | list | length > 0
+      when: not ansible_check_mode
+    - name: Their sha256
+      ansible.builtin.stat:
+        path: "{{ fleet_repo_dir }}/packages/{{ item.nevra }}.rpm"
+        checksum_algorithm: sha256
+      loop: "{{ fleet_repo_extra_packages }}"
+      loop_control: {label: "{{ item.nevra }}"}
+      register: fr_extra_sum
+      when: not ansible_check_mode
+    - name: Each file is the pinned one
+      ansible.builtin.assert:
+        that: item.stat.exists and item.stat.checksum == item.item.sha256
+        fail_msg: "{{ item.item.nevra }}.rpm is not the pinned file (sha256 {{ item.stat.checksum | default('absent') }})"
+        quiet: true
+      loop: "{{ fr_extra_sum.results }}"
+      loop_control: {label: "{{ item.item.nevra }}"}
+      when: not ansible_check_mode
+    - name: Their signatures
+      ansible.builtin.shell: >-
+        rpm -K --nodigest{% for p in fleet_repo_extra_packages %} {{ fleet_repo_dir }}/packages/{{ p.nevra }}.rpm{% endfor %} 2>&1
+        | grep -v ': signatures OK$' || true
+      register: fr_extra_sig
+      changed_when: false
+      failed_when: fr_extra_sig.stdout | length > 0
+      when: not ansible_check_mode
+    - name: Repository metadata
+      ansible.builtin.command: createrepo_c --update {{ fleet_repo_dir }}
+      changed_when: fr_extra_dl is changed
+      when: not ansible_check_mode
+    - name: SELinux labels for the new files
+      ansible.builtin.command: restorecon -R {{ fleet_repo_dir }}
+      register: fr_extra_rc
+      changed_when: fr_extra_rc.stdout | length > 0
+
+# A native worker's job environment (T89 with T88; Session A review R4): the slurmd image's builds
+# (slurm_native_runtime_packages, group_vars all/slurm.yml) and their dependencies, its own step (tag
+# native_repo), only while a worker is native, so it never refreshes the rest of the snapshot.
+- name: Native worker job environment (login node)
+  when: fleet_role == 'login' and (slurm_native_workers | default([]) | length > 0)
+  tags: [native_repo]
+  block:
+    - name: Download the exact builds and their dependencies (a missing build fails the run)
+      ansible.builtin.command:
+        argv: "{{ ['dnf', '-y', '--enablerepo=crb', 'download', '--resolve', '--alldeps', '--arch=x86_64,noarch', '--destdir',
+                   fleet_repo_dir ~ '/packages'] + slurm_native_runtime_packages }}"
+      register: fr_native_dl
+      changed_when: fr_native_dl.stdout_lines | select('search', '\\.rpm') | reject('search', 'Already downloaded') | list | length > 0
+      when: not ansible_check_mode
+    - name: Verify every RPM's signature
+      ansible.builtin.shell: >-
+        rpm -K --nodigest {{ fleet_repo_dir }}/packages/*.rpm | grep -v ': signatures OK$' || true
+      register: fr_native_sig
+      changed_when: false
+      failed_when: fr_native_sig.stdout | length > 0
+      when: not ansible_check_mode
+    - name: Repository metadata
+      ansible.builtin.command: createrepo_c --update {{ fleet_repo_dir }}
+      changed_when: fr_native_dl is changed
+      when: not ansible_check_mode
+    - name: SELinux labels for the new files
+      ansible.builtin.command: restorecon -R {{ fleet_repo_dir }}
+      register: fr_native_rc
+      changed_when: fr_native_rc.stdout | length > 0
+
+# BeeGFS (roles/beegfs; deferred under D42): its own repository beside the fleet repository, exactly
+# the pinned files (fleet_repo_beegfs_packages), each fetched by its upstream path and kept only if its
+# sha256 matches. Never in a full converge: only --tags beegfs_repo (or the role's tag, repo), in a storage window.
+- name: BeeGFS repository (login node)
+  when: fleet_role == 'login'
+  tags: [beegfs_repo, never]
+  block:
+    - name: Every pin is an exact file (NEVRA, a known source, a relative path, a sha256)
+      ansible.builtin.assert:
+        that:
+          - item.nevra is match('^[A-Za-z0-9._+-]+-[0-9]+:[0-9][A-Za-z0-9._+~^]*-[A-Za-z0-9._+~^]+[.](x86_64|noarch)$')
+          - item.source in fleet_repo_beegfs_sources
+          - item.path is match('^[A-Za-z0-9._/+-]+[.]rpm$') and '..' not in item.path
+          - item.sha256 is match('^[0-9a-f]{64}$')
+          - not item.nevra.startswith('libbeegfs-ib-')
+        fail_msg: "{{ item.nevra }}: not an exact pin (or RDMA support, refused under D43)"
+        quiet: true
+      loop: "{{ fleet_repo_beegfs_packages }}"
+      loop_control: {label: "{{ item.nevra }}"}
+
+    - name: Its directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop: ["{{ fleet_repo_beegfs_dir }}", "{{ fleet_repo_beegfs_dir }}/packages", "{{ fleet_repo_beegfs_dir }}/keys"]
+
+    - name: SELinux label for its tree (added only if not already a local rule)
+      ansible.builtin.shell: |
+        spec='{{ fleet_repo_beegfs_dir }}(/.*)?'
+        if semanage fcontext -l -C | grep -qF "$spec"; then echo present
+        else semanage fcontext -a -t httpd_sys_content_t "$spec" && echo added; fi
+      register: fr_bg_fc
+      changed_when: "'added' in fr_bg_fc.stdout"
+
+    - name: BeeGFS signing key (fetched, then imported only if the fingerprint matches)
+      ansible.builtin.get_url:
+        url: "{{ fleet_repo_beegfs_key.url }}"
+        dest: "/etc/pki/rpm-gpg/{{ fleet_repo_beegfs_key.file }}"
+        checksum: "sha256:{{ fleet_repo_beegfs_key.sha256 }}"
+        mode: "0644"
+
+    - name: Import it (fingerprint-checked; also lets rpm -K check the files on this host)
+      ansible.builtin.rpm_key:
+        key: "/etc/pki/rpm-gpg/{{ fleet_repo_beegfs_key.file }}"
+        fingerprint: "{{ fleet_repo_beegfs_key.fingerprint }}"
+        state: present
+
+    - name: Fetch each pinned file by its upstream path (kept only if its sha256 matches)
+      ansible.builtin.get_url:
+        url: "{{ fleet_repo_beegfs_sources[item.source] }}/{{ item.path }}"
+        dest: "{{ fleet_repo_beegfs_dir }}/packages/{{ item.path | basename }}"
+        checksum: "sha256:{{ item.sha256 }}"
+        mode: "0644"
+      loop: "{{ fleet_repo_beegfs_packages }}"
+      loop_control: {label: "{{ item.nevra }}"}
+      register: fr_bg_dl
+
+    - name: Files in the repository
+      ansible.builtin.find:
+        paths: "{{ fleet_repo_beegfs_dir }}/packages"
+        file_type: any
+        hidden: true
+      register: fr_bg_files
+
+    - name: Nothing but the pinned files (a stray or leftover file is refused, never served)
+      ansible.builtin.assert:
+        that: >-
+          fr_bg_files.files | map(attribute='path') | map('basename') | sort
+          == fleet_repo_beegfs_packages | map(attribute='path') | map('basename') | sort
+        fail_msg: >-
+          {{ fleet_repo_beegfs_dir }}/packages holds
+          {{ fr_bg_files.files | map(attribute='path') | map('basename') | difference(fleet_repo_beegfs_packages | map(attribute='path') | map('basename')) }}
+          beyond the pins: remove them in a window (pins are renewed by a reviewed change, never loosened)
+        quiet: true
+      when: not ansible_check_mode
+
+    # A loop of exact paths, no regex_replace with a backreference (4 Oct: the pinned Ansible kept \\1 literal).
+    - name: Their signatures (BeeGFS and Rocky keys) and NEVRAs
+      ansible.builtin.shell: >-
+        {% for p in fleet_repo_beegfs_packages %}
+        f={{ (fleet_repo_beegfs_dir ~ '/packages/' ~ (p.path | basename)) | quote }};
+        rpm -K "$f" 2>&1 | grep -v ': digests signatures OK$';
+        n=$(rpm -qp --qf '%{NAME}-%{EPOCHNUM}:%{VERSION}-%{RELEASE}.%{ARCH}' "$f" 2>&1);
+        [ "$n" = {{ p.nevra | quote }} ] || echo "$f is $n, pinned {{ p.nevra }}";
+        {% endfor %}
+        true
+      register: fr_bg_sig
+      changed_when: false
+      failed_when: fr_bg_sig.stdout | length > 0
+      when: not ansible_check_mode
+
+    - name: Its own metadata (only these files)
+      ansible.builtin.command: createrepo_c --update {{ fleet_repo_beegfs_dir }}
+      changed_when: fr_bg_dl is changed
+      when: not ansible_check_mode
+
+    - name: The public key for the hosts
+      ansible.builtin.copy:
+        src: "/etc/pki/rpm-gpg/{{ fleet_repo_beegfs_key.file }}"
+        dest: "{{ fleet_repo_beegfs_dir }}/keys/{{ fleet_repo_beegfs_key.file }}"
+        remote_src: true
+        mode: "0644"
+
+    - name: SELinux labels for the new files
+      ansible.builtin.command: restorecon -R {{ fleet_repo_beegfs_dir }}
+      register: fr_bg_rc
+      changed_when: fr_bg_rc.stdout | length > 0
+
+    - name: httpd serves it on the private address only (fleet-repo.conf holds the Listen)
+      ansible.builtin.copy:
+        dest: /etc/httpd/conf.d/fleet-repo-beegfs.conf
+        mode: "0644"
+        content: |
+          # Managed by Ansible (roles/fleet_repo, tag beegfs_repo): private network only.
+          Alias /fleet-repo-beegfs {{ fleet_repo_beegfs_dir }}
+          <Directory {{ fleet_repo_beegfs_dir }}>
+            Options Indexes
+            Require ip {{ admin_network }}
+          </Directory>
+      notify: restart httpd
+
+- name: Client side (every other node)
+  when: fleet_role != 'login'
+  block:
+    - name: Signing keys from the login node
+      ansible.builtin.get_url:
+        url: "{{ fleet_repo_url }}/keys/{{ item.file }}"
+        dest: "/etc/pki/rpm-gpg/{{ item.file }}"
+        mode: "0644"
+      loop: "{{ fleet_repo_keys }}"
+      loop_control: {label: "{{ item.file }}"}
+
+    - name: Import them, each only if its fingerprint matches (the login node is not trusted blindly)
+      ansible.builtin.rpm_key:
+        key: "/etc/pki/rpm-gpg/{{ item.file }}"
+        fingerprint: "{{ item.fingerprint }}"
+        state: present
+      loop: "{{ fleet_repo_keys }}"
+      loop_control: {label: "{{ item.file }}"}
+
+    - name: The fleet repository (signature-checked)
+      ansible.builtin.copy:
+        dest: /etc/yum.repos.d/fleet.repo
+        mode: "0644"
+        content: |
+          # Managed by Ansible (roles/fleet_repo): served by the login node on the private network.
+          [fleet]
+          name=PRACE fleet repository
+          baseurl={{ fleet_repo_url }}/
+          enabled=1
+          gpgcheck=1
+          gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-Rocky-9 file:///etc/pki/rpm-gpg/RPM-GPG-KEY-EPEL-9 file:///etc/pki/rpm-gpg/RPM-GPG-KEY-OpenHPC-3
+          # The repository grows as roles add packages; do not trust day-old metadata.
+          metadata_expire=60
+
+    - name: Upstream repositories are unreachable from the private network; disable them
+      ansible.builtin.shell: |
+        set -e
+        changed=0
+        for f in /etc/yum.repos.d/rocky*.repo; do
+          [ -e "$f" ] || continue
+          if grep -q '^enabled=1' "$f"; then sed -i 's/^enabled=1/enabled=0/' "$f"; changed=1; fi
+        done
+        echo "changed=$changed"
+      register: fr_off
+      changed_when: "'changed=1' in fr_off.stdout"
+
+    - name: Bring the node to the repository's snapshot (consistent versions, security updates)
+      ansible.builtin.command: dnf -y --refresh upgrade
+      register: fr_up
+      changed_when: "'Nothing to do' not in fr_up.stdout"
+      when: not ansible_check_mode

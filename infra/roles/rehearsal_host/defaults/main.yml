@@ -1,0 +1,16 @@
+---
+# Rehearsal host on the login node (user decision 28 Sep): QEMU/KVM VMs for the isolated restore
+# rehearsal and the fresh-deployment rehearsal, off the memory-constrained workstation.
+# Plain QEMU with localhost-only virtual networking (no libvirt, no bridges, no taps), run as an
+# unprivileged user whose host-side traffic is confined by an nftables table of its own.
+rehearsal_user: prace-rehearsal
+rehearsal_dir: /var/lib/prace-rehearsal
+rehearsal_lv: {vg: hpe_vg, name: rehearsal, size: 400g}
+rehearsal_packages: [qemu-kvm, qemu-img, edk2-ovmf]
+# Memory the VMs may never eat into: the live control plane (K3s, Slinky, MariaDB, NFS) first.
+rehearsal_reserve_mib: 65536
+# Destinations the rehearsal user's processes (QEMU user-mode networking) may not reach: the live
+# fleet, BMCs, campus and every other private/special range. Public internet stays reachable for
+# downloads only when a rehearsal VM is started with egress; the restore rehearsal has none.
+rehearsal_blocked_v4: [10.0.0.0/8, 198.51.100.0/12, 198.18.0.0/16, 198.51.100.0/10, 169.254.0.0/16, 192.0.2.53/16]
+rehearsal_allowed_v4: [192.0.2.53, 192.0.2.53, 192.0.2.53]   # campus DNS resolvers only (port 53)

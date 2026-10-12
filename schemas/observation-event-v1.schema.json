@@ -1,0 +1,120 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://prace-hpc.invalid/schemas/observation-event-v1.schema.json",
+  "title": "PRACE-HPC trusted observation event v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "event_type",
+    "run_id",
+    "sequence",
+    "timestamp",
+    "source",
+    "phase",
+    "scenario",
+    "check_id",
+    "target",
+    "observation"
+  ],
+  "properties": {
+    "schema": {
+      "const": "prace.observation-event.v1"
+    },
+    "event_type": {
+      "const": "observation"
+    },
+    "run_id": {
+      "$ref": "#/$defs/name"
+    },
+    "sequence": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "source": {
+      "const": "trusted_validator"
+    },
+    "phase": {
+      "enum": [
+        "baseline",
+        "attack",
+        "record",
+        "patched",
+        "replay",
+        "regression",
+        "cleanup",
+        "reset"
+      ]
+    },
+    "scenario": {
+      "$ref": "#/$defs/scenario"
+    },
+    "check_id": {
+      "$ref": "#/$defs/name"
+    },
+    "target": {
+      "$ref": "#/$defs/name"
+    },
+    "observation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "code",
+        "evidence_sha256",
+        "detail"
+      ],
+      "properties": {
+        "status": {
+          "enum": [
+            "pass",
+            "fail",
+            "error",
+            "not_run"
+          ]
+        },
+        "code": {
+          "$ref": "#/$defs/name"
+        },
+        "evidence_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "detail": {
+          "type": "string",
+          "maxLength": 300
+        }
+      }
+    }
+  },
+  "$defs": {
+    "name": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "scenario": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "version"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/name"
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    }
+  }
+}

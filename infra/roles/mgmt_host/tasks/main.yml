@@ -1,0 +1,180 @@
+---
+# mgmt_host: the project's management/GitLab VM (mgmt-git01). Deliberately NOT a lab
+# node: it has its own inventory (inventories/mgmt), no private_net and no lab
+# defaults. Teammates use GitLab (web/API/git); only named admins get a shell, and
+# agents never get a shell or sudo here.
+#
+# Required host_vars:
+#   mgmt_hostname           static hostname (e.g. mgmt-git01)
+#   mgmt_break_glass_user   local account kept for break-glass (admin); must already exist
+#   mgmt_controller_pubkey  controller public key, installed for root and the break-glass user
+#   mgmt_admins             personal admin accounts: [{name: local-<person>, pubkey: "..."}];
+#                           pubkey may hold several keys, one per line (YAML "|").
+#                           local- prefix so they can never collide with AD first.last names
+#                           when the VM joins Centrify. Created with NO password (key-only);
+#                           each person sets their own password to enable sudo.
+#   sshd_password_users     accounts still allowed password SSH (exception list, may be [])
+#   gitlab_data_dir         real storage for /var/opt/gitlab, bind-mounted into place
+
+- name: Set the static hostname
+  ansible.builtin.hostname:
+    name: "{{ mgmt_hostname }}"
+
+- name: Resolve the hostname locally
+  ansible.builtin.lineinfile:
+    path: /etc/hosts
+    regexp: '^{{ ansible_host | regex_escape }}\s'
+    line: "{{ ansible_host }} {{ mgmt_hostname }}"
+
+- name: Read the default boot target
+  ansible.builtin.command: systemctl get-default
+  register: mh_target
+  changed_when: false
+  check_mode: false
+
+# Takes effect at the next boot; running desktop sessions are not stopped here.
+- name: Boot to the text console (server role; the GNOME desktop is not needed)
+  ansible.builtin.command: systemctl set-default multi-user.target
+  when: mh_target.stdout != 'multi-user.target'
+
+- name: Controller key for root and the break-glass account (existing keys are kept)
+  ansible.posix.authorized_key:
+    user: "{{ item }}"
+    key: "{{ mgmt_controller_pubkey }}"
+    state: present
+  loop:
+    - root
+    - "{{ mgmt_break_glass_user }}"
+
+- name: Personal admin accounts (wheel; key-only until the person sets a password)
+  ansible.builtin.user:
+    name: "{{ item.name }}"
+    groups: wheel
+    append: true
+    shell: /bin/bash
+  loop: "{{ mgmt_admins }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: Read existing accounts (check mode cannot key an account it has not created)
+  ansible.builtin.getent:
+    database: passwd
+
+- name: Personal admin keys
+  ansible.posix.authorized_key:
+    user: "{{ item.name }}"
+    key: "{{ item.pubkey }}"
+    state: present
+  loop: "{{ mgmt_admins }}"
+  loop_control:
+    label: "{{ item.name }}"
+  when: not ansible_check_mode or item.name in ansible_facts.getent_passwd
+
+# sshd keeps the FIRST value it reads. Drop-ins are included near the top of the main
+# file, before the installer's "PermitRootLogin yes" / "PasswordAuthentication yes",
+# so this file wins. A Match block must sit at the END of the main file.
+- name: SSH policy, validated before sshd is reloaded
+  block:
+    - name: Root key-only; no password logins
+      ansible.builtin.copy:
+        dest: /etc/ssh/sshd_config.d/00-prace-mgmt.conf
+        owner: root
+        group: root
+        mode: "0600"
+        content: |
+          # Managed by Ansible mgmt_host. Read before the main file's installer defaults.
+          PermitRootLogin prohibit-password
+          PasswordAuthentication no
+      notify: reload sshd
+
+    - name: Password-SSH exceptions (end of main file)
+      ansible.builtin.blockinfile:
+        path: /etc/ssh/sshd_config
+        marker: "# {mark} PRACE mgmt_host password-SSH exceptions"
+        insertafter: EOF
+        state: "{{ 'present' if sshd_password_users | length > 0 else 'absent' }}"
+        block: |
+          Match User {{ sshd_password_users | join(',') }}
+              PasswordAuthentication yes
+        validate: /usr/sbin/sshd -t -f %s
+      notify: reload sshd
+
+    - name: Validate the complete sshd configuration
+      ansible.builtin.command: /usr/sbin/sshd -t
+      changed_when: false
+      check_mode: false
+
+    - name: Read the effective policy for each account class
+      ansible.builtin.command: "/usr/sbin/sshd -T -C user={{ item }},host=probe,addr=192.0.2.1"
+      loop: "{{ (['root', mgmt_break_glass_user] + (mgmt_admins | map(attribute='name') | list) + sshd_password_users) | unique }}"
+      register: mh_sshd_eff
+      changed_when: false
+      check_mode: false
+
+    - name: Assert passwords only for the exception list and root key-only
+      ansible.builtin.assert:
+        that:
+          - ("passwordauthentication " ~ ("yes" if item.item in sshd_password_users else "no")) in item.stdout_lines
+          - item.item != 'root' or ("permitrootlogin without-password" in item.stdout_lines or "permitrootlogin prohibit-password" in item.stdout_lines)
+        fail_msg: "effective sshd policy for {{ item.item }} is wrong"
+        quiet: true
+      loop: "{{ mh_sshd_eff.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      when: not ansible_check_mode
+  rescue:
+    - name: Remove the SSH policy files again (the running sshd was never reloaded)
+      ansible.builtin.file:
+        path: /etc/ssh/sshd_config.d/00-prace-mgmt.conf
+        state: absent
+
+    - name: Remove the exception block again
+      ansible.builtin.blockinfile:
+        path: /etc/ssh/sshd_config
+        marker: "# {mark} PRACE mgmt_host password-SSH exceptions"
+        state: absent
+
+    - name: Stop here
+      ansible.builtin.fail:
+        msg: SSH policy failed validation; files reverted, sshd not reloaded.
+
+# GitLab keeps everything under /var/opt/gitlab. The root filesystem is only 70 GiB,
+# so the data lives on the large local /home filesystem and is bind-mounted into
+# place. The SELinux equivalence makes a relabel of /home give these files the
+# /var/opt/gitlab labels instead of home-directory labels.
+- name: Real storage directory for GitLab data
+  ansible.builtin.file:
+    path: "{{ gitlab_data_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Read local SELinux file-context equivalences
+  ansible.builtin.command: semanage fcontext -l -C
+  register: mh_fcontext
+  changed_when: false
+  check_mode: false
+
+- name: Label the data directory as if it were /var/opt/gitlab
+  ansible.builtin.command: "semanage fcontext -a -e /var/opt/gitlab {{ gitlab_data_dir }}"
+  when: (gitlab_data_dir ~ " = /var/opt/gitlab") not in mh_fcontext.stdout
+  register: mh_equiv
+
+- name: Apply the labels
+  ansible.builtin.command: "restorecon -R {{ gitlab_data_dir }}"
+  when: mh_equiv is changed
+
+- name: Mount point
+  ansible.builtin.file:
+    path: /var/opt/gitlab
+    state: directory
+    mode: "0755"
+
+- name: Bind-mount the data directory at /var/opt/gitlab (persistent)
+  ansible.posix.mount:
+    path: /var/opt/gitlab
+    src: "{{ gitlab_data_dir }}"
+    fstype: none
+    opts: bind,x-systemd.requires-mounts-for=/home
+    state: mounted

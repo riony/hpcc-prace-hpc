@@ -1,0 +1,154 @@
+---
+# Backing mounts of this host's ACTIVE items (recorded in fstab by UUID; see prepare.yml), each over
+# an immutable empty mountpoint, with the identity marker at the root of the filesystem and the
+# BeeGFS store directory and numeric ID files under it. Marker, store directory and ID files are
+# written only during an authorised first use of that item; afterwards they are only checked, so
+# a wrong or missing one stops the run instead of being recreated.
+- name: Items whose first use is authorised in this run
+  ansible.builtin.set_fact:
+    bg_first_use_items: "{{ bg_confirm_items if bg_first_use_authorised | bool and not ansible_check_mode else [] }}"
+
+- name: Mountpoints (never followed through a symlink)
+  ansible.builtin.stat:
+    path: "{{ item.mount }}"
+    follow: false
+  register: bg_mp
+  loop: "{{ bg_backing }}"
+  loop_control: {label: "{{ item.mount }}"}
+
+- name: Mountpoints are directories (or absent)
+  ansible.builtin.assert:
+    that: not item.stat.exists or (item.stat.isdir and not item.stat.islnk)
+    fail_msg: "{{ item.item.mount }} exists and is not a directory"
+    quiet: true
+  loop: "{{ bg_mp.results }}"
+  loop_control: {label: "{{ item.item.mount }}"}
+
+- name: Create absent mountpoints
+  ansible.builtin.file:
+    path: "{{ item.item.mount }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  loop: "{{ bg_mp.results | rejectattr('stat.exists') | list }}"
+  loop_control: {label: "{{ item.item.mount }}"}
+
+# As in roles/login_storage: if the filesystem is ever missing, nothing (root included) can create
+# a store directory in the directory underneath.
+- name: Immutable empty mountpoints underneath
+  ansible.builtin.shell: |
+    set -euo pipefail
+    p={{ item.mount | quote }}
+    r=0; src=$(findmnt -no SOURCE --mountpoint "$p" 2>&1) || r=$?
+    [ $r = 0 ] && { echo mounted; exit 0; }
+    [ $r = 1 ] && [ -z "$src" ] || { echo "findmnt $p failed: $src"; exit 3; }
+    l=$(ls -A "$p") || { echo "cannot list $p"; exit 3; }
+    [ -z "$l" ] || { echo "$p is not mounted and not empty"; exit 3; }
+    if lsattr -d "$p" | cut -d' ' -f1 | grep -q i; then echo immutable; else chattr +i "$p"; echo set; fi
+  args: {executable: /bin/bash}
+  register: bg_immutable
+  changed_when: "'set' in bg_immutable.stdout"
+  loop: "{{ bg_backing }}"
+  loop_control: {label: "{{ item.mount }}"}
+
+- name: Mount each from its recorded UUID
+  ansible.posix.mount:
+    path: "{{ item.mount }}"
+    src: "UUID={{ item.uuid }}"
+    fstype: "{{ item.fstype }}"
+    opts: "{{ beegfs_backing_mount_opts }}"
+    state: mounted
+    fstab: "{{ beegfs_fstab }}"
+  loop: "{{ bg_backing }}"
+  loop_control: {label: "{{ item.name }} {{ item.mount }}"}
+
+- name: Mounted from exactly that filesystem
+  ansible.builtin.command: findmnt -no UUID,FSTYPE --mountpoint {{ item.mount | quote }}
+  register: bg_mounted
+  changed_when: false
+  check_mode: false
+  failed_when: bg_mounted.stdout.split() != [item.uuid, item.fstype]
+  loop: "{{ bg_backing }}"
+  loop_control: {label: "{{ item.mount }}"}
+  when: not ansible_check_mode
+
+- name: Store directories
+  ansible.builtin.stat:
+    path: "{{ item.store }}"
+    follow: false
+  register: bg_store
+  loop: "{{ bg_backing }}"
+  loop_control: {label: "{{ item.store }}"}
+
+- name: A missing store directory is created only by its first use
+  ansible.builtin.assert:
+    that: >-
+      (item.stat.exists and item.stat.isdir and not item.stat.islnk)
+      or (not item.stat.exists and item.item.name in bg_first_use_items)
+    fail_msg: >-
+      {{ item.item.store }} is missing or not a directory on {{ item.item.name }}: refusing to create a new store
+      outside an armed, confirmed first use
+    quiet: true
+  loop: "{{ bg_store.results }}"
+  loop_control: {label: "{{ item.item.store }}"}
+  when: not ansible_check_mode
+
+- name: Create the store directory (first use)
+  ansible.builtin.file:
+    path: "{{ item.item.store }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  loop: "{{ bg_store.results | rejectattr('stat.exists') | selectattr('item.name', 'in', bg_first_use_items) | list }}"
+  loop_control: {label: "{{ item.item.store }}"}
+  register: bg_store_created
+
+- name: Items initialised in this run (their service starts once with first-run initialisation)
+  ansible.builtin.set_fact:
+    bg_initialised_now: "{{ bg_store_created.results | default([]) | selectattr('changed') | map(attribute='item.item.name') | list }}"
+
+- name: Marker and ID files
+  ansible.builtin.stat:
+    path: "{{ item.path }}"
+    follow: false
+  register: bg_files
+  loop: "{{ bg_backing_files }}"
+  loop_control: {label: "{{ item.path }}"}
+
+- name: A missing marker or ID file is written only by its first use
+  ansible.builtin.assert:
+    that: item.stat.exists or item.item.item in bg_first_use_items
+    fail_msg: "{{ item.item.path }} is missing: refusing to write identity outside an armed, confirmed first use"
+    quiet: true
+  loop: "{{ bg_files.results }}"
+  loop_control: {label: "{{ item.item.path }}"}
+  when: not ansible_check_mode
+
+- name: Write the marker and ID files (first use)
+  ansible.builtin.copy:
+    dest: "{{ item.item.path }}"
+    content: "{{ item.item.content }}"
+    owner: root
+    group: root
+    mode: "{{ item.item.mode }}"
+    force: false
+  loop: "{{ bg_files.results | rejectattr('stat.exists') | selectattr('item.item', 'in', bg_first_use_items) | list }}"
+  loop_control: {label: "{{ item.item.path }}"}
+
+- name: Read them back
+  ansible.builtin.slurp:
+    src: "{{ item.path }}"
+  register: bg_files_now
+  loop: "{{ bg_backing_files }}"
+  loop_control: {label: "{{ item.path }}"}
+  when: not ansible_check_mode
+
+- name: Each says exactly what this item is
+  ansible.builtin.assert:
+    that: (item.content | b64decode) == item.item.content
+    fail_msg: "{{ item.item.path }} says {{ item.content | b64decode | trim }}, expected {{ item.item.content | trim }}"
+    quiet: true
+  loop: "{{ bg_files_now.results | default([]) | selectattr('content', 'defined') | list }}"
+  loop_control: {label: "{{ item.item.path }}"}

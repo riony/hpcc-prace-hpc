@@ -1,0 +1,134 @@
+---
+# Managed by Ansible (roles/fleet_observer, from main.yml). T89: a native worker has no slurmd pod
+# for the login node's observer to read, so its host serves a READ-ONLY observation of itself
+# (files/prace-native-observe.py: the slurmd service, the host's share mounts as PID 1 sees them,
+# the transition marker, the key's owner and mode, configuration hashes) on its private address.
+# The login node's observer fetches it (the D43 endpoints' bounded GET) and the evaluator judges it.
+# No SSH credential and no sudo rule: the unit runs as a dynamic user with only
+# CAP_NET_BIND_SERVICE, on a privileged port, admitting the login node's private address only (a
+# native job shares this host's network namespace; it can neither read it nor answer in its place).
+# Not containment: root on this host controls what it reports.
+- name: A native worker serves its read-only observation
+  when: inventory_hostname in (slurm_native_workers | default([]))
+  vars:
+    fo_login_ip: "{{ hostvars[groups['login'][0]].admin_ip }}"
+    fo_native_url: "http://{{ admin_ip }}:{{ fleet_observer_native_port }}/v1/native-worker"
+  block:
+    - name: Observation script (read-only)
+      ansible.builtin.copy:
+        src: prace-native-observe.py
+        dest: /usr/local/sbin/prace-native-observe
+        owner: root
+        group: root
+        mode: "0755"
+      register: fo_native_script
+
+    - name: Its unit (a dynamic user, the private address, the login node only)
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/prace-native-observe.service
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          # Managed by Ansible (roles/fleet_observer, tasks/native.yml)
+          [Unit]
+          Description=Read-only native Slurm worker observation on the private network (T89)
+          After=network-online.target
+          Wants=network-online.target
+          [Service]
+          ExecStart=/usr/local/sbin/prace-native-observe serve --address {{ admin_ip }} --allow {{ fo_login_ip }}
+          DynamicUser=yes
+          AmbientCapabilities=CAP_NET_BIND_SERVICE
+          CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+          NoNewPrivileges=yes
+          ProtectSystem=strict
+          ProtectHome=yes
+          PrivateTmp=yes
+          PrivateDevices=yes
+          RestrictAddressFamilies=AF_UNIX AF_INET
+          IPAddressDeny=any
+          IPAddressAllow={{ fo_login_ip }}/32
+          MemoryMax=64M
+          TasksMax=8
+          Restart=on-failure
+          RestartSec=5
+          [Install]
+          WantedBy=multi-user.target
+      register: fo_native_unit
+
+    - name: Enabled and running (restarted when its script or unit changed)
+      ansible.builtin.systemd_service:
+        name: prace-native-observe.service
+        enabled: true
+        daemon_reload: "{{ fo_native_unit is changed }}"
+        state: "{{ 'restarted' if (fo_native_unit is changed or fo_native_script is changed) else 'started' }}"
+      when: not ansible_check_mode
+
+    - name: The login node reads this host through the endpoint
+      ansible.builtin.uri:
+        url: "{{ fo_native_url }}"
+        use_proxy: false
+        follow_redirects: none
+        return_content: true
+        timeout: 5
+      delegate_to: "{{ groups['login'][0] }}"
+      register: fo_native_endpoint
+      until: >-
+        fo_native_endpoint.status | default(0) == 200
+        and fo_native_endpoint.json.host | default('') == inventory_hostname
+        and fo_native_endpoint.json.errors | default(['missing']) == []
+      retries: 3
+      delay: 2
+      when: not ansible_check_mode
+
+    - name: The same observation as root on this host (rc 1 on any unreadable part)
+      ansible.builtin.command: /usr/local/sbin/prace-native-observe check
+      register: fo_native_root
+      changed_when: false
+      when: not ansible_check_mode
+
+    - name: The unprivileged endpoint reports the host's own mounts and boot, not its own namespace's
+      ansible.builtin.assert:
+        that:
+          - fo_native_endpoint.json.mounts == (fo_native_root.stdout | from_json).mounts
+          - fo_native_endpoint.json.boot_id == (fo_native_root.stdout | from_json).boot_id
+        fail_msg: "the endpoint's view differs from the host's: {{ fo_native_endpoint.json.mounts }}"
+        quiet: true
+      when: not ansible_check_mode
+
+    - name: Nobody else is admitted (asked from this host's own address, as a native job would)
+      ansible.builtin.uri:
+        url: "{{ fo_native_url }}"
+        use_proxy: false
+        follow_redirects: none
+        timeout: 3
+      register: fo_native_denied
+      failed_when: fo_native_denied.status | default(-1) == 200
+      when: not ansible_check_mode
+
+- name: A pod worker serves no native observation (removed after a rollback)
+  when: inventory_hostname not in (slurm_native_workers | default([]))
+  block:
+    - name: A former native observation's unit
+      ansible.builtin.stat:
+        path: /etc/systemd/system/prace-native-observe.service
+      register: fo_native_old
+
+    - name: Stopped and disabled
+      ansible.builtin.systemd_service:
+        name: prace-native-observe.service
+        state: stopped
+        enabled: false
+      when: fo_native_old.stat.exists and not ansible_check_mode
+
+    - name: Its unit and script removed
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop: [/etc/systemd/system/prace-native-observe.service, /usr/local/sbin/prace-native-observe]
+      register: fo_native_removed
+
+    - name: systemd forgets the unit
+      ansible.builtin.systemd_service:
+        daemon_reload: true
+      when: fo_native_removed is changed and not ansible_check_mode

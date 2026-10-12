@@ -1,0 +1,255 @@
+-- Managed by Ansible (roles/slinky, templates/job_submit.lua.j2). slurmctld's submit filter
+-- (JobSubmitPlugins=lua). root (uid 0) is exempt: operators' maintenance and restore jobs.
+-- 1. Every job names its project with -A/--account, like PBS -P on the production cluster (user
+--    decision, 29 Sep 2026); without this filter Slurm would silently charge the default account.
+--    Which accounts a user may name is Slurm's own check (AccountingStorageEnforce=associations);
+--    a user in no project has no association, so no job of theirs is accepted.
+-- 2. A GPU node's CPUs and memory go with its GPUs (owner decision 30 Sep 2026; bench probe 30 Sep:
+--    one-GPU or GPU-less jobs held whole V100 nodes, so three jobs of one user blocked all 24 GPUs).
+--    In gpu a job asks for at least one GPU, and a GPU job in gpu, debug or payg is rewritten to exactly
+--    {{ slinky_gpu_share.cpus }} CPUs and {{ slinky_gpu_share.mem_mib }} MiB per GPU, whatever CPUs or memory it named (owner decision 2 Oct 2026,
+--    production's rule; gpu_share below). The share is exact: Slurm allocates each node's tasks times
+--    CPUs per task and nothing more, so the tasks on a node must divide that node's share evenly
+--    (Session A review R1; bench, 2 Oct: rounding gave one GPU 3 CPUs, and a larger --mincpus or
+--    total minimum added no CPU but spread one-GPU --gres jobs over two nodes, each holding a GPU).
+--    A GPU job therefore runs on an exact number of nodes with its tasks spread evenly over them.
+--    With --exclusive Slurm allocates and counts every GPU of the node. A job without GPUs in debug or payg runs on CPU nodes (feature {{ slinky_cpu_feature }}) with at most
+--    {{ slinky_cpu_mib_per_cpu }} MiB per CPU, and is refused --mem=0 and --mem-per-cpu=0. Refused everywhere:
+--    --exclusive=user|mcs and --gpus-per-socket; in debug, --exclusive; for a job without GPUs, a
+--    --constraint or --prefer other than {{ slinky_cpu_feature }} (Slurm schedules on --prefer instead of --constraint
+--    when it can). A job naming its GPUs in several forms (--gpus with --gres, --gpus-per-node or
+--    --gpus-per-task) has the largest of them, never their sum (bench probe v2, 1 Oct 2026).
+-- 3. Users cannot change a queued job's size, partition, features, preference, QoS or account (cancel
+--    it and submit it again): an update would bypass 2 or 4 (bench probe: MinMemoryNode on a pending
+--    job; probe v2: Prefer and MinCPUsNode).
+-- 4. Pay per use (simulated, slinky_payg): a job in {{ slinky_payg.partition }} runs alone in that partition, with its
+--    project's credit QoS {{ slinky_payg.qos_prefix }}<project>, which the filter sets; that QoS is refused elsewhere.
+--    The node shares of 2 apply in {{ slinky_payg.partition }} as in debug (--exclusive allowed).
+
+local GPU_PARTITION = "gpu"
+local DEBUG_PARTITION = "debug"
+local PAYG_PARTITION = "{{ slinky_payg.partition }}"
+local PAYG_QOS_PREFIX = "{{ slinky_payg.qos_prefix }}"
+local CPUS_PER_GPU = {{ slinky_gpu_share.cpus }}
+local MIB_PER_GPU = {{ slinky_gpu_share.mem_mib }}
+local GPUS_PER_NODE = {{ slinky_gpus_per_node }}
+local CPU_FEATURE = "{{ slinky_cpu_feature }}"
+local CPU_MIB_PER_CPU = {{ slinky_cpu_mib_per_cpu }}
+
+local function set(v)
+   return v ~= nil and v ~= slurm.NO_VAL and v ~= slurm.NO_VAL16 and v ~= slurm.NO_VAL64
+end
+
+-- the GPU count in a TRES request list: "gres/gpu:2", "gres/gpu:v100:2" (comma separated)
+local function gpus_in(s)
+   local n = 0
+   for item in string.gmatch(s or "", "[^,]+") do
+      if string.match(item, "^gres[/:]gpu") then
+         n = n + (tonumber(string.match(item, ":(%d+)$")) or 1)
+      end
+   end
+   return n
+end
+
+local function refuse(msg, code)
+   slurm.log_user(msg)
+   return code or slurm.ESLURM_INVALID_GRES or slurm.ERROR
+end
+
+-- (gpus, cpus, memory MiB) the job asks for, from what it gave (0 memory: the partition default)
+local function size(job_desc)
+   local nodes = set(job_desc.min_nodes) and job_desc.min_nodes or 1
+   local tasks = set(job_desc.num_tasks) and job_desc.num_tasks or 1
+   local sockets = set(job_desc.sockets_per_node) and job_desc.sockets_per_node or 1
+   -- Slurm meets every form of a GPU request at once (--gpus=1 --gres=gpu:1 is one GPU): the job
+   -- has at least the largest of them, never their sum (bench probe v2, 1 Oct)
+   local gpus = math.max(gpus_in(job_desc.tres_per_job), gpus_in(job_desc.tres_per_node) * nodes,
+                         gpus_in(job_desc.tres_per_task) * tasks, gpus_in(job_desc.tres_per_socket) * nodes * sockets)
+   local per_task = set(job_desc.cpus_per_task) and job_desc.cpus_per_task or 1
+   local cpus = math.max(set(job_desc.min_cpus) and job_desc.min_cpus or 0, per_task * tasks,
+                         (set(job_desc.pn_min_cpus) and job_desc.pn_min_cpus or 0) * nodes,
+                         (tonumber(string.match(job_desc.cpus_per_tres or "", "gpu:(%d+)")) or 0) * gpus, 1)
+   local mem = 0
+   if set(job_desc.min_mem_per_node) then
+      mem = job_desc.min_mem_per_node * nodes
+   elseif set(job_desc.min_mem_per_cpu) then
+      mem = job_desc.min_mem_per_cpu * cpus
+   end
+   local per_gpu = tonumber(string.match(job_desc.mem_per_tres or "", "gpu:(%d+)"))
+   if per_gpu then
+      mem = math.max(mem, per_gpu * gpus)
+   end
+   return gpus, cpus, mem
+end
+
+-- the task counts that split n CPUs evenly: "1, 2 or 4"
+local function divisors(n)
+   local d = {}
+   for i = 1, n do
+      if n % i == 0 then d[#d + 1] = tostring(i) end
+   end
+   if #d == 1 then return d[1] end
+   return table.concat(d, ", ", 1, #d - 1) .. " or " .. d[#d]
+end
+
+-- Owner decision 2 Oct 2026, production's rule (PBS checklist C2/C3): a valid GPU request gets exactly
+-- its GPUs' share, {{ slinky_gpu_share.cpus }} CPUs and {{ slinky_gpu_share.mem_mib }} MiB per GPU, whatever CPUs or memory it named (--mem=0,
+-- --mem-per-cpu, --mincpus, -c, --cpus-per-gpu, --mem-per-gpu, a cpu entry in --tres-per-task are all
+-- replaced), on exactly its number of nodes (-N, else one), with its tasks spread evenly over them and
+-- each node's share split evenly among that node's tasks. Refused, with the reason: a node range;
+-- tasks or GPUs that do not spread evenly over the nodes; on several nodes, GPUs given only as a total
+-- (--gpus: Slurm need not spread it evenly); more GPUs per node than a node has; a node's task count
+-- that does not divide its share. nil when rewritten, else the reason.
+local function gpu_share(job_desc, gpus)
+   local nodes = set(job_desc.min_nodes) and job_desc.min_nodes or 1
+   if set(job_desc.max_nodes) and job_desc.max_nodes ~= 0 and job_desc.max_nodes ~= nodes then
+      return string.format("a GPU job runs on an exact number of nodes: give -N %d, not a range up to %d", nodes, job_desc.max_nodes)
+   end
+   local tasks = set(job_desc.num_tasks) and job_desc.num_tasks or nodes
+   if set(job_desc.ntasks_per_node) then tasks = math.max(tasks, job_desc.ntasks_per_node * nodes) end
+   if set(job_desc.ntasks_per_tres) then tasks = math.max(tasks, job_desc.ntasks_per_tres * gpus) end
+   if tasks % nodes ~= 0 then
+      return string.format("%d tasks do not spread evenly over %d nodes: give a multiple of %d tasks (or --ntasks-per-node)", tasks, nodes, nodes)
+   end
+   if gpus % nodes ~= 0 then
+      return string.format("%d GPU(s) do not spread evenly over %d nodes: give --gpus-per-node (or --gres=gpu:N) with -N", gpus, nodes)
+   end
+   if nodes > 1 and gpus_in(job_desc.tres_per_node) == 0 and gpus_in(job_desc.tres_per_task) == 0 then
+      return string.format("on %d nodes, give the GPUs per node (--gpus-per-node=N or --gres=gpu:N): Slurm need not spread --gpus evenly", nodes)
+   end
+   local per_node = math.floor(gpus / nodes)
+   if per_node > GPUS_PER_NODE then
+      return string.format("%d GPUs per node: a GPU node has %d", per_node, GPUS_PER_NODE)
+   end
+   local share = CPUS_PER_GPU * per_node
+   local node_tasks = math.floor(tasks / nodes)
+   if share % node_tasks ~= 0 then
+      return string.format("%d tasks per node with %d GPU(s) per node: the share of %d CPUs is split evenly among a node's tasks; " ..
+                           "use %s tasks per node, or more GPUs", node_tasks, per_node, share, divisors(share))
+   end
+   local per_task = math.floor(share / node_tasks)
+   -- a cpu entry in --tres-per-task would override -c: keep only its GPU entries
+   if job_desc.tres_per_task ~= nil and job_desc.tres_per_task ~= "" then
+      local kept = {}
+      for item in string.gmatch(job_desc.tres_per_task, "[^,]+") do
+         if not string.match(item, "^cpu[:=]") then kept[#kept + 1] = item end
+      end
+      job_desc.tres_per_task = table.concat(kept, ",")
+   end
+   job_desc.cpus_per_tres = ""
+   job_desc.mem_per_tres = ""
+   job_desc.min_nodes = nodes
+   job_desc.max_nodes = nodes
+   if nodes > 1 then job_desc.ntasks_per_node = node_tasks end
+   job_desc.cpus_per_task = per_task
+   job_desc.pn_min_cpus = share
+   job_desc.min_cpus = share * nodes
+   job_desc.min_mem_per_node = MIB_PER_GPU * per_node
+   return nil
+end
+
+-- nil when the job fits its partitions' node share (a GPU job rewritten to it), else the reason
+local function node_share(job_desc)
+   local parts = {}
+   for name in string.gmatch(job_desc.partition or "", "[^,]+") do parts[name] = true end
+   if not parts[GPU_PARTITION] and not parts[DEBUG_PARTITION] and not parts[PAYG_PARTITION] then
+      return nil
+   end
+   local where = job_desc.partition
+   if job_desc.shared == slurm.JOB_SHARED_USER or job_desc.shared == slurm.JOB_SHARED_MCS then
+      return "--exclusive=user/mcs is not allowed in " .. where
+   end
+   if parts[DEBUG_PARTITION] and job_desc.shared == slurm.JOB_SHARED_NONE then
+      return "--exclusive is not allowed in debug"
+   end
+   -- Slurm gave one GPU for --gpus-per-socket=1 on two sockets (bench probe v2): no reliable count
+   if gpus_in(job_desc.tres_per_socket) > 0 then
+      return "--gpus-per-socket is not allowed in " .. where .. ": give --gpus-per-node or --gres=gpu:N"
+   end
+   local gpus, cpus, mem = size(job_desc)
+   if gpus < 1 then
+      if parts[GPU_PARTITION] then
+         return "a job in gpu asks for GPUs (--gres=gpu:N or --gpus=N); CPU-only work goes to cpu or debug"
+      end
+      if job_desc.min_mem_per_node == 0 or job_desc.min_mem_per_cpu == 0 then
+         return "--mem=0 or --mem-per-cpu=0 (a node's whole memory) is not allowed in " .. where .. ": give --mem"
+      end
+      -- debug or payg without GPUs: CPU nodes only, with the CPU nodes' memory per CPU
+      if job_desc.features ~= nil and job_desc.features ~= "" and job_desc.features ~= CPU_FEATURE then
+         return "a " .. where .. " job without GPUs runs on CPU nodes: drop --constraint (" .. job_desc.features .. ")"
+      end
+      -- Slurm schedules on --prefer INSTEAD of --constraint when it can (bench probe v2: --prefer=gpu
+      -- put a job without GPUs on a V100 node)
+      if job_desc.prefer ~= nil and job_desc.prefer ~= "" and job_desc.prefer ~= CPU_FEATURE then
+         return "a " .. where .. " job without GPUs runs on CPU nodes: drop --prefer (" .. job_desc.prefer .. ")"
+      end
+      if mem > CPU_MIB_PER_CPU * cpus then
+         return string.format("%d MiB for %d CPU(s): at most %d MiB per CPU on CPU nodes; ask for more CPUs (-c) or less memory",
+                              mem, cpus, CPU_MIB_PER_CPU)
+      end
+      job_desc.features = CPU_FEATURE
+      return nil
+   end
+   if job_desc.shared == slurm.JOB_SHARED_NONE then
+      return nil          -- --exclusive in gpu: Slurm allocates and counts every GPU of the node
+   end
+   return gpu_share(job_desc, gpus)
+end
+
+-- the credit QoS: set for a payg job, refused for any other
+local function payg(job_desc)
+   local asked = job_desc.qos
+   local in_payg = false
+   for name in string.gmatch(job_desc.partition or "", "[^,]+") do
+      if name == PAYG_PARTITION then in_payg = true end
+   end
+   if in_payg then
+      if job_desc.partition ~= PAYG_PARTITION then
+         return refuse("a pay-per-use job runs in " .. PAYG_PARTITION .. " alone: -p " .. PAYG_PARTITION, slurm.ESLURM_INVALID_PARTITION_NAME)
+      end
+      local want = PAYG_QOS_PREFIX .. string.lower(job_desc.account)
+      if asked ~= nil and asked ~= "" and asked ~= want then
+         return refuse("a " .. PAYG_PARTITION .. " job is charged to its project's credits (" .. want .. "): drop --qos", slurm.ESLURM_INVALID_QOS)
+      end
+      job_desc.qos = want
+   elseif asked ~= nil and string.sub(asked, 1, string.len(PAYG_QOS_PREFIX)) == PAYG_QOS_PREFIX then
+      return refuse("credits (" .. asked .. ") apply only in -p " .. PAYG_PARTITION, slurm.ESLURM_INVALID_QOS)
+   end
+   return slurm.SUCCESS
+end
+
+function slurm_job_submit(job_desc, part_list, submit_uid)
+   if submit_uid == 0 then
+      return slurm.SUCCESS
+   end
+   if job_desc.account == nil or job_desc.account == "" then
+      slurm.log_user("Name the project for this job with -A <project> (sbatch, srun or salloc). " ..
+                     "Your projects: sacctmgr -nP show assoc user=$USER format=account")
+      -- never nil: a nil return would be read as success
+      return slurm.ESLURM_INVALID_ACCOUNT or slurm.ERROR
+   end
+   local why = node_share(job_desc)
+   if why then
+      return refuse(why)
+   end
+   return payg(job_desc)
+end
+
+function slurm_job_modify(job_desc, job_rec, part_list, modify_uid)
+   if modify_uid == 0 then
+      return slurm.SUCCESS
+   end
+   if set(job_desc.min_cpus) or set(job_desc.cpus_per_task) or set(job_desc.num_tasks) or set(job_desc.min_nodes)
+      or set(job_desc.max_nodes) or set(job_desc.ntasks_per_node) or set(job_desc.ntasks_per_tres)
+      or job_desc.min_mem_per_node ~= nil or job_desc.min_mem_per_cpu ~= nil or set(job_desc.shared)
+      or job_desc.tres_per_job ~= nil or job_desc.tres_per_node ~= nil or job_desc.tres_per_task ~= nil
+      or job_desc.tres_per_socket ~= nil or job_desc.cpus_per_tres ~= nil or job_desc.mem_per_tres ~= nil
+      or job_desc.partition ~= nil or job_desc.features ~= nil or job_desc.qos ~= nil or job_desc.account ~= nil
+      or set(job_desc.pn_min_cpus) or job_desc.prefer ~= nil then
+      return refuse("A queued job's size, partition, features, QoS and account are fixed: cancel it and submit it again",
+                    slurm.ESLURM_ACCESS_DENIED)
+   end
+   return slurm.SUCCESS
+end
+
+return slurm.SUCCESS

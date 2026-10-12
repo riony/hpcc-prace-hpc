@@ -1,0 +1,4 @@
+# Physical lab hosts on the campus network (.205). The lab deploy runner on mgmt-git01
+# reaches .205 from 198.51.100.125 (address observed by .205's sshd, 2026-09-26).
+lab_deploy_user: admin
+lab_deploy_from: "198.51.100.125"

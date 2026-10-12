@@ -1,0 +1,47 @@
+# HPE lab-dl380 :  host-specific variables
+# Sources: iLO Redfish inventory 2026-09-17 (verified), user allocations (unverified until tested).
+
+ansible_host: 192.0.2.205        # target; prefix/gateway/VLAN still pending user confirmation
+ansible_user: admin
+
+hardware:
+  serial: EXSERIAL01               # chassis serial (iLO)
+  nvme:
+    model: MO001600KWVNB
+    serial: EXNVME00000001         # kickstart target-disk identity
+    size: 1.46 TiB
+
+network:
+  target_ip: 192.0.2.205
+  # Private admin segment, configured 2026-09-24 (NM profile private-eno4, keyfile in
+  # private_net role format). Zone "block": the bastion accepts no NEW inbound from
+  # the private segment and eno4 shares no zone with eno1 (public has forward: yes,
+  # ip_forward=1). Only ntp is opened in it (see chrony_allow below).
+  private_ip: 10.88.0.1
+  private_prefix: 24
+  private_iface: eno4              # 331i p4, MAC 02:00:00:00:00:01; identified by ARP reply from Lenovo eno2
+  private_zone: block
+  # prefix, gateway, vlan, dns: PENDING :  do not guess; record confirmed values here.
+  nics:
+    - {name: "622FLR p1", mac: "02:00:00:00:00:03", speed: 10G, note: "linked 10G at last check"}
+    - {name: "622FLR p2", mac: "02:00:00:00:00:04", speed: 10G, note: "no link"}
+    - {name: "331i p1",   mac: "02:00:00:00:00:02", speed: 1G}
+    - {name: "331i p2",   mac: "02:00:00:00:00:15", speed: 1G, note: "old 198.18.2.25 ARP matched this MAC"}
+    - {name: "331i p3",   mac: "02:00:00:00:00:16", speed: 1G}
+    - {name: "331i p4",   mac: "02:00:00:00:00:01", speed: 1G, note: "eno4 = private switch 10.88.0.1/24"}
+
+# .205 serves time to the gateway-less private segment (T37 interim). Its own
+# upstream stays the public SG pool (default ntp_servers) until institutional NTP.
+# ntp is the ONLY service opened in zone block (eno4).
+chrony_allow:
+  - 10.88.0.0/24
+chrony_allow_zone: block
+
+storage:
+  vg: hpe_vg
+  root_lv: 81920m                  # 80 GiB, matches kickstart
+  swap_lv: 8192m                   # 8 GiB
+  images_lv: 921600m               # 900 GiB /var/lib/libvirt/images
+  vg_free_reserved: true           # remaining extents left free deliberately
+
+timezone: Asia/Singapore

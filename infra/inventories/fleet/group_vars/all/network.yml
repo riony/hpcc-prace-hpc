@@ -1,0 +1,16 @@
+---
+# Admin network (user 26 Sep: login .1, g003 .13, g004 .14, g005 .15, Lenovo .21; the
+# ring must not touch it -> /25). No gateway, no DNS; NTP from the login node.
+admin_network: 10.90.10.0/25
+admin_prefix: 25
+ntp_server: 10.90.10.1
+timezone: Asia/Singapore
+
+# InfiniBand ring, as cabled (user 26 Sep). Which physical port carries which link is
+# DISCOVERED on Monday (peer GUID matched against this inventory), never assumed from the
+# slot; unmatched ports are treated as external. OpenSM runs on the lower-numbered node,
+# bound to that port GUID only.
+ring_links:
+  - {name: g003-g004, subnet: 10.90.10.200/30, ends: {lab-g003: 10.90.10.201, lab-g004: 10.90.10.202}, sm: lab-g003}
+  - {name: g004-g005, subnet: 10.90.10.208/30, ends: {lab-g004: 10.90.10.209, lab-g005: 10.90.10.210}, sm: lab-g004}
+  - {name: g005-g003, subnet: 10.90.10.216/30, ends: {lab-g005: 10.90.10.217, lab-g003: 10.90.10.218}, sm: lab-g003}

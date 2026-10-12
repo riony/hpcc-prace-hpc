@@ -1,0 +1,21 @@
+---
+# Runs AFTER tasks/login.yml, so in a fresh all-fleet run the controller and NodeSets exist before
+# any worker is checked. A worker-only run (--limit <node>) does not run the login part, so each
+# compute node proves its own registration here: Kubernetes Ready, one ready slurmd pod, usable
+# Slurm state (checked from the login node, fails closed).
+- name: This node is a usable Slinky worker (checked from the login node, fails closed)
+  ansible.builtin.command: /usr/local/sbin/prace-slinky-worker-check {{ inventory_hostname }}
+  delegate_to: "{{ groups['login'][0] }}"
+  register: slinky_this_worker
+  until: slinky_this_worker.rc == 0
+  retries: 30
+  delay: 15
+  changed_when: false
+  when: fleet_role != 'login'
+
+# A rollback from native (tasks/native-off.yml) is complete only now: the pod worker is usable.
+- name: Transition marker cleared (this host is a pod worker again)
+  ansible.builtin.file:
+    path: "{{ slinky_native_marker }}"
+    state: absent
+  when: fleet_role != 'login' and inventory_hostname not in slurm_native_workers | default([])
