@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Renders roles/slinky's slurm HelmChart values and maintenance overlay (HelmChartConfig) for the
-fleet inventory, as test-slinky-render.py does, and runs the real `helm template` of the vendored
+fleet inventory, as test-slinky-render.py does, and runs the real `helm template` of the pinned
 chart with -f chart-values -f overlay-values, the order K3s's Helm controller passes them. Checks
 what Helm renders, not the overlay's JSON: the merge, the closed and opening states, the partitions
 the chart refuses, and on a native kind (T89) the replaced PartitionName string.
@@ -8,7 +8,8 @@ the chart refuses, and on a native kind (T89) the replaced PartitionName string.
 The chart writes no slurm.conf. Partitions are the Controller object's extraConf lines (standalone
 partitions and controller.extraConfMap) and each NodeSet object's partition, which the operator
 writes as `PartitionName=<nodeset> Nodes=<nodeset> <config>` (not vendored: the bench's form,
-evidence/2026-09-29/scheduler-policy-bench). Skipped without helm (PRACE_HELM or PATH). Contacts no host."""
+evidence/2026-09-29/scheduler-policy-bench). Skipped without helm (PRACE_HELM or PATH) or the fetched
+charts (PRACE_SLURM_CHART); CI requires both. Contacts no host."""
 import json
 import os
 from pathlib import Path
@@ -22,9 +23,16 @@ import yaml
 INFRA = Path(__file__).resolve().parent.parent
 PLAYBOOK = shutil.which("ansible-playbook") or "/home/operator/venvs/ansible-prace/bin/ansible-playbook"
 HELM = os.environ.get("PRACE_HELM") or shutil.which("helm")
-if os.environ.get("CI") and not HELM:
-    raise RuntimeError("CI requires real Helm rendering; install the pinned Helm tool")
 CHART = Path(os.environ.get("PRACE_SLURM_CHART", str(INFRA / "roles/slinky/files/slurm-1.2.2.tgz")))
+# The public edition does not vendor the chart archives: tools/fetch-charts.py downloads the
+# checksum-pinned copies, and PRACE_SLURM_CHART names the slurm archive among them.
+MISSING = [n for n in ("slurm", "slurm-operator", "slurm-operator-crds")
+           if not (CHART.parent / f"{n}-1.2.2.tgz").is_file()]
+if os.environ.get("CI") and (not HELM or MISSING):
+    raise RuntimeError("CI requires real Helm rendering; install the pinned Helm tool and fetch the charts")
+SKIP = ("helm not found (set PRACE_HELM or put a Helm 3 on PATH)" if not HELM else
+        f"chart archives not found in {CHART.parent} ({', '.join(MISSING)}); run "
+        "tools/fetch-charts.py DIR and set PRACE_SLURM_CHART=DIR/slurm-1.2.2.tgz" if MISSING else "")
 CHARTS_J2 = (INFRA / "roles/slinky/templates/prace-slinky-charts.yaml.j2").read_text()
 NATIVE_LAYER = "slinky_chart_native_workers" in CHARTS_J2      # !57 (T89) and later
 LENOVO = ["lab-lenovo"]
@@ -88,7 +96,7 @@ def render(extra=None):
 
 
 def helm_template(*values):
-    """`helm template` of the vendored chart as K3s installs it (release slurm, namespace slurm),
+    """`helm template` of the pinned chart as K3s installs it (release slurm, namespace slurm),
     each values map a -f file in order: (returncode, rendered objects, stderr)"""
     out = tempfile.mkdtemp()
     args = [HELM, "template", "slurm", str(CHART), "--namespace", "slurm"]
@@ -134,7 +142,7 @@ def nodesets(objects):
     return sorted(o["metadata"]["name"].removeprefix("slurm-worker-") for o in objects if o["kind"] == "NodeSet")
 
 
-@unittest.skipUnless(HELM, "helm not found (set PRACE_HELM or put a Helm 3 on PATH); the real-Helm overlay proof is skipped")
+@unittest.skipIf(SKIP, f"{SKIP}; the real-Helm overlay proof is skipped")
 class HelmOverlay(unittest.TestCase):
     def template(self, *values):
         rc, objects, err = helm_template(*values)

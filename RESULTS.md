@@ -13,7 +13,7 @@ this sanitized edition, not republished private-cluster evidence.
 | Validation suite | 79 tests: 69 passed, 10 expected privileged-test skips |
 | Harness suite | 249 tests: 187 passed, 62 expected optional-runtime/privileged-test skips |
 | Demo ownership/admission/result tests | 13 passed |
-| Offline infrastructure tests | 39 `infra/tools/test-*.py` scripts passed locally; now included in the separate `infra-tests` hosted job |
+| Offline infrastructure tests | 39 `infra/tools/test-*.py` scripts: 39/39 passed in the hosted `infra-tests` job, with real Helm rendering of the pinned charts |
 | Ansible lint | Full profile on demo entry point passed; minimum correctness profile across retained playbooks passed (135 files examined) |
 | ShellCheck | Public check driver and pre-commit hook passed |
 | Helm lint | Four pinned dependency charts and the public Slurm values passed |
@@ -38,11 +38,12 @@ evidence or recordings were removed from this edition rather than shipped failin
 `tools/check.sh`. NeMo/model and dedicated root/container suites remain optional;
 a skip does not mean those capabilities were qualified in this release.
 
-Hosted GitHub CI subsequently passed both `checks` and `cpu-integration` at
+Hosted GitHub CI passed `checks` and `cpu-integration` at
 [`81f6ce0`](https://github.com/riony/hpcc-prace-hpc/actions/runs/38320865272),
-including a fresh kind cluster and real Slurm CPU job. The new `infra-tests` job
-extends coverage to the retained infrastructure scripts; its result is tracked
-separately in subsequent runs.
+including a fresh kind cluster and a real Slurm CPU job, and all three jobs at
+[`b993f32`](https://github.com/riony/hpcc-prace-hpc/actions/runs/38337794703),
+where `infra-tests` ran the 39 retained infrastructure scripts (39/39 successful;
+privileged-only cases skip explicitly). The badge in the README shows the latest run.
 
 No physical deployment, GPU qualification, hostile scenario, full-cluster reset
 or production acceptance is established by these public checks.
