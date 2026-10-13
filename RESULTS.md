@@ -13,7 +13,7 @@ this sanitized edition, not republished private-cluster evidence.
 | Validation suite | 79 tests: 69 passed, 10 expected privileged-test skips |
 | Harness suite | 249 tests: 187 passed, 62 expected optional-runtime/privileged-test skips |
 | Demo ownership/admission/result tests | 13 passed |
-| Offline infrastructure tests | 39 `infra/tools/test-*.py` scripts passed locally with an Ansible controller on PATH; not run in hosted CI |
+| Offline infrastructure tests | 39 `infra/tools/test-*.py` scripts passed locally; now included in the separate `infra-tests` hosted job |
 | Ansible lint | Full profile on demo entry point passed; minimum correctness profile across retained playbooks passed (135 files examined) |
 | ShellCheck | Public check driver and pre-commit hook passed |
 | Helm lint | Four pinned dependency charts and the public Slurm values passed |
@@ -38,8 +38,14 @@ evidence or recordings were removed from this edition rather than shipped failin
 `tools/check.sh`. NeMo/model and dedicated root/container suites remain optional;
 a skip does not mean those capabilities were qualified in this release.
 
-No hosted GitHub CI run, physical deployment, GPU qualification, hostile scenario,
-full-cluster reset or production acceptance occurred in this public build.
+Hosted GitHub CI subsequently passed both `checks` and `cpu-integration` at
+[`81f6ce0`](https://github.com/riony/hpcc-prace-hpc/actions/runs/38320865272),
+including a fresh kind cluster and real Slurm CPU job. The new `infra-tests` job
+extends coverage to the retained infrastructure scripts; its result is tracked
+separately in subsequent runs.
+
+No physical deployment, GPU qualification, hostile scenario, full-cluster reset
+or production acceptance is established by these public checks.
 Accounting persistence, multi-user isolation and hardware-dependent recovery are
 outside the small CPU demo. Checksum-pinned tools and charts are provided;
 upstream container image version tags are still a supply-chain limitation to

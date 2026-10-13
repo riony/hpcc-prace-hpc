@@ -97,7 +97,10 @@ pip install -r requirements-dev.txt
 bash tools/check.sh
 ```
 
-GitHub Actions runs these checks and a separate local-kind integration job.
+GitHub Actions runs these checks, a separate local-kind integration job, and
+all 39 retained infrastructure test scripts in an `infra-tests` job. That job
+uses local/fake transports, pinned Helm charts and Ansible; privileged-only
+cases may explicitly skip and do not constitute physical qualification.
 Optional NeMo dependencies and their additional tests are documented in
 `harness/README.md`. Tests requiring NeMo or root explicitly skip without them.
 

@@ -41,3 +41,28 @@ jobs:
           if test -f "$HOME/.local/state/hpcc-prace-hpc-public/demo/owner.json"; then
             python3 demo/cluster.py down
           fi
+  infra-tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      PRACE_TEST_PORTABLE_METADATA: '1'
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends acl rsync
+      - run: pip install -r requirements-dev.txt
+      - run: python3 tools/bootstrap-tools.py
+      - run: echo "$HOME/.local/state/hpcc-prace-hpc-public/tools" >> "$GITHUB_PATH"
+      - name: Prepare public chart and collection dependencies
+        run: |
+          python3 tools/fetch-charts.py "$RUNNER_TEMP/prace-charts"
+          echo "PRACE_SLURM_CHART=$RUNNER_TEMP/prace-charts/slurm-1.2.2.tgz" >> "$GITHUB_ENV"
+          ansible-galaxy collection install -p "$RUNNER_TEMP/prace-collections" -r infra/requirements.yml
+          echo "ANSIBLE_COLLECTIONS_PATH=$RUNNER_TEMP/prace-collections" >> "$GITHUB_ENV"
+      - run: python3 tools/check-infra.py

@@ -22,7 +22,9 @@ import yaml
 INFRA = Path(__file__).resolve().parent.parent
 PLAYBOOK = shutil.which("ansible-playbook") or "/home/operator/venvs/ansible-prace/bin/ansible-playbook"
 HELM = os.environ.get("PRACE_HELM") or shutil.which("helm")
-CHART = INFRA / "roles/slinky/files/slurm-1.2.2.tgz"
+if os.environ.get("CI") and not HELM:
+    raise RuntimeError("CI requires real Helm rendering; install the pinned Helm tool")
+CHART = Path(os.environ.get("PRACE_SLURM_CHART", str(INFRA / "roles/slinky/files/slurm-1.2.2.tgz")))
 CHARTS_J2 = (INFRA / "roles/slinky/templates/prace-slinky-charts.yaml.j2").read_text()
 NATIVE_LAYER = "slinky_chart_native_workers" in CHARTS_J2      # !57 (T89) and later
 LENOVO = ["lab-lenovo"]
@@ -49,6 +51,13 @@ SAVED = {"cpu": "UP", "gpu": "DOWN", "debug": "UP", "payg": "INACTIVE"}
 def render(extra=None):
     """the slurm HelmChart's values and the overlay's values (None without an intent)"""
     out = tempfile.mkdtemp()
+    # Public releases fetch checksum-pinned archives instead of vendoring them.
+    # Keep the real role's helper files and stage the charts only in this fixture.
+    role = Path(out) / "role"
+    shutil.copytree(INFRA / "roles/slinky/files", role / "files")
+    for name in ("slurm", "slurm-operator", "slurm-operator-crds"):
+        archive = CHART.parent / f"{name}-1.2.2.tgz"
+        shutil.copyfile(archive, role / "files" / archive.name)
     book = Path(out) / "render.yml"
     book.write_text(f"""
 - hosts: lab-dl380
@@ -60,7 +69,7 @@ def render(extra=None):
   tasks:
     - ansible.builtin.include_vars: {{file: "{INFRA}/roles/slinky/defaults/main.yml"}}
     - ansible.builtin.template: {{src: "{INFRA}/roles/slinky/templates/{{{{ item }}}}.j2", dest: "{out}/{{{{ item }}}}"}}
-      vars: {{role_path: "{INFRA}/roles/slinky"}}
+      vars: {{role_path: "{role}"}}
       loop: [prace-slinky-charts.yaml, prace-slinky-maintenance.json]
 """)
     env = dict(os.environ, ANSIBLE_CONFIG=str(INFRA / "ansible.cfg"), ANSIBLE_NOCOLOR="1")
